@@ -15,35 +15,65 @@ def ssh(login_alias, cmd):
 
 
 def translate_event(event):
-    if event.get("type") != "codex_event":
-        return event
+    # Only process structured RPC events from worker
+    if event.get("type") != "codex_rpc":
+        return None
 
     payload = event.get("payload", {})
     method = payload.get("method")
     params = payload.get("params", {})
 
-    if method == "AgentMessageDeltaNotification":
-        return {
-            "type": "assistant",
-            "job_id": event["job_id"],
-            "node_id": event["node_id"],
-            "content": params.get("delta", "")
-        }
+    # --- Streaming assistant deltas ---
+    if method == "codex/event/agent_message_content_delta":
+        delta = params.get("msg", {}).get("delta")
+        if delta:
+            return {
+                "type": "assistant_delta",
+                "job_id": event["job_id"],
+                "node_id": event["node_id"],
+                "content": delta
+            }
 
-    if method == "ThreadTokenUsageUpdatedNotification":
-        return {
-            "type": "usage",
-            "job_id": event["job_id"],
-            "node_id": event["node_id"],
-            "tokens_used": params.get("totalTokens", 0)
-        }
+    # --- Final assistant message ---
+    if method == "codex/event/agent_message":
+        message = params.get("msg", {}).get("message")
+        if message:
+            return {
+                "type": "assistant",
+                "job_id": event["job_id"],
+                "node_id": event["node_id"],
+                "content": message
+            }
 
-    if method == "TurnCompletedNotification":
+    # --- Token usage ---
+    if method == "codex/event/token_count":
+        info = params.get("msg", {}).get("info", {})
+        total = info.get("total_token_usage", {}).get("total_tokens")
+        if total is not None:
+            return {
+                "type": "usage",
+                "job_id": event["job_id"],
+                "node_id": event["node_id"],
+                "total_tokens": total
+            }
+
+    # --- Turn started ---
+    if method == "turn/started":
         return {
-            "type": "turn_complete",
+            "type": "turn_started",
             "job_id": event["job_id"],
             "node_id": event["node_id"]
         }
+
+    # --- Turn complete ---
+    if method == "item/completed":
+        item = params.get("item", {})
+        if item.get("type") == "agentMessage":
+            return {
+                "type": "turn_complete",
+                "job_id": event["job_id"],
+                "node_id": event["node_id"]
+            }
 
     return None
 
