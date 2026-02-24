@@ -90,6 +90,7 @@ def stream_outbox(config):
 
     cmd = [
         "ssh",
+        "-n",
         "-tt",
         login_alias,
         f"tail -n 0 -F {outbox_glob}"
