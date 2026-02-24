@@ -1,0 +1,13 @@
+# Ignore personal/local cluster configs
+configs/*.json
+!configs/example.json
+
+# Python cache
+__pycache__/
+*.pyc
+
+# SSH artifacts (if ever copied locally)
+known_hosts_codex
+
+# Misc
+*.log
