@@ -88,16 +88,14 @@ def stream_outbox(config):
 
     print(f"Streaming outbox via resilient persistent SSH tail: {outbox_glob}")
 
-    remote_cmd = (
-        f"bash -lc \"while true; do "
-        f"tail -n 0 -F {outbox_glob} 2>/dev/null; "
-        f"sleep 0.2; done\""
-    )
-
     cmd = [
         "ssh",
         login_alias,
-        remote_cmd
+        "tail",
+        "-n",
+        "0",
+        "-F",
+        outbox_glob
     ]
 
     print("DEBUG SSH CMD:", cmd)
