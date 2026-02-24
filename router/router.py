@@ -88,12 +88,12 @@ def stream_outbox(config):
 
     print(f"Streaming outbox via resilient persistent SSH tail: {outbox_glob}")
 
-    remote_cmd = f"bash -lc 'while true; do tail -n 0 -F {outbox_glob} 2>/dev/null; sleep 0.2; done'"
-
     cmd = [
         "ssh",
         login_alias,
-        remote_cmd
+        "bash",
+        "-lc",
+        f"while true; do tail -n 0 -F {outbox_glob} 2>/dev/null; sleep 0.2; done"
     ]
 
     proc = subprocess.Popen(
@@ -106,26 +106,28 @@ def stream_outbox(config):
 
     try:
         while True:
+            # Read stdout
             line = proc.stdout.readline()
-            if not line:
-                # If SSH dies, break
-                if proc.poll() is not None:
-                    print("SSH stream terminated.")
-                    break
-                continue
+            if line:
+                line = line.strip()
+                if line:
+                    try:
+                        event = json.loads(line)
+                        translated = translate_event(event)
+                        if translated:
+                            print(json.dumps(translated, indent=2))
+                    except json.JSONDecodeError:
+                        pass
 
-            line = line.strip()
-            if not line:
-                continue
+            # Read stderr (transport debugging)
+            err = proc.stderr.readline()
+            if err:
+                print("SSH STDERR:", err.strip())
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            translated = translate_event(event)
-            if translated:
-                print(json.dumps(translated, indent=2))
+            # Detect SSH exit
+            if proc.poll() is not None:
+                print("SSH stream terminated.")
+                break
 
     except KeyboardInterrupt:
         print("Stopping stream...")
