@@ -3,58 +3,198 @@ import os
 import json
 import subprocess
 import time
+import select
 from pathlib import Path
+from datetime import datetime, timezone
 
 
-def run(cmd):
-    return subprocess.run(cmd, capture_output=True, text=True)
+def write_event(f, obj):
+    f.write(json.dumps(obj) + "\n")
+    f.flush()
+
+
+def jsonrpc_request(id_, method, params=None):
+    msg = {
+        "jsonrpc": "2.0",
+        "id": id_,
+        "method": method
+    }
+    if params is not None:
+        msg["params"] = params
+    return json.dumps(msg)
+
+
+def jsonrpc_notification(method, params=None):
+    msg = {
+        "jsonrpc": "2.0",
+        "method": method
+    }
+    if params is not None:
+        msg["params"] = params
+    return json.dumps(msg)
 
 
 def main():
-    job_id = os.environ.get("SLURM_JOB_ID")
-    node_id = int(os.environ.get("SLURM_NODEID", "0"))
+    job_id = os.environ["SLURM_JOB_ID"]
+    node_id = int(os.environ["SLURM_NODEID"])
     hostname = os.uname().nodename
 
     workspace_root = os.environ["WORKSPACE_ROOT"]
     cluster_subdir = os.environ["CLUSTER_SUBDIR"]
 
     base = Path(workspace_root) / cluster_subdir
-    run_dir = base / "runs" / job_id
-    node_dir = run_dir / f"node_{node_id:02d}"
 
-    prompt_path = node_dir / "PROMPT.txt"
-    result_path = node_dir / "result.json"
+    inbox_path = base / "mailbox" / "inbox" / f"{job_id}_{node_id:02d}.jsonl"
+    outbox_path = base / "mailbox" / "outbox" / f"{job_id}_{node_id:02d}.jsonl"
 
-    # ✅ Wait for PROMPT.txt to appear (control-plane sync)
-    for _ in range(30):  # wait up to 30 seconds
-        if prompt_path.exists():
-            break
-        time.sleep(1)
-    else:
-        raise RuntimeError(f"Missing PROMPT.txt for node {node_id}")
-
-    prompt = prompt_path.read_text()
+    inbox_path.parent.mkdir(parents=True, exist_ok=True)
+    outbox_path.parent.mkdir(parents=True, exist_ok=True)
 
     codex_bin = base / "tools" / "npm-global" / "bin" / "codex"
 
-    result = run([
-        str(codex_bin),
-        "--ask-for-approval", "never",
-        "exec",
-        "--skip-git-repo-check",
-        prompt
-    ])
+    proc = subprocess.Popen(
+        [
+            str(codex_bin),
+            "app-server",
+            "--listen", "stdio://"
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
 
-    output = {
-        "job_id": job_id,
-        "node_id": node_id,
-        "hostname": hostname,
-        "returncode": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+    rpc_id = 0
+    thread_id = None
 
-    result_path.write_text(json.dumps(output, indent=2))
+    def send_request(method, params=None):
+        nonlocal rpc_id
+        msg = jsonrpc_request(rpc_id, method, params)
+        proc.stdin.write(msg + "\n")
+        proc.stdin.flush()
+        rpc_id += 1
+
+    def send_notification(method, params=None):
+        msg = jsonrpc_notification(method, params)
+        proc.stdin.write(msg + "\n")
+        proc.stdin.flush()
+
+    with open(outbox_path, "a", buffering=1) as outbox:
+
+        write_event(outbox, {
+            "type": "start",
+            "job_id": job_id,
+            "node_id": node_id,
+            "hostname": hostname,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+        # LSP-style handshake
+        send_request("initialize", {
+            "processId": None,
+            "rootUri": None,
+            "capabilities": {},
+            "clientInfo": {
+                "name": "codeswarm-worker",
+                "title": "Codeswarm Worker",
+                "version": "0.1.0"
+            }
+        })
+
+        initialized_sent = False
+        inbox_offset = 0
+        running = True
+
+        while running:
+
+            # ---- STDOUT (JSON-RPC) ----
+            ready_out, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if ready_out:
+                line = proc.stdout.readline()
+                if line:
+                    try:
+                        msg = json.loads(line)
+                        write_event(outbox, {
+                            "type": "codex_rpc",
+                            "job_id": job_id,
+                            "node_id": node_id,
+                            "payload": msg
+                        })
+
+                        # After initialize response
+                        if msg.get("id") == 0 and not initialized_sent:
+                            send_notification("initialized", {})
+                            initialized_sent = True
+                            send_request("thread/start", {})
+                            continue
+
+                        # Capture thread id from thread/start response
+                        if msg.get("result") and isinstance(msg.get("result"), dict):
+                            result = msg["result"]
+                            if isinstance(result.get("thread"), dict) and "id" in result["thread"]:
+                                thread_id = result["thread"]["id"]
+
+                    except Exception as e:
+                        write_event(outbox, {
+                            "type": "worker_error",
+                            "error": str(e)
+                        })
+
+            # ---- STDERR ----
+            ready_err, _, _ = select.select([proc.stderr], [], [], 0.0)
+            if ready_err:
+                err_line = proc.stderr.readline()
+                if err_line:
+                    write_event(outbox, {
+                        "type": "codex_stderr",
+                        "job_id": job_id,
+                        "node_id": node_id,
+                        "line": err_line.strip()
+                    })
+
+            # ---- Inbox handling ----
+            if inbox_path.exists() and thread_id:
+                lines = inbox_path.read_text().splitlines()
+                new_lines = lines[inbox_offset:]
+
+                for line in new_lines:
+                    try:
+                        event = json.loads(line)
+                    except:
+                        continue
+
+                    if event.get("type") == "user":
+                        send_request("turn/start", {
+                            "threadId": thread_id,
+                            "input": [
+                                {
+                                    "type": "text",
+                                    "text": event.get("content", "")
+                                }
+                            ]
+                        })
+
+                    elif event.get("type") == "shutdown":
+                        running = False
+                        break
+
+                inbox_offset += len(new_lines)
+
+            if proc.poll() is not None:
+                running = False
+
+        write_event(outbox, {
+            "type": "complete",
+            "job_id": job_id,
+            "node_id": node_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
+
+        try:
+            proc.terminate()
+        except:
+            pass
 
 
 if __name__ == "__main__":
