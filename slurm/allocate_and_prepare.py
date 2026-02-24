@@ -28,6 +28,7 @@ def build_sbatch_script(args, config):
         "#!/bin/bash",
         "#SBATCH --job-name=codeswarm",
         f"#SBATCH --nodes={args.nodes}",
+        f"#SBATCH --ntasks={args.nodes}",
         f"#SBATCH --time={args.time}",
         f"#SBATCH --output={hpc_base}/codeswarm_%j.out",
         f"#SBATCH --error={hpc_base}/codeswarm_%j.err",
@@ -54,11 +55,11 @@ def build_sbatch_script(args, config):
         f"cd {hpc_base}",
     ])
 
-    if args.launch_worker:
+    if args.launch_codex_run:
         lines.extend([
             f"export WORKSPACE_ROOT={workspace_root}",
             f"export CLUSTER_SUBDIR={cluster_subdir}",
-            f"srun --ntasks-per-node=1 python3 {hpc_base}/agent/worker.py",
+            f"srun python3 {hpc_base}/agent/codex_worker.py",
         ])
 
     elif args.launch_codex_test:
@@ -81,22 +82,6 @@ def build_sbatch_script(args, config):
 
 def submit_job(args, config):
     login_alias = config["ssh"]["login_alias"]
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
-    hpc_base = f"{workspace_root}/{cluster_subdir}"
-
-    # Deploy worker if needed
-    if args.launch_worker:
-        worker_local = Path(__file__).parent.parent / "agent" / "worker.py"
-        worker_remote = f"{hpc_base}/agent/worker.py"
-        ssh_login(login_alias, f"mkdir -p {hpc_base}/agent")
-        with open(worker_local, "r") as f:
-            subprocess.run(
-                ["ssh", login_alias, f"cat > {worker_remote}"],
-                input=f.read(),
-                text=True,
-                check=True,
-            )
 
     script = build_sbatch_script(args, config)
     result = ssh_login(login_alias, "sbatch", input_text=script)
@@ -131,38 +116,6 @@ def wait_running(job_id, config):
         time.sleep(3)
 
 
-def get_nodes(job_id, config):
-    login_alias = config["ssh"]["login_alias"]
-    cmd = f"scontrol show hostnames $(squeue -j {job_id} -h -o %N)"
-    result = ssh_login(login_alias, cmd)
-
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-
-    return sorted(result.stdout.strip().split())
-
-
-def resolve_ips(nodes, config):
-    login_alias = config["ssh"]["login_alias"]
-    cmd = f"getent hosts {' '.join(nodes)}"
-    result = ssh_login(login_alias, cmd)
-
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr)
-
-    mapping = {}
-    for line in result.stdout.strip().splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            ip, host = parts[0], parts[1]
-            mapping[host] = ip
-
-    if len(mapping) != len(nodes):
-        raise RuntimeError("IP resolution mismatch")
-
-    return mapping
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -171,41 +124,52 @@ if __name__ == "__main__":
     parser.add_argument("--partition")
     parser.add_argument("--account")
     parser.add_argument("--qos")
-    parser.add_argument("--launch-worker", action="store_true")
     parser.add_argument("--launch-codex-test", action="store_true")
+    parser.add_argument("--launch-codex-run", action="store_true")
 
     args = parser.parse_args()
-
     config = load_config(args.config)
 
     if not args.time:
         args.time = config["slurm"]["default_time"]
 
+    workspace_root = config["cluster"]["workspace_root"]
+    cluster_subdir = config["cluster"]["cluster_subdir"]
+    hpc_base = f"{workspace_root}/{cluster_subdir}"
+    login_alias = config["ssh"]["login_alias"]
+
+    # ✅ DEPLOY WORKER BEFORE SUBMISSION
+    if args.launch_codex_run:
+        ssh_login(login_alias, f"mkdir -p {hpc_base}/agent")
+        worker_local = Path(__file__).parent.parent / "agent" / "codex_worker.py"
+        worker_remote = f"{hpc_base}/agent/codex_worker.py"
+        with open(worker_local, "r") as f:
+            subprocess.run(
+                ["ssh", login_alias, f"cat > {worker_remote}"],
+                input=f.read(),
+                text=True,
+                check=True,
+            )
+
     print("Submitting allocation job...")
     job_id = submit_job(args, config)
     print(f"Submitted job {job_id}")
 
+    # ✅ CREATE RUN DIRECTORIES AFTER JOB ID EXISTS
+    if args.launch_codex_run:
+        run_base = f"{hpc_base}/runs/{job_id}"
+        ssh_login(login_alias, f"mkdir -p {run_base}")
+
+        for i in range(args.nodes):
+            node_dir = f"{run_base}/node_{i:02d}"
+            ssh_login(login_alias, f"mkdir -p {node_dir}")
+            ssh_login(
+                login_alias,
+                f'echo "Node {i}: Say hello in one short sentence." > {node_dir}/PROMPT.txt'
+            )
+
     print("Waiting for RUNNING state...")
     wait_running(job_id, config)
-
-    print("Discovering nodes...")
-    try:
-        nodes = get_nodes(job_id, config)
-        print(f"Allocated nodes: {nodes}")
-    except Exception:
-        print("Job completed before node discovery.")
-        nodes = []
-
-    print("Updating SSH config...")
-    if nodes:
-        node_ip_map = resolve_ips(nodes, config)
-        subprocess.run([
-            "python3",
-            str(Path(__file__).parent.parent / "ssh" / "update_ssh_config.py"),
-            args.config,
-            job_id,
-            *[f"{k}={v}" for k, v in node_ip_map.items()],
-        ], check=True)
 
     print("Allocation complete.")
     print(f"JOB_ID={job_id}")
