@@ -113,27 +113,36 @@ done
         bufsize=1
     )
 
+    import select
+
     try:
         while True:
-            # Read stdout
-            line = proc.stdout.readline()
-            if line:
+            ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
+
+            for stream in ready:
+                line = stream.readline()
+                if not line:
+                    continue
+
                 line = line.strip()
-                if line:
-                    try:
-                        event = json.loads(line)
-                        translated = translate_event(event)
-                        if translated:
-                            print(json.dumps(translated, indent=2))
-                    except json.JSONDecodeError:
-                        pass
+                if not line:
+                    continue
 
-            # Read stderr (transport debugging)
-            err = proc.stderr.readline()
-            if err:
-                print("SSH STDERR:", err.strip())
+                # STDERR
+                if stream is proc.stderr:
+                    print("SSH STDERR:", line)
+                    continue
 
-            # Detect SSH exit
+                # STDOUT
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                translated = translate_event(event)
+                if translated:
+                    print(json.dumps(translated, indent=2))
+
             if proc.poll() is not None:
                 print("SSH stream terminated.")
                 break
