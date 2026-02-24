@@ -88,12 +88,19 @@ def stream_outbox(config):
 
     print(f"Streaming outbox via resilient persistent SSH tail: {outbox_glob}")
 
+    remote_script = f"""
+while true; do
+  tail -n 0 -F {outbox_glob} 2>/dev/null
+  sleep 0.2
+done
+"""
+
     cmd = [
         "ssh",
         login_alias,
         "bash",
         "-lc",
-        f"while true; do tail -n 0 -F {outbox_glob} 2>/dev/null; sleep 0.2; done"
+        remote_script
     ]
 
     proc = subprocess.Popen(
