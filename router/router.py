@@ -83,41 +83,43 @@ def stream_outbox(config):
     workspace_root = config["cluster"]["workspace_root"]
     cluster_subdir = config["cluster"]["cluster_subdir"]
 
-    outbox_dir = f"{workspace_root}/{cluster_subdir}/mailbox/outbox"
+    outbox_glob = f"{workspace_root}/{cluster_subdir}/mailbox/outbox/*.jsonl"
 
-    print(f"Streaming outbox from {outbox_dir}...")
+    print(f"Streaming outbox via persistent SSH tail: {outbox_glob}")
 
-    known_offsets = {}
+    cmd = [
+        "ssh",
+        login_alias,
+        f"tail -n 0 -F {outbox_glob}"
+    ]
 
-    while True:
-        ls = ssh(login_alias, f"ls {outbox_dir} 2>/dev/null || true")
-        files = [f.strip() for f in ls.stdout.splitlines() if f.strip()]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1
+    )
 
-        for filename in files:
-            full_path = f"{outbox_dir}/{filename}"
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
 
-            if filename not in known_offsets:
-                known_offsets[filename] = 0
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
 
-            cat = ssh(login_alias, f"cat {full_path}")
-            lines = [l for l in cat.stdout.splitlines() if l.strip()]
+            translated = translate_event(event)
+            if translated:
+                print(json.dumps(translated, indent=2))
 
-            already = known_offsets[filename]
-            new_lines = lines[already:]
-
-            for line in new_lines:
-                try:
-                    event = json.loads(line)
-                except:
-                    continue
-
-                translated = translate_event(event)
-                if translated:
-                    print(json.dumps(translated, indent=2))
-
-            known_offsets[filename] += len(new_lines)
-
-        time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("Stopping stream...")
+    finally:
+        proc.terminate()
 
 
 if __name__ == "__main__":
