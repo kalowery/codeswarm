@@ -83,14 +83,17 @@ def stream_outbox(config):
     workspace_root = config["cluster"]["workspace_root"]
     cluster_subdir = config["cluster"]["cluster_subdir"]
 
-    outbox_glob = f"{workspace_root}/{cluster_subdir}/mailbox/outbox/*.jsonl"
+    outbox_dir = f"{workspace_root}/{cluster_subdir}/mailbox/outbox"
+    outbox_glob = f"{outbox_dir}/*.jsonl"
 
-    print(f"Streaming outbox via persistent SSH tail: {outbox_glob}")
+    print(f"Streaming outbox via resilient persistent SSH tail: {outbox_glob}")
+
+    remote_cmd = f"bash -lc 'while true; do tail -n 0 -F {outbox_glob} 2>/dev/null; sleep 0.2; done'"
 
     cmd = [
         "ssh",
         login_alias,
-        f"tail -n 0 -F {outbox_glob}"
+        remote_cmd
     ]
 
     proc = subprocess.Popen(
@@ -102,7 +105,15 @@ def stream_outbox(config):
     )
 
     try:
-        for line in proc.stdout:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                # If SSH dies, break
+                if proc.poll() is not None:
+                    print("SSH stream terminated.")
+                    break
+                continue
+
             line = line.strip()
             if not line:
                 continue
