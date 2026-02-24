@@ -127,6 +127,9 @@ def stream_outbox(config):
                     continue
 
                 # STDOUT
+                # DEBUG: print every raw line from SSH
+                print("RAW:", repr(line))
+
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
