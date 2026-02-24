@@ -105,6 +105,8 @@ done
         remote_cmd
     ]
 
+    print("DEBUG SSH CMD:", cmd)
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
