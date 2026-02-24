@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+import sys
+import time
 import argparse
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-import sys
 
+# Make project root importable
 sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 from common.config import load_config
 
 
@@ -30,78 +32,51 @@ def find_job_aliases(job_id):
     return aliases
 
 
-def transport_test(config, job_id):
-    login_alias = config["ssh"]["login_alias"]
+def monitor_job(config, job_id):
     workspace_root = config["cluster"]["workspace_root"]
     cluster_subdir = config["cluster"]["cluster_subdir"]
-    max_workers = config["router"]["ssh_max_workers"]
 
     base_path = f"{workspace_root}/{cluster_subdir}"
-    test_dir = f"{base_path}/test_{job_id}"
-
     aliases = find_job_aliases(job_id)
 
     if not aliases:
         print("No aliases found for job.")
         sys.exit(1)
 
-    print(f"Testing {len(aliases)} nodes...")
+    print(f"Monitoring job {job_id} (Ctrl+C to stop)...")
 
-    def test_node(alias):
-        cmd = (
-            f"mkdir -p {test_dir} && "
-            f"echo $(hostname) > {test_dir}/transport.txt && "
-            f"cat {test_dir}/transport.txt"
-        )
-        result = ssh_cmd(alias, cmd)
+    while True:
+        for alias in aliases:
+            node_dir_cmd = (
+                f"ls -d {base_path}/job_{job_id}/node_* 2>/dev/null | head -n1"
+            )
+            result = ssh_cmd(alias, node_dir_cmd)
+            node_dir = result.stdout.strip()
 
-        if result.returncode == 0:
-            return alias, True, result.stdout.strip()
-        else:
-            return alias, False, result.stderr.strip()
+            if not node_dir:
+                print(f"[{alias}] No node directory found yet.")
+                continue
 
-    successes = 0
+            hb = ssh_cmd(alias, f"cat {node_dir}/heartbeat.json 2>/dev/null")
+            out = ssh_cmd(alias, f"tail -n 3 {node_dir}/outbox.jsonl 2>/dev/null")
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(test_node, a) for a in aliases]
+            print("\n----------------------------------------")
+            print(f"[{alias}]")
+            print("Heartbeat:")
+            print(hb.stdout.strip() or "(no heartbeat)")
+            print("Recent logs:")
+            print(out.stdout.strip() or "(no logs)")
 
-        for future in as_completed(futures):
-            alias, ok, output = future.result()
-
-            if ok:
-                print(f"[OK] {alias} -> {output}")
-                successes += 1
-            else:
-                print(f"[FAIL] {alias} -> {output}")
-
-    print(f"Transport Test: {successes}/{len(aliases)} nodes OK")
-
-    if successes == len(aliases):
-        print("All nodes OK. Cancelling job...")
-
-        # Cancel job via login alias
-        subprocess.run(
-            ["ssh", login_alias, f"scancel {job_id}"],
-            check=False
-        )
-
-        # Cleanup SSH config block
-        subprocess.run([
-            "python3",
-            str(Path(__file__).parent.parent / "ssh" / "cleanup_job.py"),
-            job_id
-        ], check=False)
-
-        print("Cleanup complete.")
+        time.sleep(5)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--transport-test")
+    parser.add_argument("--monitor-job")
     args = parser.parse_args()
 
     config = load_config(args.config)
 
-    if args.transport_test:
-        transport_test(config, args.transport_test)
+    if args.monitor_job:
+        monitor_job(config, args.monitor_job)
