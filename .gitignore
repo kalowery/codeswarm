@@ -1,13 +1,9 @@
-# Ignore personal/local cluster configs
-configs/*.json
-!configs/example.json
+# Node build artifacts
+cli/node_modules/
+cli/dist/
 
-# Python cache
-__pycache__/
-*.pyc
+# Router runtime state
+router_state.json
 
-# SSH artifacts (if ever copied locally)
-known_hosts_codex
-
-# Misc
-*.log
+# OS junk
+.DS_Store

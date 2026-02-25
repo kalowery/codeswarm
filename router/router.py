@@ -90,7 +90,25 @@ def emit_event(event_name, data):
         "event": event_name,
         "data": data
     }
-    print(json.dumps(envelope), flush=True)
+
+    line = json.dumps(envelope) + "\n"
+
+    print("EMIT_EVENT TO TCP:", line.strip(), file=sys.stderr, flush=True)
+
+    dead = []
+
+    for conn in TCP_CLIENTS:
+        try:
+            conn.sendall(line.encode())
+        except:
+            dead.append(conn)
+
+    for conn in dead:
+        if conn in TCP_CLIENTS:
+            TCP_CLIENTS.remove(conn)
+
+    if DEBUG:
+        print(line, end="", flush=True)
 
 
 def debug_event(message):
@@ -309,26 +327,75 @@ def translate_event(event):
 # Daemon Loop
 # ================================
 
+import queue
+COMMAND_QUEUE = queue.Queue()
+TCP_CLIENTS = []
+
 def run_daemon(config):
-    proc = start_remote_follower(config)
 
     stdout_buffer = b""
-    stdin_buffer = b""
 
-    # non-blocking stdin
-    try:
-        import fcntl
-        fd = sys.stdin.fileno()
-        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    except:
-        pass
+    # TCP control server
+    import socket, sys
+
+    def tcp_server():
+        host = "127.0.0.1"
+        port = 8765
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((host, port))
+        server.listen()
+
+        print(f"TCP CONTROL READY {host}:{port}", file=sys.stderr, flush=True)
+
+        while True:
+            conn, addr = server.accept()
+            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
+
+    def handle_client(conn):
+        print("CLIENT CONNECTED", file=sys.stderr, flush=True)
+        TCP_CLIENTS.append(conn)
+        buffer = b""
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    decoded = line.decode().strip()
+                    if decoded:
+                        COMMAND_QUEUE.put(decoded)
+        finally:
+            if conn in TCP_CLIENTS:
+                TCP_CLIENTS.remove(conn)
+            conn.close()
+
+    threading.Thread(target=tcp_server, daemon=True).start()
+
+    # Start follower asynchronously so it cannot block daemon startup
+    proc = None
+
+    def start_follower_async():
+        nonlocal proc
+        try:
+            proc = start_remote_follower(config)
+        except Exception as e:
+            print(f"Follower failed to start: {e}", flush=True)
+
+    threading.Thread(target=start_follower_async, daemon=True).start()
 
     debug_event("daemon_started")
 
     while True:
+        streams = []
+        if proc:
+            streams = [proc.stdout, proc.stderr]
+
         ready, _, _ = select.select(
-            [proc.stdout, proc.stderr, sys.stdin],
+            streams,
             [],
             [],
             0.2
@@ -356,177 +423,158 @@ def run_daemon(config):
                         event_name, data = translated
                         emit_event(event_name, data)
 
-        # Stdin commands
-        if sys.stdin in ready:
+        # Process queued stdin commands
+# Process queued stdin commands
+        while not COMMAND_QUEUE.empty():
+            raw = COMMAND_QUEUE.get()
+
             try:
-                chunk = os.read(sys.stdin.fileno(), 4096)
+                cmd = json.loads(raw)
             except:
-                chunk = None
+                continue
 
-            if chunk:
-                stdin_buffer += chunk
+            if cmd.get("protocol") != PROTOCOL:
+                continue
 
-                while b"\n" in stdin_buffer:
-                    line, stdin_buffer = stdin_buffer.split(b"\n", 1)
-                    line = line.decode().strip()
-                    if not line:
-                        continue
+            command = cmd.get("command")
+            request_id = cmd.get("request_id")
+            payload = cmd.get("payload", {})
 
+            debug_event(f"command received: {command!r}")
+
+            if command == "swarm_launch":
+                nodes = payload.get("nodes", 1)
+                partition = payload.get("partition")
+                time_limit = payload.get("time", "00:01:00")
+                account = payload.get("account")
+                qos = payload.get("qos")
+                system_prompt = payload.get("system_prompt", "")
+
+                if not partition:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "partition is required"
+                    })
+                    continue
+
+                job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
+                swarm_id = str(uuid.uuid4())
+
+                SWARMS[swarm_id] = {
+                    "job_id": job_id,
+                    "node_count": nodes,
+                    "system_prompt": system_prompt,
+                    "partition": partition,
+                    "time": time_limit,
+                    "status": "running"
+                }
+
+                JOB_TO_SWARM[job_id] = swarm_id
+                save_state()
+
+                emit_event("swarm_launched", {
+                    "request_id": request_id,
+                    "swarm_id": swarm_id,
+                    "job_id": job_id,
+                    "node_count": nodes,
+                    "partition": partition,
+                    "time": time_limit
+                })
+
+                for node_id in range(nodes):
+                    threading.Thread(
+                        target=perform_injection,
+                        args=(config, request_id, swarm_id, job_id, node_id, system_prompt),
+                        daemon=True
+                    ).start()
+
+            elif command == "inject":
+                swarm_id = payload.get("swarm_id")
+                nodes = payload.get("nodes", "all")
+                content = payload.get("content")
+
+                swarm = SWARMS.get(swarm_id)
+                if not swarm:
+                    continue
+
+                job_id = swarm["job_id"]
+                node_count = swarm["node_count"]
+
+                if nodes == "all":
+                    targets = range(node_count)
+                elif isinstance(nodes, list):
+                    targets = nodes
+                else:
+                    targets = [nodes]
+
+                for node_id in targets:
+                    threading.Thread(
+                        target=perform_injection,
+                        args=(config, request_id, swarm_id, job_id, node_id, content),
+                        daemon=True
+                    ).start()
+
+            elif command == "swarm_list":
+                emit_event("swarm_list", {
+                    "request_id": request_id,
+                    "swarms": SWARMS
+                })
+
+            elif command == "swarm_status":
+                swarm_id = payload.get("swarm_id")
+                swarm = SWARMS.get(swarm_id)
+
+                if not swarm:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown swarm_id"
+                    })
+                    continue
+
+                def handle_swarm_status():
                     try:
-                        cmd = json.loads(line)
-                    except:
-                        continue
+                        job_id = swarm["job_id"]
+                        login_alias = config["ssh"]["login_alias"]
 
-                    if cmd.get("protocol") != PROTOCOL:
-                        continue
+                        result = subprocess.run(
+                            ["ssh", login_alias, f"squeue -j {job_id} -h -o '%T'"],
+                            capture_output=True,
+                            text=True,
+                            timeout=15
+                        )
 
-                    command = cmd.get("command")
-                    request_id = cmd.get("request_id")
-                    payload = cmd.get("payload", {})
+                        slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
 
-                    debug_event(f"command received: {command!r}")
-
-                    # swarm_launch
-                    if command == "swarm_launch":
-                        nodes = payload.get("nodes", 1)
-                        partition = payload.get("partition")
-                        time_limit = payload.get("time", "00:01:00")
-                        account = payload.get("account")
-                        qos = payload.get("qos")
-                        system_prompt = payload.get("system_prompt", "")
-
-                        if not partition:
-                            emit_event("command_rejected", {
-                                "request_id": request_id,
-                                "reason": "partition is required"
-                            })
-                            continue
-
-                        job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
-                        swarm_id = str(uuid.uuid4())
-
-                        SWARMS[swarm_id] = {
-                            "job_id": job_id,
-                            "node_count": nodes,
-                            "system_prompt": system_prompt,
-                            "partition": partition,
-                            "time": time_limit,
-                            "status": "running"
-                        }
-
-                        JOB_TO_SWARM[job_id] = swarm_id
-                        save_state()
-
-                        emit_event("swarm_launched", {
+                        emit_event("swarm_status", {
                             "request_id": request_id,
                             "swarm_id": swarm_id,
                             "job_id": job_id,
-                            "node_count": nodes,
-                            "partition": partition,
-                            "time": time_limit
+                            "node_count": swarm["node_count"],
+                            "status": swarm["status"],
+                            "slurm_state": slurm_state
                         })
-
-                        # inject system prompt
-                        for node_id in range(nodes):
-                            threading.Thread(
-                                target=perform_injection,
-                                args=(config, request_id, swarm_id, job_id, node_id, system_prompt),
-                                daemon=True
-                            ).start()
-
-                    # inject
-                    elif command == "inject":
-                        swarm_id = payload.get("swarm_id")
-                        nodes = payload.get("nodes", "all")
-                        content = payload.get("content")
-
-                        swarm = SWARMS.get(swarm_id)
-                        if not swarm:
-                            continue
-
-                        job_id = swarm["job_id"]
-                        node_count = swarm["node_count"]
-
-                        if nodes == "all":
-                            targets = range(node_count)
-                        elif isinstance(nodes, list):
-                            targets = nodes
-                        else:
-                            targets = [nodes]
-
-                        for node_id in targets:
-                            threading.Thread(
-                                target=perform_injection,
-                                args=(config, request_id, swarm_id, job_id, node_id, content),
-                                daemon=True
-                            ).start()
-
-                    # swarm_list
-                    elif command == "swarm_list":
-                        emit_event("swarm_list", {
+                    except Exception as e:
+                        emit_event("swarm_status", {
                             "request_id": request_id,
-                            "swarms": SWARMS
+                            "swarm_id": swarm_id,
+                            "error": str(e)
                         })
 
-                    # swarm_status
-                    elif command == "swarm_status":
-                        swarm_id = payload.get("swarm_id")
-                        swarm = SWARMS.get(swarm_id)
+                threading.Thread(target=handle_swarm_status, daemon=True).start()
 
-                        if not swarm:
-                            emit_event("command_rejected", {
-                                "request_id": request_id,
-                                "reason": "unknown swarm_id"
-                            })
-                            continue
-
-                        def handle_swarm_status():
-                            try:
-                                job_id = swarm["job_id"]
-                                login_alias = config["ssh"]["login_alias"]
-
-                                result = subprocess.run(
-                                    ["ssh", login_alias, f"squeue -j {job_id} -h -o '%T'"],
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=15
-                                )
-
-                                slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
-
-                                emit_event("swarm_status", {
-                                    "request_id": request_id,
-                                    "swarm_id": swarm_id,
-                                    "job_id": job_id,
-                                    "node_count": swarm["node_count"],
-                                    "status": swarm["status"],
-                                    "slurm_state": slurm_state
-                                })
-                            except Exception as e:
-                                emit_event("swarm_status", {
-                                    "request_id": request_id,
-                                    "swarm_id": swarm_id,
-                                    "error": str(e)
-                                })
-
-                        threading.Thread(target=handle_swarm_status, daemon=True).start()
-
-                    # swarm_terminate
-                    elif command == "swarm_terminate":
-                        swarm_id = payload.get("swarm_id")
-                        swarm = SWARMS.get(swarm_id)
-                        if swarm:
-                            job_id = swarm["job_id"]
-                            login_alias = config["ssh"]["login_alias"]
-                            subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
-                            swarm["status"] = "terminated"
-                            save_state()
-                            emit_event("swarm_terminated", {
-                                "request_id": request_id,
-                                "swarm_id": swarm_id
-                            })
-
-
+            elif command == "swarm_terminate":
+                swarm_id = payload.get("swarm_id")
+                swarm = SWARMS.get(swarm_id)
+                if swarm:
+                    job_id = swarm["job_id"]
+                    login_alias = config["ssh"]["login_alias"]
+                    subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
+                    swarm["status"] = "terminated"
+                    save_state()
+                    emit_event("swarm_terminated", {
+                        "request_id": request_id,
+                        "swarm_id": swarm_id
+                    })
 # ================================
 # Main
 # ================================
