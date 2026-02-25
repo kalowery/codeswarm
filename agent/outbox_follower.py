@@ -15,6 +15,12 @@ def main():
     while True:
         try:
             files = sorted(outbox_dir.glob("*.jsonl"))
+            current_files = set(files)
+
+            # Remove offsets for files that no longer exist (e.g., archived)
+            for tracked in list(offsets.keys()):
+                if tracked not in current_files:
+                    del offsets[tracked]
 
             for path in files:
                 if path not in offsets:

@@ -30,6 +30,7 @@ def build_sbatch_script(args, config):
         f"#SBATCH --nodes={args.nodes}",
         f"#SBATCH --ntasks={args.nodes}",
         f"#SBATCH --time={args.time}",
+        "#SBATCH --signal=TERM@60",
         f"#SBATCH --output={hpc_base}/codeswarm_%j.out",
         f"#SBATCH --error={hpc_base}/codeswarm_%j.err",
     ]

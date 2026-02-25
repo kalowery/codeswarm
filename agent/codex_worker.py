@@ -4,6 +4,7 @@ import json
 import subprocess
 import time
 import select
+import signal
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -67,6 +68,14 @@ def main():
 
     rpc_id = 0
     thread_id = None
+    shutdown_requested = False
+
+    def handle_shutdown(signum, frame):
+        nonlocal shutdown_requested
+        shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
 
     def send_request(method, params=None):
         nonlocal rpc_id
@@ -106,7 +115,7 @@ def main():
         inbox_offset = 0
         running = True
 
-        while running:
+        while running and not shutdown_requested:
 
             # ---- STDOUT (JSON-RPC) ----
             ready_out, _, _ = select.select([proc.stdout], [], [], 0.1)
@@ -190,6 +199,19 @@ def main():
             "node_id": node_id,
             "timestamp": datetime.now(timezone.utc).isoformat()
         })
+
+        # Archive outbox file after completion (transport lifecycle cleanup)
+        try:
+            archive_dir = base / "mailbox" / "archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+
+            archived_path = archive_dir / outbox_path.name
+            outbox.flush()
+            outbox.close()
+            outbox_path.rename(archived_path)
+        except Exception as e:
+            # Non-fatal; follower may continue until cleanup
+            pass
 
         try:
             proc.terminate()
