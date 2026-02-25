@@ -26,6 +26,57 @@ SWARMS = {}
 JOB_TO_SWARM = {}
 LAST_USAGE = {}
 
+STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
+
+
+def save_state():
+    try:
+        data = {"swarms": SWARMS}
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_state():
+    global SWARMS
+    try:
+        if STATE_FILE.exists():
+            with open(STATE_FILE) as f:
+                data = json.load(f)
+                SWARMS = data.get("swarms", {})
+    except Exception:
+        SWARMS = {}
+
+
+def reconcile_with_slurm(config):
+    global JOB_TO_SWARM
+
+    login_alias = config["ssh"]["login_alias"]
+    user = config["ssh"].get("user")
+
+    cmd = ["ssh", login_alias, "squeue -h -o '%i|%j|%T'"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    running_jobs = {}
+
+    for line in result.stdout.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3:
+            continue
+        job_id, job_name, state = parts
+        running_jobs[job_id] = state
+
+    JOB_TO_SWARM.clear()
+
+    for swarm_id, swarm in SWARMS.items():
+        job_id = swarm.get("job_id")
+        if job_id in running_jobs:
+            swarm["status"] = "running"
+            JOB_TO_SWARM[job_id] = swarm_id
+        else:
+            swarm["status"] = "terminated"
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -200,7 +251,7 @@ def translate_event(event):
     if event.get("type") != "codex_rpc":
         return None
 
-    job_id = event.get("job_id")
+    job_id = str(event.get("job_id"))
     node_id = event.get("node_id")
     injection_id = event.get("injection_id")
     swarm_id = JOB_TO_SWARM.get(job_id)
@@ -333,6 +384,8 @@ def run_daemon(config):
                     request_id = cmd.get("request_id")
                     payload = cmd.get("payload", {})
 
+                    debug_event(f"command received: {command!r}")
+
                     # swarm_launch
                     if command == "swarm_launch":
                         nodes = payload.get("nodes", 1)
@@ -356,10 +409,13 @@ def run_daemon(config):
                             "job_id": job_id,
                             "node_count": nodes,
                             "system_prompt": system_prompt,
+                            "partition": partition,
+                            "time": time_limit,
                             "status": "running"
                         }
 
                         JOB_TO_SWARM[job_id] = swarm_id
+                        save_state()
 
                         emit_event("swarm_launched", {
                             "request_id": request_id,
@@ -424,25 +480,36 @@ def run_daemon(config):
                             })
                             continue
 
-                        job_id = swarm["job_id"]
-                        login_alias = config["ssh"]["login_alias"]
+                        def handle_swarm_status():
+                            try:
+                                job_id = swarm["job_id"]
+                                login_alias = config["ssh"]["login_alias"]
 
-                        result = subprocess.run(
-                            ["ssh", login_alias, f"squeue -j {job_id} -h -o %T"],
-                            capture_output=True,
-                            text=True
-                        )
+                                result = subprocess.run(
+                                    ["ssh", login_alias, f"squeue -j {job_id} -h -o '%T'"],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=15
+                                )
 
-                        slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
+                                slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
 
-                        emit_event("swarm_status", {
-                            "request_id": request_id,
-                            "swarm_id": swarm_id,
-                            "job_id": job_id,
-                            "node_count": swarm["node_count"],
-                            "status": swarm["status"],
-                            "slurm_state": slurm_state
-                        })
+                                emit_event("swarm_status", {
+                                    "request_id": request_id,
+                                    "swarm_id": swarm_id,
+                                    "job_id": job_id,
+                                    "node_count": swarm["node_count"],
+                                    "status": swarm["status"],
+                                    "slurm_state": slurm_state
+                                })
+                            except Exception as e:
+                                emit_event("swarm_status", {
+                                    "request_id": request_id,
+                                    "swarm_id": swarm_id,
+                                    "error": str(e)
+                                })
+
+                        threading.Thread(target=handle_swarm_status, daemon=True).start()
 
                     # swarm_terminate
                     elif command == "swarm_terminate":
@@ -453,6 +520,7 @@ def run_daemon(config):
                             login_alias = config["ssh"]["login_alias"]
                             subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
                             swarm["status"] = "terminated"
+                            save_state()
                             emit_event("swarm_terminated", {
                                 "request_id": request_id,
                                 "swarm_id": swarm_id
@@ -477,6 +545,10 @@ def main():
 
     # Store absolute config path so swarm_launch uses the same config
     config["_config_path"] = str(Path(args.config).resolve())
+
+    # Load persisted state and reconcile with Slurm
+    load_state()
+    reconcile_with_slurm(config)
 
     if args.daemon:
         run_daemon(config)
