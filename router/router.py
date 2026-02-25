@@ -9,6 +9,7 @@ import select
 from pathlib import Path
 from datetime import datetime, timezone
 import threading
+import re
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
@@ -20,6 +21,10 @@ from common.config import load_config
 
 PROTOCOL = "codeswarm.router.v1"
 DEBUG = False
+
+SWARMS = {}
+JOB_TO_SWARM = {}
+LAST_USAGE = {}
 
 
 def now_iso():
@@ -39,10 +44,7 @@ def emit_event(event_name, data):
 
 def debug_event(message):
     if DEBUG:
-        emit_event("debug", {
-            "source": "router",
-            "message": message
-        })
+        emit_event("debug", {"source": "router", "message": message})
 
 
 # ================================
@@ -70,106 +72,72 @@ def start_remote_follower(config):
 
 
 # ================================
-# Translation Layer
+# Slurm Allocation
 # ================================
 
-def translate_event(event):
-    if event.get("type") != "codex_rpc":
-        return None
+def launch_swarm(config, nodes, partition, time_limit, account=None, qos=None):
+    config_path = config.get("_config_path")
+    if not config_path:
+        raise RuntimeError("Router config path not available for swarm launch")
 
-    payload = event.get("payload", {})
-    method = payload.get("method")
+    if not partition:
+        raise RuntimeError("Swarm launch requires 'partition'")
 
-    job_id = event.get("job_id")
-    node_id = event.get("node_id")
-    injection_id = event.get("injection_id")
+    if not time_limit:
+        raise RuntimeError("Swarm launch requires 'time'")
 
-    # ----------------------------
-    # Turn lifecycle
-    # ----------------------------
+    # Local path to allocate_and_prepare.py
+    repo_root = Path(__file__).resolve().parents[1]
+    allocate_script = repo_root / "slurm" / "allocate_and_prepare.py"
 
-    if method == "turn/started":
-        return ("turn_started", {
-            "job_id": job_id,
-            "node_id": node_id,
-            "injection_id": injection_id
-        })
+    cmd = [
+        "python3",
+        str(allocate_script),
+        "--config",
+        config_path,
+        "--nodes",
+        str(nodes),
+        "--time",
+        str(time_limit),
+        "--partition",
+        str(partition),
+        "--launch-codex-run"
+    ]
 
-    if method == "turn/completed":
-        return ("turn_complete", {
-            "job_id": job_id,
-            "node_id": node_id,
-            "injection_id": injection_id
-        })
+    if account:
+        cmd += ["--account", str(account)]
 
-    # ----------------------------
-    # Assistant streaming
-    # ----------------------------
+    if qos:
+        cmd += ["--qos", str(qos)]
 
-    if method == "codex/event/agent_message_content_delta":
-        delta = payload["params"]["msg"].get("delta")
-        return ("assistant_delta", {
-            "job_id": job_id,
-            "node_id": node_id,
-            "injection_id": injection_id,
-            "content": delta
-        })
+    result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if method == "codex/event/agent_message":
-        message = payload["params"]["msg"].get("message")
-        return ("assistant", {
-            "job_id": job_id,
-            "node_id": node_id,
-            "injection_id": injection_id,
-            "content": message
-        })
+    output = result.stdout + result.stderr
 
-    # Fallback: task_complete contains final message
-    if method == "codex/event/task_complete":
-        message = payload["params"]["msg"].get("last_agent_message")
-        if message:
-            return ("assistant", {
-                "job_id": job_id,
-                "node_id": node_id,
-                "injection_id": injection_id,
-                "content": message
-            })
+    match = re.search(r"JOB_ID=(\d+)", output)
+    if not match:
+        match = re.search(r"Submitted job (\d+)", output)
 
-    # ----------------------------
-    # Token usage
-    # ----------------------------
+    if not match:
+        raise RuntimeError(f"Unable to parse Slurm JOB_ID. Output:\n{output}")
 
-    if method == "codex/event/token_count":
-        info = payload["params"]["msg"].get("info")
-        if info and "total_token_usage" in info:
-            total = info["total_token_usage"].get("total_tokens")
-            return ("usage", {
-                "job_id": job_id,
-                "node_id": node_id,
-                "injection_id": injection_id,
-                "total_tokens": total
-            })
-
-    # Newer schema: thread/tokenUsage/updated
-    if method == "thread/tokenUsage/updated":
-        token_usage = payload["params"].get("tokenUsage", {})
-        total = token_usage.get("total", {}).get("totalTokens")
-        if total:
-            return ("usage", {
-                "job_id": job_id,
-                "node_id": node_id,
-                "injection_id": injection_id,
-                "total_tokens": total
-            })
-
-    return None
+    return match.group(1)
 
 
 # ================================
 # Injection
 # ================================
 
-def perform_injection(config, request_id, job_id, node_id, content, injection_id):
+def perform_injection(config, request_id, swarm_id, job_id, node_id, content):
+    injection_id = str(uuid.uuid4())
+
+    emit_event("inject_ack", {
+        "request_id": request_id,
+        "swarm_id": swarm_id,
+        "injection_id": injection_id,
+        "node_id": node_id
+    })
+
     try:
         login_alias = config["ssh"]["login_alias"]
         workspace_root = config["cluster"]["workspace_root"]
@@ -201,15 +169,15 @@ def perform_injection(config, request_id, job_id, node_id, content, injection_id
         if result.returncode == 0:
             emit_event("inject_delivered", {
                 "request_id": request_id,
+                "swarm_id": swarm_id,
                 "injection_id": injection_id,
-                "job_id": job_id,
                 "node_id": node_id
             })
         else:
             emit_event("inject_failed", {
                 "request_id": request_id,
+                "swarm_id": swarm_id,
                 "injection_id": injection_id,
-                "job_id": job_id,
                 "node_id": node_id,
                 "error": result.stderr.strip()
             })
@@ -217,15 +185,77 @@ def perform_injection(config, request_id, job_id, node_id, content, injection_id
     except Exception as e:
         emit_event("inject_failed", {
             "request_id": request_id,
+            "swarm_id": swarm_id,
             "injection_id": injection_id,
-            "job_id": job_id,
             "node_id": node_id,
             "error": str(e)
         })
 
 
 # ================================
-# Daemon
+# Translation
+# ================================
+
+def translate_event(event):
+    if event.get("type") != "codex_rpc":
+        return None
+
+    job_id = event.get("job_id")
+    node_id = event.get("node_id")
+    injection_id = event.get("injection_id")
+    swarm_id = JOB_TO_SWARM.get(job_id)
+
+    # Ignore events from jobs not tracked by this router instance
+    if not swarm_id:
+        return None
+
+    payload = event.get("payload", {})
+    method = payload.get("method")
+
+    base = {
+        "swarm_id": swarm_id,
+        "job_id": job_id,
+        "node_id": node_id,
+        "injection_id": injection_id
+    }
+
+    if method == "turn/started":
+        return ("turn_started", base)
+
+    if method == "turn/completed":
+        return ("turn_complete", base)
+
+    if method == "codex/event/agent_message_content_delta":
+        delta = payload["params"]["msg"].get("delta")
+        return ("assistant_delta", {**base, "content": delta})
+
+    if method == "codex/event/agent_message":
+        msg = payload["params"]["msg"].get("message")
+        return ("assistant", {**base, "content": msg})
+
+    if method == "codex/event/token_count":
+        info = payload["params"]["msg"].get("info")
+        if info:
+            total = info["total_token_usage"]["total_tokens"]
+            last = LAST_USAGE.get(injection_id)
+            if last == total:
+                return None
+            LAST_USAGE[injection_id] = total
+            return ("usage", {**base, "total_tokens": total})
+
+    if method == "thread/tokenUsage/updated":
+        total = payload["params"]["tokenUsage"]["total"]["totalTokens"]
+        last = LAST_USAGE.get(injection_id)
+        if last == total:
+            return None
+        LAST_USAGE[injection_id] = total
+        return ("usage", {**base, "total_tokens": total})
+
+    return None
+
+
+# ================================
+# Daemon Loop
 # ================================
 
 def run_daemon(config):
@@ -234,19 +264,18 @@ def run_daemon(config):
     stdout_buffer = b""
     stdin_buffer = b""
 
-    # Make stdin non-blocking (safe because we use os.read and never readline)
+    # non-blocking stdin
     try:
         import fcntl
         fd = sys.stdin.fileno()
         flags = fcntl.fcntl(fd, fcntl.F_GETFL)
         fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-    except Exception:
+    except:
         pass
 
     debug_event("daemon_started")
 
     while True:
-        # Always monitor stdin; non-blocking mode prevents TTY stalls
         ready, _, _ = select.select(
             [proc.stdout, proc.stderr, sys.stdin],
             [],
@@ -254,9 +283,7 @@ def run_daemon(config):
             0.2
         )
 
-        # ----------------------------
-        # Follower stdout (non-blocking)
-        # ----------------------------
+        # Follower stdout
         if proc.stdout in ready:
             chunk = os.read(proc.stdout.fileno(), 4096)
             if chunk:
@@ -264,14 +291,13 @@ def run_daemon(config):
 
                 while b"\n" in stdout_buffer:
                     line, stdout_buffer = stdout_buffer.split(b"\n", 1)
-                    line = line.decode("utf-8", errors="replace").strip()
+                    line = line.decode().strip()
                     if not line:
                         continue
 
                     try:
                         event = json.loads(line)
                     except:
-                        debug_event("invalid_json_from_worker")
                         continue
 
                     translated = translate_event(event)
@@ -279,23 +305,11 @@ def run_daemon(config):
                         event_name, data = translated
                         emit_event(event_name, data)
 
-        # ----------------------------
-        # Follower stderr
-        # ----------------------------
-        if proc.stderr in ready:
-            err = os.read(proc.stderr.fileno(), 4096)
-            if err:
-                debug_event(f"follower_stderr: {err.decode(errors='replace')}")
-
-        # ----------------------------
-        # Stdin commands (non-blocking)
-        # ----------------------------
+        # Stdin commands
         if sys.stdin in ready:
             try:
                 chunk = os.read(sys.stdin.fileno(), 4096)
-            except BlockingIOError:
-                chunk = None
-            except OSError:
+            except:
                 chunk = None
 
             if chunk:
@@ -303,56 +317,146 @@ def run_daemon(config):
 
                 while b"\n" in stdin_buffer:
                     line, stdin_buffer = stdin_buffer.split(b"\n", 1)
-                    line = line.decode("utf-8", errors="replace").strip()
+                    line = line.decode().strip()
                     if not line:
                         continue
 
-                    # Ignore anything that is not valid JSON
                     try:
                         cmd = json.loads(line)
-                    except Exception:
+                    except:
                         continue
 
-                    # Ignore non-protocol lines silently
                     if cmd.get("protocol") != PROTOCOL:
-                        continue
-
-                    if cmd.get("type") != "command":
-                        emit_event("command_rejected", {
-                            "request_id": cmd.get("request_id"),
-                            "reason": "invalid type"
-                        })
                         continue
 
                     command = cmd.get("command")
                     request_id = cmd.get("request_id")
                     payload = cmd.get("payload", {})
 
-                    if command == "inject":
-                        job_id = payload.get("job_id")
-                        node_id = payload.get("node_id", 0)
+                    # swarm_launch
+                    if command == "swarm_launch":
+                        nodes = payload.get("nodes", 1)
+                        partition = payload.get("partition")
+                        time_limit = payload.get("time", "00:01:00")
+                        account = payload.get("account")
+                        qos = payload.get("qos")
+                        system_prompt = payload.get("system_prompt", "")
+
+                        if not partition:
+                            emit_event("command_rejected", {
+                                "request_id": request_id,
+                                "reason": "partition is required"
+                            })
+                            continue
+
+                        job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
+                        swarm_id = str(uuid.uuid4())
+
+                        SWARMS[swarm_id] = {
+                            "job_id": job_id,
+                            "node_count": nodes,
+                            "system_prompt": system_prompt,
+                            "status": "running"
+                        }
+
+                        JOB_TO_SWARM[job_id] = swarm_id
+
+                        emit_event("swarm_launched", {
+                            "request_id": request_id,
+                            "swarm_id": swarm_id,
+                            "job_id": job_id,
+                            "node_count": nodes,
+                            "partition": partition,
+                            "time": time_limit
+                        })
+
+                        # inject system prompt
+                        for node_id in range(nodes):
+                            threading.Thread(
+                                target=perform_injection,
+                                args=(config, request_id, swarm_id, job_id, node_id, system_prompt),
+                                daemon=True
+                            ).start()
+
+                    # inject
+                    elif command == "inject":
+                        swarm_id = payload.get("swarm_id")
+                        nodes = payload.get("nodes", "all")
                         content = payload.get("content")
 
-                        injection_id = str(uuid.uuid4())
+                        swarm = SWARMS.get(swarm_id)
+                        if not swarm:
+                            continue
 
-                        emit_event("inject_ack", {
+                        job_id = swarm["job_id"]
+                        node_count = swarm["node_count"]
+
+                        if nodes == "all":
+                            targets = range(node_count)
+                        elif isinstance(nodes, list):
+                            targets = nodes
+                        else:
+                            targets = [nodes]
+
+                        for node_id in targets:
+                            threading.Thread(
+                                target=perform_injection,
+                                args=(config, request_id, swarm_id, job_id, node_id, content),
+                                daemon=True
+                            ).start()
+
+                    # swarm_list
+                    elif command == "swarm_list":
+                        emit_event("swarm_list", {
                             "request_id": request_id,
-                            "injection_id": injection_id,
+                            "swarms": SWARMS
+                        })
+
+                    # swarm_status
+                    elif command == "swarm_status":
+                        swarm_id = payload.get("swarm_id")
+                        swarm = SWARMS.get(swarm_id)
+
+                        if not swarm:
+                            emit_event("command_rejected", {
+                                "request_id": request_id,
+                                "reason": "unknown swarm_id"
+                            })
+                            continue
+
+                        job_id = swarm["job_id"]
+                        login_alias = config["ssh"]["login_alias"]
+
+                        result = subprocess.run(
+                            ["ssh", login_alias, f"squeue -j {job_id} -h -o %T"],
+                            capture_output=True,
+                            text=True
+                        )
+
+                        slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
+
+                        emit_event("swarm_status", {
+                            "request_id": request_id,
+                            "swarm_id": swarm_id,
                             "job_id": job_id,
-                            "node_id": node_id
+                            "node_count": swarm["node_count"],
+                            "status": swarm["status"],
+                            "slurm_state": slurm_state
                         })
 
-                        threading.Thread(
-                            target=perform_injection,
-                            args=(config, request_id, job_id, node_id, content, injection_id),
-                            daemon=True
-                        ).start()
-
-                    else:
-                        emit_event("command_rejected", {
-                            "request_id": request_id,
-                            "reason": "unknown command"
-                        })
+                    # swarm_terminate
+                    elif command == "swarm_terminate":
+                        swarm_id = payload.get("swarm_id")
+                        swarm = SWARMS.get(swarm_id)
+                        if swarm:
+                            job_id = swarm["job_id"]
+                            login_alias = config["ssh"]["login_alias"]
+                            subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
+                            swarm["status"] = "terminated"
+                            emit_event("swarm_terminated", {
+                                "request_id": request_id,
+                                "swarm_id": swarm_id
+                            })
 
 
 # ================================
@@ -371,9 +475,13 @@ def main():
 
     config = load_config(args.config)
 
+    # Store absolute config path so swarm_launch uses the same config
+    config["_config_path"] = str(Path(args.config).resolve())
+
     if args.daemon:
         run_daemon(config)
 
 
 if __name__ == "__main__":
     main()
+

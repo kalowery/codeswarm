@@ -36,6 +36,18 @@ def jsonrpc_notification(method, params=None):
 
 
 def main():
+    # Ensure worker runs from project root
+    config = load_config_from_env() if 'load_config_from_env' in globals() else None
+    try:
+        if config:
+            workspace_root = config["cluster"]["workspace_root"]
+            cluster_subdir = config["cluster"]["cluster_subdir"]
+            project_root = os.path.join(workspace_root, cluster_subdir)
+            os.chdir(project_root)
+    except Exception:
+        pass
+
+
     job_id = os.environ["SLURM_JOB_ID"]
     node_id = int(os.environ["SLURM_NODEID"])
     hostname = os.uname().nodename
