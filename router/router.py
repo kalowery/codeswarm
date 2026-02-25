@@ -1,57 +1,53 @@
-#!/usr/bin/env python3
 import argparse
 import subprocess
 import json
-import time
-import shlex
-import uuid
 import sys
-import signal
+import uuid
+import shlex
+import os
+import select
 from pathlib import Path
+from datetime import datetime, timezone
+import threading
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
 
+
+# ================================
+# Protocol
+# ================================
+
+PROTOCOL = "codeswarm.router.v1"
 DEBUG = False
 
-def debug(msg):
-    if DEBUG:
-        print(f"[DEBUG] {msg}", file=sys.stderr, flush=True)
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
-# =========================
-# Injection
-# =========================
-
-def inject_prompt_internal(config, job_id, node_id, text):
-    login_alias = config["ssh"]["login_alias"]
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
-
-    inbox_path = f"{workspace_root}/{cluster_subdir}/mailbox/inbox/{job_id}_{int(node_id):02d}.jsonl"
-
-    injection_id = str(uuid.uuid4())
-
-    payload = {
-        "type": "user",
-        "content": text,
-        "injection_id": injection_id
+def emit_event(event_name, data):
+    envelope = {
+        "protocol": PROTOCOL,
+        "type": "event",
+        "timestamp": now_iso(),
+        "event": event_name,
+        "data": data
     }
-
-    json_line = json.dumps(payload)
-    remote_cmd = f"printf '%s\n' {shlex.quote(json_line)} >> {inbox_path}"
-
-    result = subprocess.run(["ssh", login_alias, remote_cmd])
-
-    if result.returncode != 0:
-        raise RuntimeError("Injection failed")
-
-    return injection_id
+    print(json.dumps(envelope), flush=True)
 
 
-# =========================
-# Remote Follower Startup
-# =========================
+def debug_event(message):
+    if DEBUG:
+        emit_event("debug", {
+            "source": "router",
+            "message": message
+        })
+
+
+# ================================
+# Remote Follower
+# ================================
 
 def start_remote_follower(config):
     login_alias = config["ssh"]["login_alias"]
@@ -59,41 +55,23 @@ def start_remote_follower(config):
     cluster_subdir = config["cluster"]["cluster_subdir"]
 
     outbox_dir = f"{workspace_root}/{cluster_subdir}/mailbox/outbox"
-    agent_remote_dir = f"{workspace_root}/{cluster_subdir}/agent"
-    follower_remote_path = f"{agent_remote_dir}/outbox_follower.py"
 
-    # Bootstrap follower if missing
-    check = subprocess.run(["ssh", login_alias, f"test -f {follower_remote_path}"])
-
-    if check.returncode != 0:
-        local_follower = Path(__file__).resolve().parents[1] / "agent" / "outbox_follower.py"
-        subprocess.run(["ssh", login_alias, f"mkdir -p {agent_remote_dir}"], check=True)
-        subprocess.run([
-            "rsync",
-            "-az",
-            str(local_follower),
-            f"{login_alias}:{agent_remote_dir}/"
-        ], check=True)
-
-    cmd = [
-        "ssh",
-        login_alias,
-        "python3",
-        follower_remote_path,
-        outbox_dir
-    ]
+    remote_cmd = (
+        f"python3 {workspace_root}/{cluster_subdir}/agent/outbox_follower.py "
+        f"{outbox_dir}"
+    )
 
     return subprocess.Popen(
-        cmd,
+        ["ssh", login_alias, remote_cmd],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0
     )
 
 
-# =========================
-# Event Translation
-# =========================
+# ================================
+# Translation Layer
+# ================================
 
 def translate_event(event):
     if event.get("type") != "codex_rpc":
@@ -101,103 +79,187 @@ def translate_event(event):
 
     payload = event.get("payload", {})
     method = payload.get("method")
-    params = payload.get("params", {})
-    msg = params.get("msg", {})
+
+    job_id = event.get("job_id")
+    node_id = event.get("node_id")
     injection_id = event.get("injection_id")
 
+    # ----------------------------
+    # Turn lifecycle
+    # ----------------------------
+
     if method == "turn/started":
-        return {
-            "type": "turn_started",
-            "job_id": event["job_id"],
-            "node_id": event["node_id"],
+        return ("turn_started", {
+            "job_id": job_id,
+            "node_id": node_id,
             "injection_id": injection_id
-        }
+        })
+
+    if method == "turn/completed":
+        return ("turn_complete", {
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id
+        })
+
+    # ----------------------------
+    # Assistant streaming
+    # ----------------------------
 
     if method == "codex/event/agent_message_content_delta":
-        delta = msg.get("delta")
-        if delta:
-            return {
-                "type": "assistant_delta",
-                "job_id": event["job_id"],
-                "node_id": event["node_id"],
-                "injection_id": injection_id,
-                "content": delta
-            }
+        delta = payload["params"]["msg"].get("delta")
+        return ("assistant_delta", {
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+            "content": delta
+        })
 
     if method == "codex/event/agent_message":
-        message = msg.get("message")
-        if message is not None:
-            return {
-                "type": "assistant",
-                "job_id": event["job_id"],
-                "node_id": event["node_id"],
+        message = payload["params"]["msg"].get("message")
+        return ("assistant", {
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+            "content": message
+        })
+
+    # Fallback: task_complete contains final message
+    if method == "codex/event/task_complete":
+        message = payload["params"]["msg"].get("last_agent_message")
+        if message:
+            return ("assistant", {
+                "job_id": job_id,
+                "node_id": node_id,
                 "injection_id": injection_id,
                 "content": message
-            }
+            })
+
+    # ----------------------------
+    # Token usage
+    # ----------------------------
 
     if method == "codex/event/token_count":
-        info = msg.get("info") or {}
-        total = info.get("total_token_usage", {}).get("total_tokens")
-        if total is not None:
-            return {
-                "type": "usage",
-                "job_id": event["job_id"],
-                "node_id": event["node_id"],
+        info = payload["params"]["msg"].get("info")
+        if info and "total_token_usage" in info:
+            total = info["total_token_usage"].get("total_tokens")
+            return ("usage", {
+                "job_id": job_id,
+                "node_id": node_id,
                 "injection_id": injection_id,
                 "total_tokens": total
-            }
+            })
 
-    if method == "item/completed":
-        item = params.get("item", {})
-        if item.get("type") == "agentMessage":
-            return {
-                "type": "turn_complete",
-                "job_id": event["job_id"],
-                "node_id": event["node_id"],
-                "injection_id": injection_id
-            }
+    # Newer schema: thread/tokenUsage/updated
+    if method == "thread/tokenUsage/updated":
+        token_usage = payload["params"].get("tokenUsage", {})
+        total = token_usage.get("total", {}).get("totalTokens")
+        if total:
+            return ("usage", {
+                "job_id": job_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                "total_tokens": total
+            })
 
     return None
 
 
-# =========================
-# Daemon Mode
-# =========================
+# ================================
+# Injection
+# ================================
+
+def perform_injection(config, request_id, job_id, node_id, content, injection_id):
+    try:
+        login_alias = config["ssh"]["login_alias"]
+        workspace_root = config["cluster"]["workspace_root"]
+        cluster_subdir = config["cluster"]["cluster_subdir"]
+
+        inbox_path = (
+            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
+            f"{job_id}_{int(node_id):02d}.jsonl"
+        )
+
+        payload = {
+            "type": "user",
+            "content": content,
+            "injection_id": injection_id
+        }
+
+        json_line = json.dumps(payload)
+        remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
+
+        timeout = config.get("router", {}).get("inject_timeout_seconds", 60)
+
+        result = subprocess.run(
+            ["ssh", login_alias, remote_cmd],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        if result.returncode == 0:
+            emit_event("inject_delivered", {
+                "request_id": request_id,
+                "injection_id": injection_id,
+                "job_id": job_id,
+                "node_id": node_id
+            })
+        else:
+            emit_event("inject_failed", {
+                "request_id": request_id,
+                "injection_id": injection_id,
+                "job_id": job_id,
+                "node_id": node_id,
+                "error": result.stderr.strip()
+            })
+
+    except Exception as e:
+        emit_event("inject_failed", {
+            "request_id": request_id,
+            "injection_id": injection_id,
+            "job_id": job_id,
+            "node_id": node_id,
+            "error": str(e)
+        })
+
+
+# ================================
+# Daemon
+# ================================
 
 def run_daemon(config):
     proc = start_remote_follower(config)
 
-    debug("Daemon started")
-    debug(f"Follower PID: {proc.pid}")
-
-    import select
-    import os
-
     stdout_buffer = b""
+    stdin_buffer = b""
+
+    # Make stdin non-blocking (safe because we use os.read and never readline)
+    try:
+        import fcntl
+        fd = sys.stdin.fileno()
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except Exception:
+        pass
+
+    debug_event("daemon_started")
 
     while True:
-        fds = [proc.stdout, proc.stderr, sys.stdin]
-
+        # Always monitor stdin; non-blocking mode prevents TTY stalls
         ready, _, _ = select.select(
-            fds,
+            [proc.stdout, proc.stderr, sys.stdin],
             [],
             [],
             0.2
         )
 
-        debug(f"select ready: stdout={proc.stdout in ready}, stderr={proc.stderr in ready}, stdin={sys.stdin in ready}")
-
-        # ---- Always process follower output first ----
+        # ----------------------------
+        # Follower stdout (non-blocking)
+        # ----------------------------
         if proc.stdout in ready:
-            debug("Reading from follower stdout")
-            try:
-                chunk = os.read(proc.stdout.fileno(), 4096)
-            except Exception as e:
-                debug(f"stdout read error: {e}")
-                chunk = None
-
+            chunk = os.read(proc.stdout.fileno(), 4096)
             if chunk:
-                debug(f"Read {len(chunk)} bytes from stdout")
                 stdout_buffer += chunk
 
                 while b"\n" in stdout_buffer:
@@ -206,161 +268,112 @@ def run_daemon(config):
                     if not line:
                         continue
 
-                    debug(f"Raw event line: {line}")
-
                     try:
                         event = json.loads(line)
-                    except Exception as e:
-                        debug(f"JSON parse error: {e}")
+                    except:
+                        debug_event("invalid_json_from_worker")
                         continue
 
                     translated = translate_event(event)
-                    debug(f"Translated: {translated}")
                     if translated:
-                        print(json.dumps(translated), flush=True)
+                        event_name, data = translated
+                        emit_event(event_name, data)
 
+        # ----------------------------
+        # Follower stderr
+        # ----------------------------
         if proc.stderr in ready:
-            debug("Reading from follower stderr")
-            try:
-                err = os.read(proc.stderr.fileno(), 4096)
-                if err:
-                    debug(f"Follower stderr: {err.decode(errors='replace').strip()}")
-            except Exception as e:
-                debug(f"stderr read error: {e}")
+            err = os.read(proc.stderr.fileno(), 4096)
+            if err:
+                debug_event(f"follower_stderr: {err.decode(errors='replace')}")
 
-        # ---- Then handle stdin control ----
+        # ----------------------------
+        # Stdin commands (non-blocking)
+        # ----------------------------
         if sys.stdin in ready:
-            line = sys.stdin.readline()
-            if line:
-                debug(f"Received stdin line: {line.strip()}")
-                try:
-                    cmd = json.loads(line.strip())
-                except Exception as e:
-                    debug(f"Stdin JSON parse error: {e}")
-                    cmd = None
+            try:
+                chunk = os.read(sys.stdin.fileno(), 4096)
+            except BlockingIOError:
+                chunk = None
+            except OSError:
+                chunk = None
 
-                if cmd and cmd.get("action") == "inject":
-                    debug(f"Processing inject command: {cmd}")
+            if chunk:
+                stdin_buffer += chunk
 
-                    # Generate injection_id immediately
-                    injection_id = str(uuid.uuid4())
+                while b"\n" in stdin_buffer:
+                    line, stdin_buffer = stdin_buffer.split(b"\n", 1)
+                    line = line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
 
-                    # Emit ack immediately (non-blocking control plane)
-                    print(json.dumps({
-                        "type": "inject_ack",
-                        "job_id": cmd["job_id"],
-                        "node_id": cmd.get("node_id", 0),
-                        "injection_id": injection_id
-                    }), flush=True)
+                    # Ignore anything that is not valid JSON
+                    try:
+                        cmd = json.loads(line)
+                    except Exception:
+                        continue
 
-                    # Capture values explicitly to avoid closure/race issues
-                    job_id = cmd["job_id"]
-                    node_id = cmd.get("node_id", 0)
-                    content = cmd["content"]
+                    # Ignore non-protocol lines silently
+                    if cmd.get("protocol") != PROTOCOL:
+                        continue
 
-                    # Perform SSH injection in background thread with delivery reporting
-                    import threading
+                    if cmd.get("type") != "command":
+                        emit_event("command_rejected", {
+                            "request_id": cmd.get("request_id"),
+                            "reason": "invalid type"
+                        })
+                        continue
 
-                    def do_inject(job_id, node_id, content, injection_id):
-                        try:
-                            login_alias = config["ssh"]["login_alias"]
-                            workspace_root = config["cluster"]["workspace_root"]
-                            cluster_subdir = config["cluster"]["cluster_subdir"]
+                    command = cmd.get("command")
+                    request_id = cmd.get("request_id")
+                    payload = cmd.get("payload", {})
 
-                            inbox_path = f"{workspace_root}/{cluster_subdir}/mailbox/inbox/{job_id}_{int(node_id):02d}.jsonl"
+                    if command == "inject":
+                        job_id = payload.get("job_id")
+                        node_id = payload.get("node_id", 0)
+                        content = payload.get("content")
 
-                            payload = {
-                                "type": "user",
-                                "content": content,
-                                "injection_id": injection_id
-                            }
+                        injection_id = str(uuid.uuid4())
 
-                            json_line = json.dumps(payload)
-                            remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
+                        emit_event("inject_ack", {
+                            "request_id": request_id,
+                            "injection_id": injection_id,
+                            "job_id": job_id,
+                            "node_id": node_id
+                        })
 
-                            timeout = config.get("router", {}).get("inject_timeout_seconds", 60)
+                        threading.Thread(
+                            target=perform_injection,
+                            args=(config, request_id, job_id, node_id, content, injection_id),
+                            daemon=True
+                        ).start()
 
-                            result = subprocess.run(
-                                ["ssh", login_alias, remote_cmd],
-                                capture_output=True,
-                                text=True,
-                                timeout=timeout
-                            )
-
-                            if result.returncode == 0:
-                                print(json.dumps({
-                                    "type": "inject_delivered",
-                                    "job_id": job_id,
-                                    "node_id": node_id,
-                                    "injection_id": injection_id
-                                }), flush=True)
-                            else:
-                                print(json.dumps({
-                                    "type": "inject_failed",
-                                    "job_id": job_id,
-                                    "node_id": node_id,
-                                    "injection_id": injection_id,
-                                    "error": result.stderr.strip()
-                                }), flush=True)
-
-                        except Exception as e:
-                            print(json.dumps({
-                                "type": "inject_failed",
-                                "job_id": job_id,
-                                "node_id": node_id,
-                                "injection_id": injection_id,
-                                "error": str(e)
-                            }), flush=True)
-                            debug(f"Background inject exception: {e}")
-
-                    threading.Thread(
-                        target=do_inject,
-                        args=(job_id, node_id, content, injection_id),
-                        daemon=True
-                    ).start()
-
-        if proc.poll() is not None:
-            print(json.dumps({"type": "follower_exit"}), flush=True)
-            break
+                    else:
+                        emit_event("command_rejected", {
+                            "request_id": request_id,
+                            "reason": "unknown command"
+                        })
 
 
-# =========================
-# CLI Entry
-# =========================
+# ================================
+# Main
+# ================================
 
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--inject", action="store_true")
     parser.add_argument("--daemon", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--job-id")
-    parser.add_argument("--node", default=0)
-    parser.add_argument("--text")
-
     args = parser.parse_args()
-    config = load_config(args.config)
 
+    global DEBUG
     DEBUG = args.debug
+
+    config = load_config(args.config)
 
     if args.daemon:
         run_daemon(config)
-        sys.exit(0)
 
-    if args.inject:
-        if not args.job_id or not args.text:
-            print("--inject requires --job-id and --text")
-            sys.exit(1)
 
-        injection_id = inject_prompt_internal(
-            config,
-            args.job_id,
-            args.node,
-            args.text
-        )
-
-        print(f"Injected prompt to job {args.job_id} node {int(args.node):02d}.")
-        print(f"injection_id={injection_id}")
-        sys.exit(0)
-
-    print("No mode specified. Use --daemon or --inject.")
+if __name__ == "__main__":
+    main()
