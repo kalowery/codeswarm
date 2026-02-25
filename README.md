@@ -1,47 +1,151 @@
 # Codeswarm
 
-Codeswarm is a scalable Slurm-based distributed Codex runtime designed for HPC clusters.
+Codeswarm is a scalable, Slurm-native distributed Codex runtime for HPC clusters.
 
-It provides:
-
-- Router control plane (JSON stdin/stdout protocol)
-- Slurm job orchestration
-- Shared filesystem mailbox transport
-- Correlated prompt injection
-- Streaming assistant responses
-- OpenClaw-compatible daemon mode
+It provides a versioned TCP control plane, multi-swarm orchestration, correlated injection lifecycle, and streaming agent responses across distributed compute nodes.
 
 ---
 
-## Quick Start
-
-### 1. Allocate Worker
+## Architecture
 
 ```
-python slurm/allocate_and_prepare.py --config configs/<cluster>.json
+CLI (Node.js)
+   ↓ TCP (127.0.0.1:8765)
+Router (Python daemon)
+   ↓ SSH
+HPC Login Node
+   ↓ Slurm
+Compute Nodes
+   ↓ Shared Filesystem Mailbox
+Outbox Follower → Router → CLI
 ```
 
-### 2. Start Router
+### Core Components
 
+- **CLI** – User-facing control client (Node.js)
+- **Router** – Persistent control-plane daemon (Python)
+- **Slurm Allocator** – Provisions nodes
+- **Codex Worker** – Runs on compute nodes
+- **Mailbox Transport** – Shared filesystem JSONL event stream
+- **Outbox Follower** – Single scalable SSH streaming process
+
+---
+
+## Control Plane
+
+Transport:
+- Local TCP (`127.0.0.1:8765`)
+- JSON-line protocol
+- Versioned envelope: `codeswarm.router.v1`
+
+The CLI automatically spawns and connects to the router daemon.
+
+All responses are correlated by `request_id`.
+
+---
+
+## Multi-Swarm Model
+
+Codeswarm supports multiple concurrent swarms.
+
+Each swarm has:
+
+- `swarm_id`
+- `job_id`
+- `node_count`
+- `system_prompt`
+- `status`
+
+All runtime events include:
+
+- `swarm_id`
+- `job_id`
+- `node_id`
+- `injection_id`
+
+---
+
+## Quick Start (CLI Recommended)
+
+From `codeswarm/cli`:
+
+```bash
+npm install
+npm run build
 ```
+
+Launch a swarm:
+
+```bash
+node dist/index.js launch \
+  --nodes 4 \
+  --partition mi2508x \
+  --time 00:10:00 \
+  --prompt "You are a focused autonomous agent." \
+  --config ../configs/hpcfund.json
+```
+
+Inject into swarm:
+
+```bash
+node dist/index.js inject <swarm_id> \
+  --prompt "Optimize GEMM tiling." \
+  --config ../configs/hpcfund.json
+```
+
+Check status:
+
+```bash
+node dist/index.js status <swarm_id> \
+  --config ../configs/hpcfund.json
+```
+
+---
+
+## Router (Advanced Usage)
+
+Manual router startup:
+
+```bash
 python router/router.py --config configs/<cluster>.json --daemon
 ```
 
-### 3. Inject Prompt
+The router:
 
-```json
-{"action":"inject","job_id":"<JOB_ID>","node_id":0,"content":"Hello"}
-```
+- Maintains persistent swarm registry
+- Reconciles state with Slurm
+- Streams worker events via single SSH follower
+- Emits structured JSON events over TCP
+- Never blocks control loop
 
 ---
 
-## Documentation
-
-Full documentation available in:
+## Slurm Provisioning Flow
 
 ```
-docs/USER_GUIDE.md
+Router (local)
+   → allocate_and_prepare.py (local)
+      → SSH
+         → sbatch
 ```
+
+Provisioning always occurs locally on router host.
+
+Required Slurm flags:
+- `--partition`
+- `--time`
+
+---
+
+## Transport Guarantees
+
+- No stdio IPC
+- No UNIX sockets
+- No pipe buffering issues
+- Deterministic TCP handshake with retry
+- Buffered TCP framing
+- Client registration for event emission
+- Single scalable SSH follower (no per-node tails)
 
 ---
 
@@ -50,22 +154,33 @@ docs/USER_GUIDE.md
 Codeswarm assumes:
 
 - Shared filesystem between login and compute nodes
-- Login node acts as Slurm submission host
-- Passwordless SSH configured
-- Slurm supports graceful termination signals
-
-See `docs/USER_GUIDE.md` for detailed cluster assumptions and configuration.
+- Passwordless SSH
+- Slurm with `--signal=TERM@60` support
+- squeue accessible from login node
 
 ---
 
-## Status
+## System Status (2026‑02‑25)
 
-Stable daemon mode with:
+Stable:
 
-- Non-blocking injection
-- Delivery reporting
-- Configurable SSH timeout
-- Single SSH scalable follower
-- Correlated event lifecycle
+- TCP control plane
+- Multi-swarm orchestration
+- Correlated injection lifecycle
+- Non-blocking daemon
+- Persistent router state
+- Slurm reconciliation
+- Structured event streaming
 
-Production-ready for OpenClaw integration.
+Ready for:
+
+- OpenClaw integration
+- Web UI reuse
+- Production HPC workflows
+
+---
+
+## Documentation
+
+- CLI docs: `cli/README.md`
+- Full guide: `docs/USER_GUIDE.md`
