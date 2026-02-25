@@ -4,6 +4,7 @@ import subprocess
 import json
 import time
 import shlex
+import uuid
 from pathlib import Path
 import sys
 
@@ -24,12 +25,15 @@ def translate_event(event):
     params = payload.get("params", {})
     msg = params.get("msg", {})
 
+    injection_id = event.get("injection_id")
+
     # --- Turn started ---
     if method == "turn/started":
         return {
             "type": "turn_started",
             "job_id": event["job_id"],
-            "node_id": event["node_id"]
+            "node_id": event["node_id"],
+            "injection_id": injection_id
         }
 
     # --- Streaming assistant deltas ---
@@ -40,6 +44,7 @@ def translate_event(event):
                 "type": "assistant_delta",
                 "job_id": event["job_id"],
                 "node_id": event["node_id"],
+                "injection_id": injection_id,
                 "content": delta
             }
 
@@ -51,6 +56,7 @@ def translate_event(event):
                 "type": "assistant",
                 "job_id": event["job_id"],
                 "node_id": event["node_id"],
+                "injection_id": injection_id,
                 "content": message
             }
 
@@ -63,6 +69,7 @@ def translate_event(event):
                 "type": "usage",
                 "job_id": event["job_id"],
                 "node_id": event["node_id"],
+                "injection_id": injection_id,
                 "total_tokens": total
             }
 
@@ -73,7 +80,8 @@ def translate_event(event):
             return {
                 "type": "turn_complete",
                 "job_id": event["job_id"],
-                "node_id": event["node_id"]
+                "node_id": event["node_id"],
+                "injection_id": injection_id
             }
 
     return None
@@ -187,9 +195,12 @@ def inject_prompt(config, job_id, node_id, text):
 
     inbox_path = f"{workspace_root}/{cluster_subdir}/mailbox/inbox/{job_id}_{int(node_id):02d}.jsonl"
 
+    injection_id = str(uuid.uuid4())
+
     payload = {
         "type": "user",
-        "content": text
+        "content": text,
+        "injection_id": injection_id
     }
 
     json_line = json.dumps(payload)
@@ -202,6 +213,7 @@ def inject_prompt(config, job_id, node_id, text):
         sys.exit(1)
 
     print(f"Injected prompt to job {job_id} node {int(node_id):02d}.")
+    print(f"injection_id={injection_id}")
 
 
 if __name__ == "__main__":

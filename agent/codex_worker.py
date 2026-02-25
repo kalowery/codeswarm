@@ -69,6 +69,7 @@ def main():
     rpc_id = 0
     thread_id = None
     shutdown_requested = False
+    current_injection_id = None
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -128,6 +129,7 @@ def main():
                             "type": "codex_rpc",
                             "job_id": job_id,
                             "node_id": node_id,
+                            "injection_id": current_injection_id,
                             "payload": msg
                         })
 
@@ -174,6 +176,7 @@ def main():
                         continue
 
                     if event.get("type") == "user":
+                        current_injection_id = event.get("injection_id")
                         send_request("turn/start", {
                             "threadId": thread_id,
                             "input": [
