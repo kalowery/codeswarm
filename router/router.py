@@ -3,6 +3,7 @@ import argparse
 import subprocess
 import json
 import time
+import shlex
 from pathlib import Path
 import sys
 
@@ -85,128 +86,120 @@ def stream_outbox(config, fixed_job_id=None):
 
     outbox_dir = f"{workspace_root}/{cluster_subdir}/mailbox/outbox"
 
-    print(f"Streaming outbox for active Slurm jobs in: {outbox_dir}")
+    print(f"Streaming outbox via remote follower in: {outbox_dir}")
+
+    cmd = [
+        "ssh",
+        login_alias,
+        "python3",
+        f"{workspace_root}/{cluster_subdir}/agent/outbox_follower.py",
+        outbox_dir
+    ]
+
+    print("DEBUG SSH CMD:", cmd)
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0
+    )
+
+    stdout_buffer = b""
+    stderr_buffer = b""
 
     import select
 
-    while True:
-        # --- Determine which jobs to monitor ---
-        if fixed_job_id:
-            active_jobs = [fixed_job_id]
-        else:
-            result = subprocess.run(
-                ["ssh", login_alias, "squeue -h -n codeswarm -o %A"],
-                capture_output=True,
-                text=True
-            )
+    try:
+        while True:
+            ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
 
-            if result.returncode != 0:
-                print("Failed to query active Slurm jobs.")
-                print(result.stderr)
-                time.sleep(5)
-                continue
+            for stream in ready:
+                chunk = stream.read(4096)
+                if not chunk:
+                    continue
 
-            active_jobs = [jid.strip() for jid in result.stdout.splitlines() if jid.strip()]
-
-            if not active_jobs:
-                print("No active Slurm jobs found. Retrying in 5 seconds...")
-                time.sleep(5)
-                continue
-
-        print("Monitoring jobs:", active_jobs)
-
-        # For now assume single-node per job (_00)
-        outbox_files = [
-            f"{outbox_dir}/{jid}_00.jsonl"
-            for jid in active_jobs
-        ]
-
-        # Build SSH tail command (explicit filenames, no glob)
-        cmd = [
-            "ssh",
-            login_alias,
-            "stdbuf",
-            "-oL",
-            "-eL",
-            "tail",
-            "-n",
-            "+1",
-            "-F",
-        ] + outbox_files
-
-        print("DEBUG SSH CMD:", cmd)
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0
-        )
-
-        stdout_buffer = b""
-        stderr_buffer = b""
-
-        try:
-            while True:
-                ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], 0.5)
-
-                for stream in ready:
-                    chunk = stream.read(4096)
-                    if not chunk:
-                        continue
-
-                    if stream is proc.stderr:
-                        stderr_buffer += chunk
-                        while b"\n" in stderr_buffer:
-                            line, stderr_buffer = stderr_buffer.split(b"\n", 1)
-                            line = line.decode("utf-8", errors="replace").strip()
-                            if line:
-                                print("SSH STDERR:", line)
-                        continue
-
-                    # stdout handling
-                    stdout_buffer += chunk
-
-                    while b"\n" in stdout_buffer:
-                        line, stdout_buffer = stdout_buffer.split(b"\n", 1)
+                if stream is proc.stderr:
+                    stderr_buffer += chunk
+                    while b"\n" in stderr_buffer:
+                        line, stderr_buffer = stderr_buffer.split(b"\n", 1)
                         line = line.decode("utf-8", errors="replace").strip()
+                        if line:
+                            print("SSH STDERR:", line)
+                    continue
 
-                        if not line:
-                            continue
+                stdout_buffer += chunk
 
-                        print(f"RAW: {line}")
+                while b"\n" in stdout_buffer:
+                    line, stdout_buffer = stdout_buffer.split(b"\n", 1)
+                    line = line.decode("utf-8", errors="replace").strip()
 
-                        # Ignore tail headers like ==> file <==
-                        if line.startswith("==>") and line.endswith("<=="):
-                            continue
+                    if not line:
+                        continue
 
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            print("Could not decode " + line)
-                            continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        print("Could not decode " + line)
+                        continue
 
-                        translated = translate_event(event)
-                        if translated:
-                            print(json.dumps(translated, indent=2))
+                    if fixed_job_id and event.get("job_id") != fixed_job_id:
+                        continue
 
-                if proc.poll() is not None:
-                    print("SSH stream terminated.")
-                    break
+                    translated = translate_event(event)
+                    if translated:
+                        print(json.dumps(translated, indent=2))
 
-        except KeyboardInterrupt:
-            print("Stopping stream...")
-        finally:
-            proc.terminate()
+            if proc.poll() is not None:
+                print("Remote follower terminated.")
+                break
+
+    except KeyboardInterrupt:
+        print("Router shutting down.")
+        proc.terminate()
+
+def inject_prompt(config, job_id, node_id, text):
+    login_alias = config["ssh"]["login_alias"]
+    workspace_root = config["cluster"]["workspace_root"]
+    cluster_subdir = config["cluster"]["cluster_subdir"]
+
+    inbox_path = f"{workspace_root}/{cluster_subdir}/mailbox/inbox/{job_id}_{int(node_id):02d}.jsonl"
+
+    payload = {
+        "type": "user",
+        "content": text
+    }
+
+    json_line = json.dumps(payload)
+    remote_cmd = f"printf '%s\n' {shlex.quote(json_line)} >> {inbox_path}"
+
+    result = subprocess.run(["ssh", login_alias, remote_cmd])
+
+    if result.returncode != 0:
+        print("Injection failed.")
+        sys.exit(1)
+
+    print(f"Injected prompt to job {job_id} node {int(node_id):02d}.")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--stream-outbox", action="store_true")
     parser.add_argument("--job-id", help="Monitor a specific job_id without querying Slurm")
+    parser.add_argument("--inject", action="store_true", help="Inject a prompt into a running job")
+    parser.add_argument("--node", default=0, help="Node id for injection (default 0)")
+    parser.add_argument("--text", help="Prompt text for injection")
 
     args = parser.parse_args()
     config = load_config(args.config)
+
+    if args.inject:
+        if not args.job_id or not args.text:
+            print("--inject requires --job-id and --text")
+            sys.exit(1)
+        inject_prompt(config, args.job_id, args.node, args.text)
+        sys.exit(0)
 
     if args.stream_outbox:
         stream_outbox(config, fixed_job_id=args.job_id)

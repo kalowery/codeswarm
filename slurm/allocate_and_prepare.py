@@ -138,18 +138,24 @@ if __name__ == "__main__":
     hpc_base = f"{workspace_root}/{cluster_subdir}"
     login_alias = config["ssh"]["login_alias"]
 
-    # ✅ DEPLOY WORKER BEFORE SUBMISSION
+    # ✅ DEPLOY AGENT DIRECTORY (worker + follower) BEFORE SUBMISSION
     if args.launch_codex_run:
-        ssh_login(login_alias, f"mkdir -p {hpc_base}/agent")
-        worker_local = Path(__file__).parent.parent / "agent" / "codex_worker.py"
-        worker_remote = f"{hpc_base}/agent/codex_worker.py"
-        with open(worker_local, "r") as f:
-            subprocess.run(
-                ["ssh", login_alias, f"cat > {worker_remote}"],
-                input=f.read(),
-                text=True,
-                check=True,
-            )
+        agent_local_dir = Path(__file__).parent.parent / "agent"
+        agent_remote_dir = f"{hpc_base}/agent"
+
+        # Ensure remote directory exists
+        ssh_login(login_alias, f"mkdir -p {agent_remote_dir}")
+
+        # Rsync entire agent directory (codex_worker.py, outbox_follower.py, future utilities)
+        subprocess.run(
+            [
+                "rsync",
+                "-az",
+                str(agent_local_dir) + "/",
+                f"{login_alias}:{agent_remote_dir}/",
+            ],
+            check=True,
+        )
 
     print("Submitting allocation job...")
     job_id = submit_job(args, config)
