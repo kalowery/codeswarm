@@ -1,211 +1,71 @@
-# codeswarm
+# Codeswarm
 
-Distributed, interactive Codex execution on Slurm-based HPC clusters.
+Codeswarm is a scalable Slurm-based distributed Codex runtime designed for HPC clusters.
 
-codeswarm turns a Slurm allocation into a fleet of persistent Codex app-server agents, each running on its own compute node, controllable from outside the cluster via a filesystem-backed message bus.
+It provides:
 
----
-
-## Architecture Overview
-
-```
-OpenClaw (external control plane)
-        ↓
-Router (protocol translator)
-        ↓
-Shared Filesystem Mailbox (JSONL)
-        ↓
-Worker (one per Slurm node)
-        ↓
-Codex `app-server` (JSON-RPC over stdio)
-```
-
-### Key Properties
-
-- ✅ No inbound networking to cluster required
-- ✅ No daemons on login node
-- ✅ Fully Slurm-driven lifecycle (`sbatch`)
-- ✅ Persistent multi-turn Codex sessions per node
-- ✅ Structured JSON-RPC (no PTY scraping)
-- ✅ Streaming assistant deltas
-- ✅ Token usage accounting
-- ✅ Scales to multi-node orchestration
+- Router control plane (JSON stdin/stdout protocol)
+- Slurm job orchestration
+- Shared filesystem mailbox transport
+- Correlated prompt injection
+- Streaming assistant responses
+- OpenClaw-compatible daemon mode
 
 ---
 
-## Why `app-server` Mode?
+## Quick Start
 
-Early prototypes used interactive TTY mode and PTY scraping. That approach was fragile due to:
-
-- ANSI redraw behavior
-- Character-by-character streaming
-- UI-oriented output
-- No stable turn boundaries
-
-codeswarm instead uses:
+### 1. Allocate Worker
 
 ```
-codex app-server --listen stdio://
+python slurm/allocate_and_prepare.py --config configs/<cluster>.json
 ```
 
-This provides:
-
-- Structured JSON-RPC 2.0
-- LSP-style initialization handshake
-- Explicit `thread/start` and `turn/start`
-- Streaming `agent_message_content_delta`
-- Deterministic lifecycle events
-
-This makes Codex a programmable distributed runtime rather than a scraped CLI.
-
----
-
-## Directory Layout
+### 2. Start Router
 
 ```
-codeswarm/
-  agent/
-    codex_worker.py          # JSON-RPC relay worker (runs under Slurm)
-  router/
-    router.py                # Outbox streamer + protocol translator
-  slurm/
-    allocate_and_prepare.py  # Slurm job launcher
-  common/
-    config.py                # Config loading
-  mailbox/
-    inbox/                   # Router → worker
-    outbox/                  # Worker → router
-  tools/
-    node/                    # Bootstrapped Node runtime
-    npm-global/              # Isolated npm prefix (contains codex CLI)
+python router/router.py --config configs/<cluster>.json --daemon
 ```
 
-All HPC-side execution occurs under:
+### 3. Inject Prompt
 
-```
-<workspace_root>/<cluster_subdir>/
-```
-
----
-
-## Worker Lifecycle
-
-Each worker:
-
-1. Launches `codex app-server`
-2. Performs LSP handshake:
-   - `initialize`
-   - `initialized`
-3. Calls `thread/start`
-4. Waits for user input in mailbox
-5. On inbox message:
-   - Calls `turn/start`
-6. Streams JSON-RPC events to outbox
-
-Workers are persistent for the life of the Slurm job.
-
----
-
-## Router Responsibilities
-
-The router:
-
-- Polls (currently) or streams outbox files
-- Translates `codex/event/*` into OpenClaw-friendly events
-- Injects user messages into inbox
-
-Future improvement:
-
-- Replace polling with persistent SSH `tail -F`
-
----
-
-## Message Bus Design
-
-Mailbox files are append-only JSONL:
-
-### Inbox (Router → Worker)
-```
-mailbox/inbox/<JOB_ID>_<NODE_ID>.jsonl
-```
-
-Example:
 ```json
-{"type":"user","content":"Say hello."}
+{"action":"inject","job_id":"<JOB_ID>","node_id":0,"content":"Hello"}
 ```
-
-### Outbox (Worker → Router)
-```
-mailbox/outbox/<JOB_ID>_<NODE_ID>.jsonl
-```
-
-Contains raw JSON-RPC events from Codex app-server.
 
 ---
 
-## Slurm Execution Model
+## Documentation
 
-Jobs are allocated via:
-
-```
-sbatch
-```
-
-Each node runs:
+Full documentation available in:
 
 ```
-python3 agent/codex_worker.py
+docs/USER_GUIDE.md
 ```
-
-One Codex session per node.
 
 ---
 
-## Authentication
+## Cluster Requirements
 
-Codex CLI v0.104.0 uses stored credentials under:
+Codeswarm assumes:
 
-```
-~/.codex
-```
+- Shared filesystem between login and compute nodes
+- Login node acts as Slurm submission host
+- Passwordless SSH configured
+- Slurm supports graceful termination signals
 
-Authentication must be established with:
-
-```
-codex login
-```
-
-Environment variables like `OPENAI_API_KEY` are not used by this CLI version.
+See `docs/USER_GUIDE.md` for detailed cluster assumptions and configuration.
 
 ---
 
-## Current Status
+## Status
 
-✅ LSP handshake working
-✅ thread/start working
-✅ turn/start working
-✅ Streaming deltas working
-✅ Token accounting working
-✅ Multi-turn capable
+Stable daemon mode with:
 
-Next steps:
+- Non-blocking injection
+- Delivery reporting
+- Configurable SSH timeout
+- Single SSH scalable follower
+- Correlated event lifecycle
 
-- Clean router event translator
-- Persistent SSH streaming
-- Multi-node orchestration
-- OpenClaw channel integration
-
----
-
-## Design Principles
-
-- Deterministic > clever
-- Structured protocols > scraped UI
-- Explicit configuration > defaults
-- Isolation of toolchain under workspace
-- Slurm-native lifecycle
-- No cluster-side daemons
-
----
-
-codeswarm turns Codex into a distributed, programmable HPC-native agent runtime.
+Production-ready for OpenClaw integration.
