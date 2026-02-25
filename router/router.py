@@ -88,11 +88,33 @@ def stream_outbox(config, fixed_job_id=None):
 
     print(f"Streaming outbox via remote follower in: {outbox_dir}")
 
+    agent_remote_dir = f"{workspace_root}/{cluster_subdir}/agent"
+    follower_remote_path = f"{agent_remote_dir}/outbox_follower.py"
+
+    # Ensure follower exists on remote (control-plane bootstrap)
+    check = subprocess.run([
+        "ssh", login_alias, f"test -f {follower_remote_path}"
+    ])
+
+    if check.returncode != 0:
+        print("Remote outbox_follower.py not found. Deploying...")
+        local_follower = Path(__file__).resolve().parents[1] / "agent" / "outbox_follower.py"
+        subprocess.run([
+            "ssh", login_alias, f"mkdir -p {agent_remote_dir}"
+        ], check=True)
+        subprocess.run([
+            "rsync",
+            "-az",
+            str(local_follower),
+            f"{login_alias}:{agent_remote_dir}/"
+        ], check=True)
+        print("Deployment complete.")
+
     cmd = [
         "ssh",
         login_alias,
         "python3",
-        f"{workspace_root}/{cluster_subdir}/agent/outbox_follower.py",
+        follower_remote_path,
         outbox_dir
     ]
 
