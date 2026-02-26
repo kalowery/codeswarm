@@ -190,6 +190,14 @@ def launch_swarm(config, nodes, partition, time_limit, account=None, qos=None):
 
     result = subprocess.run(cmd, capture_output=True, text=True)
 
+    # If allocation script failed, propagate error
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Swarm launch failed (exit {result.returncode}).\n"
+            f"STDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+
     output = result.stdout + result.stderr
 
     match = re.search(r"JOB_ID=(\d+)", output)
@@ -466,7 +474,15 @@ def run_daemon(config):
                     })
                     continue
 
-                job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
+                try:
+                    job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e)
+                    })
+                    continue
+
                 swarm_id = str(uuid.uuid4())
 
                 SWARMS[swarm_id] = {
