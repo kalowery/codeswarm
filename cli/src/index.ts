@@ -35,9 +35,20 @@ program
     let requestId: string | null = null;
 
     client.onEvent((e) => {
-      if (requestId && e?.data?.request_id === requestId) {
-        formatter.handle(e);
-        process.exit(0);
+      if (!requestId || e?.data?.request_id !== requestId) return;
+
+      switch (e.event) {
+        case "swarm_list":
+          formatter.handle(e);
+          process.exit(0);
+          break;
+        case "command_rejected":
+          console.error("Error:", e.data?.reason || "Command rejected");
+          process.exit(1);
+          break;
+        default:
+          console.error("Unexpected response:", e.event);
+          process.exit(1);
       }
     });
 
@@ -61,9 +72,20 @@ program
     let requestId: string | null = null;
 
     client.onEvent((e) => {
-      if (requestId && e?.data?.request_id === requestId) {
-        formatter.handle(e);
-        process.exit(0);
+      if (!requestId || e?.data?.request_id !== requestId) return;
+
+      switch (e.event) {
+        case "swarm_status":
+          formatter.handle(e);
+          process.exit(0);
+          break;
+        case "command_rejected":
+          console.error("Error:", e.data?.reason || "Command rejected");
+          process.exit(1);
+          break;
+        default:
+          console.error("Unexpected response:", e.event);
+          process.exit(1);
       }
     });
 
@@ -90,12 +112,23 @@ program
     let requestId: string | null = null;
 
     client.onEvent((e) => {
-      if (requestId && e?.data?.request_id === requestId) {
-        console.log("Swarm launched successfully:\n");
-        Object.entries(e.data).forEach(([k, v]) => {
-          console.log(`${k}: ${v}`);
-        });
-        process.exit(0);
+      if (!requestId || e?.data?.request_id !== requestId) return;
+
+      switch (e.event) {
+        case "swarm_launched":
+          console.log("Swarm launched successfully:\n");
+          Object.entries(e.data).forEach(([k, v]) => {
+            console.log(`${k}: ${v}`);
+          });
+          process.exit(0);
+          break;
+        case "command_rejected":
+          console.error("Launch failed:", e.data?.reason || "Command rejected");
+          process.exit(1);
+          break;
+        default:
+          console.error("Unexpected response:", e.event);
+          process.exit(1);
       }
     });
 
