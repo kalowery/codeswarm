@@ -26,10 +26,6 @@ program
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (cmd: any) => {
     const opts = cmd;
-    if (!opts.config && !opts.router) {
-      console.error("--config required unless --router is provided");
-      process.exit(1);
-    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
@@ -66,10 +62,6 @@ program
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (swarmId: string, cmd: any) => {
     const opts = cmd;
-    if (!opts.config && !opts.router) {
-      console.error("--config required unless --router is provided");
-      process.exit(1);
-    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
@@ -108,10 +100,6 @@ program
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (cmd: any) => {
     const opts = cmd;
-    if (!opts.config && !opts.router) {
-      console.error("--config required unless --router is provided");
-      process.exit(1);
-    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
@@ -155,10 +143,6 @@ program
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (swarmId: string, cmd: any) => {
     const opts = cmd;
-    if (!opts.config && !opts.router) {
-      console.error("--config required unless --router is provided");
-      process.exit(1);
-    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
@@ -339,6 +323,12 @@ async function createTransport(opts: any) {
     if (running) {
       console.error("[codeswarm] Using existing router.");
     } else {
+      if (!opts.config) {
+        throw new Error(
+          "No router running and no --config provided. Cannot start embedded router."
+        );
+      }
+
       console.error("[codeswarm] Starting embedded router...");
 
       const routerProcess = spawn(
@@ -377,34 +367,46 @@ program
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (swarmId: string, cmd: any) => {
     const opts = cmd;
-    if (!opts.config && !opts.router) {
-      console.error("--config required unless --router is provided");
-      process.exit(1);
-    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
 
-    console.log(`🔗 Attached to swarm ${swarmId}`);
-    console.log("Press Ctrl+C to detach.\n");
+    // Validate swarm_id first
+    const statusRequestId = client.status(swarmId);
+    let validated = false;
 
     client.onEvent((e: any) => {
+      // Validation phase
+      if (!validated && e?.data?.request_id === statusRequestId) {
+        if (e.event === "command_rejected") {
+          console.error("Invalid swarm_id.");
+          process.exit(1);
+        }
+
+        if (e.event === "swarm_status") {
+          validated = true;
+          console.log(`🔗 Attached to swarm ${swarmId}`);
+          console.log("Press Ctrl+C to detach.\n");
+        }
+        return;
+      }
+
+      // Do not stream until validated
+      if (!validated) return;
+
+      // Streaming phase
       if (
         e?.data?.swarm_id === swarmId &&
         typeof e?.data?.node_id === "number"
       ) {
         const node = e.data.node_id;
 
-        if (e.event === "assistant_delta") {
-          process.stdout.write(e.data.content);
-        }
-
-        if (e.event === "assistant") {
-          process.stdout.write(e.data.content);
-        }
-
         if (e.event === "turn_started") {
           process.stdout.write(`\n\n[swarm ${swarmId} | node ${node}]\n`);
+        }
+
+        if (e.event === "assistant_delta") {
+          process.stdout.write(e.data.content);
         }
 
         if (e.event === "turn_complete") {
@@ -417,6 +419,9 @@ program
       console.log("\nDetached.");
       process.exit(0);
     });
+
+    // Keep process alive indefinitely
+    await new Promise<void>(() => {});
   });
 
 program.parse(process.argv);
