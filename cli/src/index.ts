@@ -96,8 +96,6 @@ program
   .command("launch")
   .description("Launch new swarm")
   .requiredOption("--nodes <number>", "Number of nodes")
-  .requiredOption("--partition <partition>", "Slurm partition")
-  .requiredOption("--time <time>", "Time limit (e.g. 00:10:00)")
   .requiredOption("--prompt <text>", "System prompt")
   .action(async (cmd: any) => {
     const opts = program.opts();
@@ -134,8 +132,6 @@ program
 
     requestId = client.launch(
       parseInt(cmd.nodes),
-      cmd.partition,
-      cmd.time,
       cmd.prompt
     );
   });
@@ -198,19 +194,27 @@ program
     const injectionRequestIds = new Set<string>();
 
     // Track lifecycle per node
-    const nodeLifecycle = new Map<number, { turnComplete: boolean; delivered: boolean }>();
+    const nodeLifecycle = new Map<
+      number,
+      { turnComplete: boolean; delivered: boolean; assistantSeen: boolean }
+    >();
 
     const maybeExit = () => {
       if (targetNodes.length === 0) return;
 
       for (const node of targetNodes) {
         const state = nodeLifecycle.get(node);
-        if (!state || !state.turnComplete || !state.delivered) {
+        if (
+          !state ||
+          !state.delivered ||
+          !state.assistantSeen ||
+          !state.turnComplete
+        ) {
           return;
         }
       }
 
-      // All targeted nodes have completed AND been delivered
+      // All targeted nodes have delivered, produced assistant output, and completed turn
       setImmediate(() => process.exit(0));
     };
 
@@ -221,7 +225,11 @@ program
       if (reqId && injectionRequestIds.has(reqId)) {
         if (e.event === "inject_ack") {
           const nodeId = e.data.node_id;
-          nodeLifecycle.set(nodeId, { turnComplete: false, delivered: false });
+          nodeLifecycle.set(nodeId, {
+            turnComplete: false,
+            delivered: false,
+            assistantSeen: false,
+          });
           formatter.handle(e);
           return;
         }
@@ -249,13 +257,19 @@ program
       ) {
         formatter.handle(e);
 
-        if (e.event === "turn_complete") {
-          const state = nodeLifecycle.get(e.data.node_id);
-          if (state) {
+        const state = nodeLifecycle.get(e.data.node_id);
+
+        if (state) {
+          if (e.event === "assistant") {
+            state.assistantSeen = true;
+          }
+
+          if (e.event === "turn_complete") {
             state.turnComplete = true;
           }
-          maybeExit();
         }
+
+        maybeExit();
       }
     };
 
@@ -271,8 +285,19 @@ async function createTransport(opts: any) {
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const routerPath = path.resolve(__dirname, "../../router/router.py");
 
-  const host = "127.0.0.1";
-  const port = 8765;
+  let host = "127.0.0.1";
+  let port = 8765;
+
+  if (opts.router) {
+    const [h, p] = String(opts.router).split(":");
+    host = h || host;
+    if (p) {
+      const parsed = parseInt(p, 10);
+      if (!isNaN(parsed)) {
+        port = parsed;
+      }
+    }
+  }
 
   const isRouterRunning = (): Promise<boolean> => {
     return new Promise((resolve) => {

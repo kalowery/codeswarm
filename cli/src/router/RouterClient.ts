@@ -18,11 +18,9 @@ export class RouterClient {
     return requestId;
   }
 
-  launch(nodes: number, partition: string, time: string, systemPrompt: string) {
+  launch(nodes: number, systemPrompt: string) {
     return this.sendCommand("swarm_launch", {
       nodes,
-      partition,
-      time,
       system_prompt: systemPrompt,
     });
   }

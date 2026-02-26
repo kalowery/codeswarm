@@ -13,6 +13,7 @@ import re
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
+from cluster.factory import build_provider
 
 
 # ================================
@@ -49,22 +50,10 @@ def load_state():
         SWARMS = {}
 
 
-def reconcile_with_slurm(config):
+def reconcile(provider):
     global JOB_TO_SWARM
 
-    login_alias = config["ssh"]["login_alias"]
-
-    cmd = ["ssh", login_alias, "squeue -h -o '%i|%j|%T'"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    running_jobs = {}
-
-    for line in result.stdout.splitlines():
-        parts = line.strip().split("|")
-        if len(parts) != 3:
-            continue
-        job_id, job_name, state = parts
-        running_jobs[job_id] = state
+    running_jobs = provider.list_active_jobs()
 
     JOB_TO_SWARM.clear()
 
@@ -101,8 +90,6 @@ def emit_event(event_name, data):
     }
 
     line = json.dumps(envelope) + "\n"
-
-    print("EMIT_EVENT TO TCP:", line.strip(), file=sys.stderr, flush=True)
 
     dead = []
 
@@ -348,7 +335,7 @@ import queue
 COMMAND_QUEUE = queue.Queue()
 TCP_CLIENTS = []
 
-def run_daemon(config):
+def run_daemon(config, provider):
 
     stdout_buffer = b""
 
@@ -376,7 +363,11 @@ def run_daemon(config):
         buffer = b""
         try:
             while True:
-                chunk = conn.recv(4096)
+                try:
+                    chunk = conn.recv(4096)
+                except ConnectionResetError:
+                    break
+
                 if not chunk:
                     break
                 buffer += chunk
@@ -461,21 +452,10 @@ def run_daemon(config):
 
             if command == "swarm_launch":
                 nodes = payload.get("nodes", 1)
-                partition = payload.get("partition")
-                time_limit = payload.get("time", "00:01:00")
-                account = payload.get("account")
-                qos = payload.get("qos")
                 system_prompt = payload.get("system_prompt", "")
 
-                if not partition:
-                    emit_event("command_rejected", {
-                        "request_id": request_id,
-                        "reason": "partition is required"
-                    })
-                    continue
-
                 try:
-                    job_id = launch_swarm(config, nodes, partition, time_limit, account, qos)
+                    job_id = provider.launch(nodes)
                 except Exception as e:
                     emit_event("command_rejected", {
                         "request_id": request_id,
@@ -489,9 +469,8 @@ def run_daemon(config):
                     "job_id": job_id,
                     "node_count": nodes,
                     "system_prompt": system_prompt,
-                    "partition": partition,
-                    "time": time_limit,
-                    "status": "running"
+                    "status": "running",
+                    "backend": config.get("cluster", {}).get("backend", "slurm")
                 }
 
                 JOB_TO_SWARM[job_id] = swarm_id
@@ -501,9 +480,7 @@ def run_daemon(config):
                     "request_id": request_id,
                     "swarm_id": swarm_id,
                     "job_id": job_id,
-                    "node_count": nodes,
-                    "partition": partition,
-                    "time": time_limit
+                    "node_count": nodes
                 })
 
                 for node_id in range(nodes):
@@ -660,9 +637,10 @@ def main():
     # Store absolute config path so swarm_launch uses the same config
     config["_config_path"] = str(Path(args.config).resolve())
 
-    # Load persisted state and reconcile with Slurm
+    # Load persisted state and reconcile with cluster backend
     load_state()
-    reconcile_with_slurm(config)
+    provider = build_provider(config)
+    reconcile(provider)
 
     # Ensure state is flushed on shutdown
     import signal
@@ -675,7 +653,7 @@ def main():
     signal.signal(signal.SIGINT, graceful_shutdown)
 
     if args.daemon:
-        run_daemon(config)
+        run_daemon(config, provider)
 
 
 if __name__ == "__main__":

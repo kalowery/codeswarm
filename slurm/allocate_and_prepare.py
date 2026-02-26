@@ -35,20 +35,22 @@ def build_sbatch_script(args, config):
         f"#SBATCH --error={hpc_base}/codeswarm_%j.err",
     ]
 
+    slurm_cfg = config.get("cluster", {}).get("slurm", {})
+
     if args.partition:
         lines.append(f"#SBATCH --partition={args.partition}")
-    elif config["slurm"]["default_partition"]:
-        lines.append(f"#SBATCH --partition={config['slurm']['default_partition']}")
+    elif slurm_cfg.get("default_partition"):
+        lines.append(f"#SBATCH --partition={slurm_cfg.get('default_partition')}")
 
     if args.account:
         lines.append(f"#SBATCH --account={args.account}")
-    elif config["slurm"]["default_account"]:
-        lines.append(f"#SBATCH --account={config['slurm']['default_account']}")
+    elif slurm_cfg.get("default_account"):
+        lines.append(f"#SBATCH --account={slurm_cfg.get('default_account')}")
 
     if args.qos:
         lines.append(f"#SBATCH --qos={args.qos}")
-    elif config["slurm"]["default_qos"]:
-        lines.append(f"#SBATCH --qos={config['slurm']['default_qos']}")
+    elif slurm_cfg.get("default_qos"):
+        lines.append(f"#SBATCH --qos={slurm_cfg.get('default_qos')}")
 
     lines.extend([
         "",
@@ -85,6 +87,11 @@ def submit_job(args, config):
     login_alias = config["ssh"]["login_alias"]
 
     script = build_sbatch_script(args, config)
+
+    print("----- SBATCH SCRIPT BEGIN -----")
+    print(script)
+    print("----- SBATCH SCRIPT END -----")
+
     result = ssh_login(login_alias, "sbatch", input_text=script)
 
     if result.returncode != 0:
@@ -132,7 +139,8 @@ if __name__ == "__main__":
     config = load_config(args.config)
 
     if not args.time:
-        args.time = config["slurm"]["default_time"]
+        slurm_cfg = config.get("cluster", {}).get("slurm", {})
+        args.time = slurm_cfg.get("time_limit") or slurm_cfg.get("default_time")
 
     workspace_root = config["cluster"]["workspace_root"]
     cluster_subdir = config["cluster"]["cluster_subdir"]
