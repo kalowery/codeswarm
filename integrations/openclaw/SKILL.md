@@ -92,13 +92,15 @@ If the user asks to:
 Then:
 
 1. Ensure codeswarm_swarm_id exists.
-2. Use exec in JSON streaming mode:
+2. Use exec in human streaming mode:
 
-   codeswarm attach <codeswarm_swarm_id> --json --config <codeswarm_config_path>
+   codeswarm attach <codeswarm_swarm_id> --config <codeswarm_config_path>
 
 3. Keep the exec session open.
-4. Continuously read and process JSON event lines without waiting for further user prompts.
-5. Do not expect human-formatted prefixes. Parse each line as structured JSON.
+4. Continuously read and process streamed output without waiting for further user prompts.
+5. Expect human-formatted prefixes like:
+   [swarm <swarm_id> | node <node_id>]
+   and group content accordingly.
 
 ---
 
