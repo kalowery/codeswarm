@@ -6,12 +6,14 @@ export class TcpTransport implements ITransport {
   private listeners: ((msg: any) => void)[] = [];
   private buffer = "";
   private connected = false;
+  private debug = false;
 
-  constructor(host: string, port: number) {
+  constructor(host: string, port: number, debug = false) {
+    this.debug = debug;
     this.connectWithRetry(host, port);
   }
 
-  private connectWithRetry(host: string, port: number, retries = 50) {
+  private connectWithRetry(host: string, port: number, deadline = Date.now() + 60000) {
     const socket = net.createConnection({ host, port });
 
     socket.on("connect", () => {
@@ -22,12 +24,13 @@ export class TcpTransport implements ITransport {
 
     socket.on("error", (err) => {
       socket.destroy();
-      if (retries > 0) {
+
+      if (Date.now() < deadline) {
         setTimeout(() => {
-          this.connectWithRetry(host, port, retries - 1);
-        }, 100);
+          this.connectWithRetry(host, port, deadline);
+        }, 250);
       } else {
-        console.error("Unable to connect to router:", err);
+        console.error("Unable to connect to router after 60s:", err);
       }
     });
   }
@@ -44,6 +47,10 @@ export class TcpTransport implements ITransport {
         this.buffer = this.buffer.slice(idx + 1);
 
         if (!line) continue;
+
+        if (this.debug) {
+          console.error(line);
+        }
 
         try {
           const msg = JSON.parse(line);

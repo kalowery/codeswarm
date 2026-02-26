@@ -7,6 +7,7 @@ import { RouterClient } from "./router/RouterClient.js";
 import { EventFormatter } from "./formatter/EventFormatter.js";
 import path from "path";
 import process from "process";
+import net from "net";
 
 const program = new Command();
 
@@ -14,7 +15,8 @@ program
   .name("codeswarm")
   .description("Codeswarm CLI")
   .option("--config <path>", "Path to router config")
-  .option("--router <address>", "Router address override (future TCP)");
+  .option("--router <address>", "Router address override (future TCP)")
+  .option("--debug", "Print raw JSON messages from router", false);
 
 program
   .command("list")
@@ -26,7 +28,7 @@ program
       process.exit(1);
     }
 
-    const transport = createTransport(opts);
+    const transport = await createTransport(opts);
     const client = new RouterClient(transport);
     const formatter = new EventFormatter();
 
@@ -52,7 +54,7 @@ program
       process.exit(1);
     }
 
-    const transport = createTransport(opts);
+    const transport = await createTransport(opts);
     const client = new RouterClient(transport);
     const formatter = new EventFormatter();
 
@@ -82,7 +84,7 @@ program
       process.exit(1);
     }
 
-    const transport = createTransport(opts);
+    const transport = await createTransport(opts);
     const client = new RouterClient(transport);
 
     let requestId: string | null = null;
@@ -117,35 +119,113 @@ program
       process.exit(1);
     }
 
-    const transport = createTransport(opts);
+    const transport = await createTransport(opts);
     const client = new RouterClient(transport);
     const formatter = new EventFormatter();
 
     client.onEvent((e) => formatter.handle(e));
 
-    const nodes = cmd.nodes === "all" ? "all" : parseInt(cmd.nodes);
-    client.inject(swarmId, nodes as any, cmd.prompt);
+    // Step 1: Fetch swarm status to determine node count
+    const statusRequestId = client.status(swarmId);
+
+    let nodeCount: number | null = null;
+
+    await new Promise<void>((resolve) => {
+      client.onEvent((e) => {
+        if (e?.data?.request_id === statusRequestId) {
+          nodeCount = e?.data?.node_count ?? null;
+          resolve();
+        }
+      });
+    });
+
+    if (nodeCount === null) {
+      console.error("Unable to determine node count for swarm.");
+      process.exit(1);
+    }
+
+    // Step 2: Resolve target nodes
+    let targetNodes: number[] = [];
+
+    if (cmd.nodes === "all") {
+      targetNodes = Array.from({ length: nodeCount }, (_, i) => i);
+    } else {
+      const idx = parseInt(cmd.nodes);
+      if (isNaN(idx) || idx < 0 || idx >= nodeCount) {
+        console.error(`Invalid node index: ${cmd.nodes}`);
+        process.exit(1);
+      }
+      targetNodes = [idx];
+    }
+
+    // Step 3: Inject per node
+    for (const nodeIdx of targetNodes) {
+      client.inject(swarmId, nodeIdx, cmd.prompt);
+    }
   });
 
-function createTransport(opts: any) {
+async function createTransport(opts: any) {
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
   const routerPath = path.resolve(__dirname, "../../router/router.py");
 
-  if (!opts.router) {
-    // spawn router detached
-    spawn("python3", [
-      "-u",
-      routerPath,
-      "--config",
-      opts.config,
-      "--daemon"
-    ], {
-      detached: true,
-      stdio: "ignore"
+  const host = "127.0.0.1";
+  const port = 8765;
+
+  const isRouterRunning = (): Promise<boolean> => {
+    return new Promise((resolve) => {
+      const socket = new net.Socket();
+
+      socket.setTimeout(300);
+
+      socket
+        .once("connect", () => {
+          socket.destroy();
+          resolve(true);
+        })
+        .once("error", () => {
+          resolve(false);
+        })
+        .once("timeout", () => {
+          socket.destroy();
+          resolve(false);
+        })
+        .connect(port, host);
     });
+  };
+
+  if (!opts.router) {
+    const running = await isRouterRunning();
+
+    if (running) {
+      console.error("[codeswarm] Using existing router.");
+    } else {
+      console.error("[codeswarm] Starting embedded router...");
+
+      const routerProcess = spawn(
+        "python3",
+        ["-u", routerPath, "--config", opts.config, "--daemon"],
+        { stdio: "ignore" }
+      );
+
+      const shutdown = () => {
+        try {
+          routerProcess.kill();
+        } catch {}
+      };
+
+      process.on("exit", shutdown);
+      process.on("SIGINT", () => {
+        shutdown();
+        process.exit(0);
+      });
+      process.on("SIGTERM", () => {
+        shutdown();
+        process.exit(0);
+      });
+    }
   }
 
-  return new TcpTransport("127.0.0.1", 8765);
+  return new TcpTransport(host, port, opts.debug === true);
 }
 
 program.parse(process.argv);

@@ -53,7 +53,6 @@ def reconcile_with_slurm(config):
     global JOB_TO_SWARM
 
     login_alias = config["ssh"]["login_alias"]
-    user = config["ssh"].get("user")
 
     cmd = ["ssh", login_alias, "squeue -h -o '%i|%j|%T'"]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -69,13 +68,23 @@ def reconcile_with_slurm(config):
 
     JOB_TO_SWARM.clear()
 
+    to_remove = []
+
     for swarm_id, swarm in SWARMS.items():
         job_id = swarm.get("job_id")
         if job_id in running_jobs:
             swarm["status"] = "running"
             JOB_TO_SWARM[job_id] = swarm_id
         else:
-            swarm["status"] = "terminated"
+            to_remove.append((swarm_id, job_id))
+
+    # Remove terminated swarms from memory
+    for swarm_id, job_id in to_remove:
+        SWARMS.pop(swarm_id, None)
+        if job_id:
+            JOB_TO_SWARM.pop(job_id, None)
+
+    save_state()
 
 
 def now_iso():
@@ -533,7 +542,22 @@ def run_daemon(config):
 
                 def handle_swarm_status():
                     try:
-                        job_id = swarm["job_id"]
+                        job_id = swarm.get("job_id")
+
+                        # If job_id is missing, swarm is considered terminated
+                        if not job_id:
+                            swarm["status"] = "terminated"
+                            save_state()
+                            emit_event("swarm_status", {
+                                "request_id": request_id,
+                                "swarm_id": swarm_id,
+                                "job_id": None,
+                                "node_count": swarm.get("node_count"),
+                                "status": "terminated",
+                                "slurm_state": "MISSING_JOB_ID"
+                            })
+                            return
+
                         login_alias = config["ssh"]["login_alias"]
 
                         result = subprocess.run(
@@ -543,16 +567,38 @@ def run_daemon(config):
                             timeout=15
                         )
 
-                        slurm_state = result.stdout.strip() if result.stdout else "UNKNOWN"
+                        slurm_state = result.stdout.strip()
 
-                        emit_event("swarm_status", {
-                            "request_id": request_id,
-                            "swarm_id": swarm_id,
-                            "job_id": job_id,
-                            "node_count": swarm["node_count"],
-                            "status": swarm["status"],
-                            "slurm_state": slurm_state
-                        })
+                        # If job not found in Slurm, remove swarm entirely
+                        if not slurm_state:
+                            slurm_state = "NOT_FOUND"
+
+                            # Remove terminated swarm from memory
+                            SWARMS.pop(swarm_id, None)
+                            JOB_TO_SWARM.pop(job_id, None)
+                            save_state()
+
+                            emit_event("swarm_status", {
+                                "request_id": request_id,
+                                "swarm_id": swarm_id,
+                                "job_id": job_id,
+                                "node_count": swarm.get("node_count"),
+                                "status": "terminated",
+                                "slurm_state": slurm_state
+                            })
+                            return
+                        else:
+                            swarm["status"] = "running"
+                            save_state()
+
+                            emit_event("swarm_status", {
+                                "request_id": request_id,
+                                "swarm_id": swarm_id,
+                                "job_id": job_id,
+                                "node_count": swarm["node_count"],
+                                "status": swarm["status"],
+                                "slurm_state": slurm_state
+                            })
                     except Exception as e:
                         emit_event("swarm_status", {
                             "request_id": request_id,
@@ -569,8 +615,12 @@ def run_daemon(config):
                     job_id = swarm["job_id"]
                     login_alias = config["ssh"]["login_alias"]
                     subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
-                    swarm["status"] = "terminated"
+
+                    # Remove swarm immediately after termination
+                    SWARMS.pop(swarm_id, None)
+                    JOB_TO_SWARM.pop(job_id, None)
                     save_state()
+
                     emit_event("swarm_terminated", {
                         "request_id": request_id,
                         "swarm_id": swarm_id
@@ -597,6 +647,16 @@ def main():
     # Load persisted state and reconcile with Slurm
     load_state()
     reconcile_with_slurm(config)
+
+    # Ensure state is flushed on shutdown
+    import signal
+
+    def graceful_shutdown(signum, frame):
+        save_state()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, graceful_shutdown)
+    signal.signal(signal.SIGINT, graceful_shutdown)
 
     if args.daemon:
         run_daemon(config)
