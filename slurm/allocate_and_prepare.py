@@ -62,7 +62,15 @@ def build_sbatch_script(args, config):
         lines.extend([
             f"export WORKSPACE_ROOT={workspace_root}",
             f"export CLUSTER_SUBDIR={cluster_subdir}",
-            f"srun python3 {hpc_base}/agent/codex_worker.py",
+            "",
+            "# Per-node working directory isolation",
+            f"srun bash -c '\n"
+            f"JOB_CLUSTER_DIR=\"$WORKSPACE_ROOT/cluster/$SLURM_JOB_ID\"\n"
+            f"NODE_WORKDIR=\"$JOB_CLUSTER_DIR/nodes/$SLURM_PROCID\"\n"
+            f"mkdir -p \"$NODE_WORKDIR\"\n"
+            f"cd \"$NODE_WORKDIR\"\n"
+            f"python3 {hpc_base}/agent/codex_worker.py\n"
+            f"'",
         ])
 
     elif args.launch_codex_test:
