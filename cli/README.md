@@ -72,11 +72,17 @@ Router config must point to your HPC cluster settings.
 
 ### Launch a Swarm
 
+After linking for development:
+
 ```bash
-node dist/index.js launch \
+npm link
+```
+
+Launch:
+
+```bash
+codeswarm launch \
   --nodes 4 \
-  --partition mi2508x \
-  --time 00:10:00 \
   --prompt "You are a focused autonomous agent." \
   --config ../configs/hpcfund.json
 ```
@@ -85,10 +91,10 @@ node dist/index.js launch \
 
 | Flag | Description |
 |------|------------|
-| `--nodes` | Number of Slurm nodes |
-| `--partition` | Slurm partition |
-| `--time` | Slurm time limit |
+| `--nodes` | Number of swarm nodes |
 | `--prompt` | System prompt injected at launch |
+
+Backend-specific parameters (partition, time, account, etc.) are defined in the router configuration file.
 
 #### Output Example
 
@@ -99,8 +105,6 @@ request_id: ...
 swarm_id: ...
 job_id: ...
 node_count: 4
-partition: mi2508x
-time: 00:10:00
 ```
 
 ---
@@ -108,7 +112,7 @@ time: 00:10:00
 ### List Swarms
 
 ```bash
-node dist/index.js list --config ../configs/hpcfund.json
+codeswarm list --config ../configs/hpcfund.json
 ```
 
 Returns all known swarms from router state.
@@ -118,7 +122,7 @@ Returns all known swarms from router state.
 ### Swarm Status
 
 ```bash
-node dist/index.js status <swarm_id> \
+codeswarm status <swarm_id> \
   --config ../configs/hpcfund.json
 ```
 
@@ -134,7 +138,7 @@ Includes:
 Inject into all nodes:
 
 ```bash
-node dist/index.js inject <swarm_id> \
+codeswarm inject <swarm_id> \
   --prompt "Refactor kernel memory access." \
   --config ../configs/hpcfund.json
 ```
@@ -142,7 +146,7 @@ node dist/index.js inject <swarm_id> \
 Inject into specific node:
 
 ```bash
-node dist/index.js inject <swarm_id> \
+codeswarm inject <swarm_id> \
   --nodes 0 \
   --prompt "Focus on GEMM tiling strategy." \
   --config ../configs/hpcfund.json

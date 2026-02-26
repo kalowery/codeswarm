@@ -74,13 +74,18 @@ npm install
 npm run build
 ```
 
+After linking the CLI for development:
+
+```bash
+cd cli
+npm link
+```
+
 Launch a swarm:
 
 ```bash
-node dist/index.js launch \
+codeswarm launch \
   --nodes 4 \
-  --partition mi2508x \
-  --time 00:10:00 \
   --prompt "You are a focused autonomous agent." \
   --config ../configs/hpcfund.json
 ```
@@ -88,7 +93,7 @@ node dist/index.js launch \
 Inject into swarm:
 
 ```bash
-node dist/index.js inject <swarm_id> \
+codeswarm inject <swarm_id> \
   --prompt "Optimize GEMM tiling." \
   --config ../configs/hpcfund.json
 ```
@@ -96,7 +101,7 @@ node dist/index.js inject <swarm_id> \
 Check status:
 
 ```bash
-node dist/index.js status <swarm_id> \
+codeswarm status <swarm_id> \
   --config ../configs/hpcfund.json
 ```
 
