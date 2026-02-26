@@ -368,4 +368,55 @@ async function createTransport(opts: any) {
   return new TcpTransport(host, port, opts.debug === true);
 }
 
+
+program
+  .command("attach <swarmId>")
+  .description("Attach to a running swarm and stream events continuously")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .action(async (swarmId: string, cmd: any) => {
+    const opts = cmd;
+    if (!opts.config && !opts.router) {
+      console.error("--config required unless --router is provided");
+      process.exit(1);
+    }
+
+    const transport = await createTransport(opts);
+    const client = new RouterClient(transport);
+
+    console.log(`🔗 Attached to swarm ${swarmId}`);
+    console.log("Press Ctrl+C to detach.\n");
+
+    client.onEvent((e: any) => {
+      if (
+        e?.data?.swarm_id === swarmId &&
+        typeof e?.data?.node_id === "number"
+      ) {
+        const node = e.data.node_id;
+
+        if (e.event === "assistant_delta") {
+          process.stdout.write(e.data.content);
+        }
+
+        if (e.event === "assistant") {
+          process.stdout.write(e.data.content);
+        }
+
+        if (e.event === "turn_started") {
+          process.stdout.write(`\n\n[swarm ${swarmId} | node ${node}]\n`);
+        }
+
+        if (e.event === "turn_complete") {
+          process.stdout.write("\n");
+        }
+      }
+    });
+
+    process.on("SIGINT", () => {
+      console.log("\nDetached.");
+      process.exit(0);
+    });
+  });
+
 program.parse(process.argv);
