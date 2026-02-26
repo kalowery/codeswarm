@@ -50,7 +50,14 @@ export class EventFormatter {
     if (name === "assistant") {
       const key = data.injection_id;
       const state = this.injections.get(key);
-      if (!state) return;
+
+      if (!state) {
+        // No prior deltas — print assistant content directly
+        console.log(`\n[Swarm ${data.swarm_id} | Node ${data.node_id}]`);
+        console.log("------------------------------------------------------------");
+        console.log(data.content);
+        return;
+      }
 
       console.log(`\n[Swarm ${state.swarmId} | Node ${state.nodeId}]`);
       console.log("------------------------------------------------------------");
@@ -65,6 +72,11 @@ export class EventFormatter {
       state.tokens = data.total_tokens;
       console.log(`\nTokens used: ${state.tokens}`);
       console.log("------------------------------------------------------------\n");
+    }
+
+    if (name === "turn_complete") {
+      const key = data.injection_id;
+      this.injections.delete(key);
     }
 
     if (name === "inject_ack") {

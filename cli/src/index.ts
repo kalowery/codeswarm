@@ -156,20 +156,23 @@ program
     const client = new RouterClient(transport);
     const formatter = new EventFormatter();
 
-    client.onEvent((e) => formatter.handle(e));
-
-    // Step 1: Fetch swarm status to determine node count
+    // ---- Step 1: Bootstrap status to determine node count ----
     const statusRequestId = client.status(swarmId);
 
     let nodeCount: number | null = null;
 
     await new Promise<void>((resolve) => {
-      client.onEvent((e) => {
-        if (e?.data?.request_id === statusRequestId) {
+      const statusListener = (e: any) => {
+        if (e?.data?.request_id !== statusRequestId) return;
+        if (e.event === "swarm_status") {
           nodeCount = e?.data?.node_count ?? null;
           resolve();
+        } else if (e.event === "command_rejected") {
+          console.error("Error:", e.data?.reason || "Command rejected");
+          process.exit(1);
         }
-      });
+      };
+      client.onEvent(statusListener);
     });
 
     if (nodeCount === null) {
@@ -177,7 +180,7 @@ program
       process.exit(1);
     }
 
-    // Step 2: Resolve target nodes
+    // ---- Step 2: Resolve target nodes ----
     let targetNodes: number[] = [];
 
     if (cmd.nodes === "all") {
@@ -191,9 +194,76 @@ program
       targetNodes = [idx];
     }
 
-    // Step 3: Inject per node
+    // ---- Step 3: Inject and track request_ids + injection_ids ----
+    const injectionRequestIds = new Set<string>();
+
+    // Track lifecycle per node
+    const nodeLifecycle = new Map<number, { turnComplete: boolean; delivered: boolean }>();
+
+    const maybeExit = () => {
+      if (targetNodes.length === 0) return;
+
+      for (const node of targetNodes) {
+        const state = nodeLifecycle.get(node);
+        if (!state || !state.turnComplete || !state.delivered) {
+          return;
+        }
+      }
+
+      // All targeted nodes have completed AND been delivered
+      setImmediate(() => process.exit(0));
+    };
+
+    const injectListener = (e: any) => {
+      const reqId = e?.data?.request_id;
+
+      // ---- Handle inject command-level events ----
+      if (reqId && injectionRequestIds.has(reqId)) {
+        if (e.event === "inject_ack") {
+          const nodeId = e.data.node_id;
+          nodeLifecycle.set(nodeId, { turnComplete: false, delivered: false });
+          formatter.handle(e);
+          return;
+        }
+        if (e.event === "inject_failed") {
+          console.error("Inject failed:", e.data?.error || "Unknown error");
+          process.exit(1);
+        }
+        if (e.event === "inject_delivered") {
+          const nodeId = e.data.node_id;
+          const state = nodeLifecycle.get(nodeId);
+          if (state) {
+            state.delivered = true;
+          }
+          formatter.handle(e);
+          maybeExit();
+          return;
+        }
+      }
+
+      // ---- Handle streaming assistant events by swarm + node ----
+      if (
+        e?.data?.swarm_id === swarmId &&
+        typeof e?.data?.node_id === "number" &&
+        targetNodes.includes(e.data.node_id)
+      ) {
+        formatter.handle(e);
+
+        if (e.event === "turn_complete") {
+          const state = nodeLifecycle.get(e.data.node_id);
+          if (state) {
+            state.turnComplete = true;
+          }
+          maybeExit();
+        }
+      }
+    };
+
+    client.onEvent(injectListener);
+
     for (const nodeIdx of targetNodes) {
-      client.inject(swarmId, nodeIdx, cmd.prompt);
+      const reqId = client.inject(swarmId, nodeIdx, cmd.prompt);
+      injectionRequestIds.add(reqId);
     }
   });
 
