@@ -321,7 +321,9 @@ async function createTransport(opts: any) {
     const running = await isRouterRunning();
 
     if (running) {
-      console.error("[codeswarm] Using existing router.");
+      if (!opts.json) {
+        console.error("[codeswarm] Using existing router.");
+      }
     } else {
       if (!opts.config) {
         throw new Error(
@@ -329,7 +331,9 @@ async function createTransport(opts: any) {
         );
       }
 
-      console.error("[codeswarm] Starting embedded router...");
+      if (!opts.json) {
+        console.error("[codeswarm] Starting embedded router...");
+      }
 
       const routerProcess = spawn(
         "python3",
@@ -365,8 +369,10 @@ program
   .option("--config <path>", "Path to router config")
   .option("--router <address>", "Router address override (host:port)")
   .option("--debug", "Print raw JSON messages from router", false)
+  .option("--json", "Emit raw router events as JSON lines", false)
   .action(async (swarmId: string, cmd: any) => {
     const opts = cmd;
+    const jsonMode = opts.json === true;
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
@@ -379,22 +385,35 @@ program
       // Validation phase
       if (!validated && e?.data?.request_id === statusRequestId) {
         if (e.event === "command_rejected") {
-          console.error("Invalid swarm_id.");
+          if (jsonMode) {
+            console.log(JSON.stringify(e));
+          } else {
+            console.error("Invalid swarm_id.");
+          }
           process.exit(1);
         }
 
         if (e.event === "swarm_status") {
           validated = true;
-          console.log(`🔗 Attached to swarm ${swarmId}`);
-          console.log("Press Ctrl+C to detach.\n");
+          if (!jsonMode) {
+            console.log(`🔗 Attached to swarm ${swarmId}`);
+            console.log("Press Ctrl+C to detach.\n");
+          }
         }
         return;
       }
 
-      // Do not stream until validated
       if (!validated) return;
 
-      // Streaming phase
+      // JSON mode: emit structured events filtered by swarm_id
+      if (jsonMode) {
+        if (e?.data?.swarm_id === swarmId) {
+          console.log(JSON.stringify(e));
+        }
+        return;
+      }
+
+      // Human streaming mode
       if (
         e?.data?.swarm_id === swarmId &&
         typeof e?.data?.node_id === "number"
@@ -416,11 +435,12 @@ program
     });
 
     process.on("SIGINT", () => {
-      console.log("\nDetached.");
+      if (!jsonMode) {
+        console.log("\nDetached.");
+      }
       process.exit(0);
     });
 
-    // Keep process alive indefinitely
     await new Promise<void>(() => {});
   });
 

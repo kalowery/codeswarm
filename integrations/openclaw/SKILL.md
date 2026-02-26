@@ -12,6 +12,7 @@ Use this skill when the user wants to:
 
 - Launch a distributed swarm
 - Inject prompts into a swarm
+- Monitor a running swarm continuously
 - Check swarm status
 - Manage distributed agent sessions on a cluster
 
@@ -31,7 +32,6 @@ Then:
 
 1. Store <path> in session memory as:
    codeswarm_config_path
-
 2. Confirm:
    ✅ Codeswarm config set to <path>
 
@@ -60,7 +60,6 @@ Then:
 4. Extract swarm_id.
 5. Store in session memory as:
    codeswarm_swarm_id
-
 6. Confirm:
    ✅ Swarm launched: <swarm_id>
 
@@ -77,7 +76,50 @@ If the user provides a prompt and a swarm exists:
 
    codeswarm inject <codeswarm_swarm_id> --prompt "<user_prompt>" --config <codeswarm_config_path>
 
-3. Stream the output to the user.
+3. Allow streaming output to flow back to the user.
+
+---
+
+# Continuous Monitoring (Attach Mode)
+
+If the user asks to:
+
+- Monitor the swarm
+- Continuously watch the swarm
+- Stream swarm output
+- Keep observing swarm activity
+
+Then:
+
+1. Ensure codeswarm_swarm_id exists.
+2. Use exec in JSON streaming mode:
+
+   codeswarm attach <codeswarm_swarm_id> --json --config <codeswarm_config_path>
+
+3. Keep the exec session open.
+4. Continuously read and process JSON event lines without waiting for further user prompts.
+5. Do not expect human-formatted prefixes. Parse each line as structured JSON.
+
+---
+
+# Streaming Interpretation Rules
+
+When streaming output from attach:
+
+- Treat lines prefixed with:
+  [swarm <swarm_id> | node <node_id>]
+  as the start of a new logical message block.
+
+- Group all subsequent streamed text under that swarm_id and node_id until the next prefix appears.
+
+- Organize responses clearly in the conversation as:
+
+  Swarm <swarm_id>
+    Node <node_id>:
+      <assistant output>
+
+- Do not merge outputs from different nodes.
+- Preserve ordering of streamed content.
 
 ---
 
@@ -101,6 +143,7 @@ If the user asks for swarm status:
 - Never inject without swarm_id.
 - Always surface CLI errors clearly.
 - Only use the exec tool to run codeswarm commands.
+- For attach mode, do not terminate the session unless explicitly instructed.
 
 ---
 
@@ -121,3 +164,4 @@ Do not use other names.
 - Do not guess file paths.
 - Ask user if required information is missing.
 - Confirm state changes clearly.
+- In attach mode, proactively process and organize streaming output without requiring new user prompts.
