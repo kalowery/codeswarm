@@ -14,15 +14,18 @@ const program = new Command();
 program
   .name("codeswarm")
   .description("Codeswarm CLI")
-  .option("--config <path>", "Path to router config")
-  .option("--router <address>", "Router address override (future TCP)")
-  .option("--debug", "Print raw JSON messages from router", false);
+  .showHelpAfterError()
+  .enablePositionalOptions()
+  .helpOption("-h, --help", "Display help for command");
 
 program
   .command("list")
   .description("List available swarms")
-  .action(async () => {
-    const opts = program.opts();
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .action(async (cmd: any) => {
+    const opts = cmd;
     if (!opts.config && !opts.router) {
       console.error("--config required unless --router is provided");
       process.exit(1);
@@ -58,8 +61,11 @@ program
 program
   .command("status <swarmId>")
   .description("Get swarm status")
-  .action(async (swarmId: string) => {
-    const opts = program.opts();
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .action(async (swarmId: string, cmd: any) => {
+    const opts = cmd;
     if (!opts.config && !opts.router) {
       console.error("--config required unless --router is provided");
       process.exit(1);
@@ -97,8 +103,11 @@ program
   .description("Launch new swarm")
   .requiredOption("--nodes <number>", "Number of nodes")
   .requiredOption("--prompt <text>", "System prompt")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
   .action(async (cmd: any) => {
-    const opts = program.opts();
+    const opts = cmd;
     if (!opts.config && !opts.router) {
       console.error("--config required unless --router is provided");
       process.exit(1);
@@ -141,8 +150,11 @@ program
   .description("Inject prompt into swarm")
   .requiredOption("--prompt <text>", "Prompt text")
   .option("--nodes <nodes>", "Node index or 'all'", "all")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
   .action(async (swarmId: string, cmd: any) => {
-    const opts = program.opts();
+    const opts = cmd;
     if (!opts.config && !opts.router) {
       console.error("--config required unless --router is provided");
       process.exit(1);
