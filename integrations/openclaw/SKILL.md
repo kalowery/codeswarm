@@ -190,12 +190,64 @@ If the user asks to terminate a swarm:
 
 # Memory Keys
 
-Use session memory keys:
+Use structured session memory keys:
 
 codeswarm_config_path
-codeswarm_swarm_id
+codeswarm_active_swarm_id
+codeswarm_swarms
 
-Do not use other names.
+Where:
+
+codeswarm_swarms is a dictionary:
+
+{
+  "<swarm_id>": {
+    "job_id": "<job_id>",
+    "node_count": <number>,
+    "status": "running|terminated|unknown"
+  }
+}
+
+Rules:
+
+- Always update codeswarm_swarms after launch, status, or terminate.
+- Always set codeswarm_active_swarm_id after launch or attach.
+- Never silently overwrite an existing swarm entry.
+
+---
+
+# Multi-Swarm Handling Rules
+
+## Launch
+
+- Add new swarm to codeswarm_swarms.
+- Set codeswarm_active_swarm_id to the new swarm.
+
+## List
+
+- Do NOT change active swarm.
+- Display all known swarms clearly.
+
+## Inject
+
+- If swarm_id explicitly provided → use it.
+- Else if codeswarm_active_swarm_id exists → use it.
+- Else if multiple swarms exist → ask user to choose.
+- Never guess when multiple swarms exist.
+
+## Terminate
+
+- If swarm_id explicitly provided → use it.
+- Else use codeswarm_active_swarm_id.
+- Remove terminated swarm from codeswarm_swarms.
+- If it was active:
+  - If other swarms remain → set one as active.
+  - Else clear codeswarm_active_swarm_id.
+
+## Attach
+
+- Explicitly bind to provided swarm_id.
+- Set codeswarm_active_swarm_id to that swarm.
 
 ---
 
@@ -205,4 +257,5 @@ Do not use other names.
 - Do not guess file paths.
 - Ask user if required information is missing.
 - Confirm state changes clearly.
+- Never assume a single-swarm model.
 - In attach mode, proactively process and organize streaming output without requiring new user prompts.
