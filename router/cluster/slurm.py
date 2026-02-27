@@ -73,16 +73,16 @@ class SlurmProvider(ClusterProvider):
         return match.group(1)
 
     def terminate(self, job_id: str) -> None:
-        login_alias = self.slurm_cfg.get("login_alias")
+        login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:
-            raise RuntimeError("Slurm login_alias not configured")
+            raise RuntimeError("SSH login_alias not configured")
 
         subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
 
     def get_job_state(self, job_id: str) -> Optional[str]:
-        login_alias = self.slurm_cfg.get("login_alias")
+        login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:
-            raise RuntimeError("Slurm login_alias not configured")
+            raise RuntimeError("SSH login_alias not configured")
 
         result = subprocess.run(
             ["ssh", login_alias, f"squeue -j {job_id} -h -o '%T'"],
@@ -98,11 +98,15 @@ class SlurmProvider(ClusterProvider):
         return state
 
     def list_active_jobs(self) -> Dict[str, str]:
-        login_alias = self.slurm_cfg.get("login_alias")
+        login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:
-            raise RuntimeError("Slurm login_alias not configured")
+            raise RuntimeError("SSH login_alias not configured")
 
-        cmd = ["ssh", login_alias, "squeue -h -o '%i|%j|%T'"]
+        cmd = [
+            "ssh",
+            login_alias,
+            "squeue -h -o '%i|%j|%T'"
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         running_jobs: Dict[str, str] = {}
