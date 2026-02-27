@@ -14,6 +14,8 @@ Use this skill when the user wants to:
 - Inject prompts into a swarm
 - Monitor a running swarm continuously
 - Check swarm status
+- List active swarms
+- Terminate a running swarm
 - Manage distributed agent sessions on a cluster
 
 ---
@@ -135,6 +137,43 @@ If the user asks for swarm status:
    codeswarm status <codeswarm_swarm_id> --config <codeswarm_config_path>
 
 3. Display result clearly.
+
+---
+
+# List Swarms
+
+If the user asks to list swarms:
+
+1. Ensure codeswarm_config_path exists.
+2. Use:
+
+   codeswarm list --config <codeswarm_config_path>
+
+3. Display all active swarms clearly.
+4. Do not overwrite codeswarm_swarm_id unless user explicitly selects a swarm.
+
+---
+
+# Terminate Swarm
+
+If the user asks to terminate a swarm:
+
+1. Determine target swarm_id:
+   - Use codeswarm_swarm_id if none specified.
+   - If multiple swarms exist and none specified, ask user.
+
+2. Use:
+
+   codeswarm terminate <swarm_id> --config <codeswarm_config_path>
+
+3. On success:
+   ✅ Swarm terminated: <swarm_id>
+
+4. Remove codeswarm_swarm_id from session memory if it matches the terminated swarm.
+
+5. Surface CLI errors clearly.
+
+---
 
 ---
 
