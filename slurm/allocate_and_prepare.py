@@ -63,10 +63,10 @@ def build_sbatch_script(args, config):
             f"export WORKSPACE_ROOT={workspace_root}",
             f"export CLUSTER_SUBDIR={cluster_subdir}",
             "",
-            "# Per-node working directory isolation",
+            "# Per-node working directory isolation (use existing runs/<job_id>/node_XX layout)",
             f"srun bash -c '\n"
-            f"JOB_CLUSTER_DIR=\"$WORKSPACE_ROOT/cluster/$SLURM_JOB_ID\"\n"
-            f"NODE_WORKDIR=\"$JOB_CLUSTER_DIR/nodes/$SLURM_PROCID\"\n"
+            f"NODE_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
+            f"NODE_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/node_${{NODE_INDEX}}\"\n"
             f"mkdir -p \"$NODE_WORKDIR\"\n"
             f"cd \"$NODE_WORKDIR\"\n"
             f"python3 {hpc_base}/agent/codex_worker.py\n"
@@ -89,6 +89,141 @@ def build_sbatch_script(args, config):
         ])
 
     return "\n".join(lines) + "\n"
+
+
+def ensure_codex_ready(config):
+    login_alias = config["ssh"]["login_alias"]
+    workspace_root = config["cluster"]["workspace_root"]
+    cluster_subdir = config["cluster"]["cluster_subdir"]
+
+    tools_dir = f"{workspace_root}/{cluster_subdir}/tools"
+    node_bin = f"{tools_dir}/node/bin"
+    npm_bin = f"{node_bin}/npm"
+    npm_prefix = f"{tools_dir}/npm-global"
+    codex_bin = f"{npm_prefix}/bin/codex"
+
+    # Ensure Node/npm exist in workspace
+    if ssh_login(login_alias, f'test -x "{npm_bin}"').returncode != 0:
+        print("ERROR: Node/npm not found in workspace tools directory.")
+        print(f"Expected npm at: {npm_bin}")
+        sys.exit(1)
+
+    # Ensure codex installed in workspace (version pinned)
+    CODEX_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
+
+    if ssh_login(login_alias, f'test -x "{codex_bin}"').returncode != 0:
+        print("Codex not found in workspace. Installing...")
+        install_cmd = (
+            f'NPM_CONFIG_PREFIX="{npm_prefix}" '
+            f'"{npm_bin}" install -g @openai/codex@{CODEX_VERSION}'
+        )
+        result = ssh_login(login_alias, install_cmd)
+        if result.returncode != 0:
+            print("Codex installation failed:")
+            print(result.stderr)
+            sys.exit(1)
+
+    # Verify installed codex version (defensive check)
+    version_check = ssh_login(login_alias, f'"{codex_bin}" --version')
+    if version_check.returncode != 0:
+        print("ERROR: Codex binary exists but failed to execute --version.")
+        print(version_check.stderr)
+        sys.exit(1)
+
+    # Check for existing Codex home configuration
+    codex_home_check = ssh_login(
+        login_alias,
+        'test -d "$HOME/.codex"'
+    )
+
+    if codex_home_check.returncode == 0:
+        print("Existing ~/.codex detected. Skipping login.")
+        return
+
+    print("No ~/.codex directory found. Codex not authenticated.")
+
+    # Ensure OPENAI_API_KEY exists on login node
+    key_check = ssh_login(login_alias, 'test -n "$OPENAI_API_KEY"')
+
+    if key_check.returncode != 0:
+        print("\nERROR:")
+        print("Codex not authenticated and OPENAI_API_KEY is not set.")
+        print("On the login node, run:")
+        print("  export OPENAI_API_KEY=sk-...")
+        print("Then re-run codeswarm.\n")
+        sys.exit(1)
+
+    print("Authenticating Codex using OPENAI_API_KEY...")
+    login_result = ssh_login(
+        login_alias,
+        f'printf "%s" "$OPENAI_API_KEY" | "{codex_bin}" login --with-api-key'
+    )
+
+    if login_result.returncode != 0:
+        print("Codex login failed:")
+        print(login_result.stderr)
+        sys.exit(1)
+
+    # Verify ~/.codex now exists
+    verify_home = ssh_login(
+        login_alias,
+        'test -d "$HOME/.codex"'
+    )
+
+    if verify_home.returncode != 0:
+        print("Codex login did not create ~/.codex.")
+        sys.exit(1)
+
+    print("Codex authenticated successfully.")
+
+
+def ensure_partition_capacity(args, config):
+    login_alias = config["ssh"]["login_alias"]
+
+    slurm_cfg = config.get("cluster", {}).get("slurm", {})
+
+    partition = (
+        args.partition
+        or slurm_cfg.get("default_partition")
+    )
+
+    if not partition:
+        print("No partition specified and no default partition configured.")
+        sys.exit(1)
+
+    result = ssh_login(
+        login_alias,
+        f'sinfo -h -p {partition} -o "%D %t"'
+    )
+
+    if result.returncode != 0:
+        print("Failed to query partition state via sinfo:")
+        print(result.stderr)
+        sys.exit(1)
+
+    idle_nodes = 0
+
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+
+        count, state = parts
+
+        if state.lower().startswith("idle"):
+            try:
+                idle_nodes += int(count)
+            except Exception:
+                pass
+
+    if idle_nodes < args.nodes:
+        print("\nERROR:")
+        print(f"Partition '{partition}' has {idle_nodes} idle nodes.")
+        print(f"Requested {args.nodes} nodes.")
+        print("Not submitting job.\n")
+        sys.exit(1)
+
+    print(f"Partition '{partition}' has {idle_nodes} idle nodes. OK.")
 
 
 def submit_job(args, config):
@@ -173,6 +308,13 @@ if __name__ == "__main__":
             ],
             check=True,
         )
+
+    # Ensure Codex installed and authenticated before submission
+    if args.launch_codex_run:
+        ensure_codex_ready(config)
+
+    # Ensure partition has sufficient idle nodes
+    ensure_partition_capacity(args, config)
 
     print("Submitting allocation job...")
     job_id = submit_job(args, config)
