@@ -1,6 +1,6 @@
 # Codeswarm Configuration Schema
 
-This document defines the configuration structure expected by the router and cluster providers.
+This document defines the configuration structure currently expected by the router and Slurm provider implementation.
 
 ---
 
@@ -8,29 +8,53 @@ This document defines the configuration structure expected by the router and clu
 
 ```json
 {
-  "cluster": { ... },
   "ssh": { ... },
+  "cluster": { ... },
   "router": { ... }
 }
 ```
 
 ---
 
-# 2. Cluster Section
+# 2. SSH Section
+
+```json
+{
+  "ssh": {
+    "login_alias": "hpcfund"
+  }
+}
+```
+
+## Fields
+
+### login_alias
+
+Required.
+
+SSH host alias used for:
+- Slurm job submission
+- squeue queries
+- scancel
+- Remote outbox follower
+
+This must correspond to a valid SSH configuration entry (e.g., in `~/.ssh/config`).
+
+---
+
+# 3. Cluster Section
 
 ```json
 {
   "cluster": {
-    "backend": "slurm",
     "workspace_root": "/path/on/cluster",
     "cluster_subdir": "codeswarm",
 
     "slurm": {
-      "login_alias": "hpcfund",
-      "partition": "mi2508x",
+      "partition": "compute",
       "time_limit": "00:20:00",
-      "account": "research",
-      "qos": "optional"
+      "account": null,
+      "qos": null
     }
   }
 }
@@ -38,32 +62,29 @@ This document defines the configuration structure expected by the router and clu
 
 ## Fields
 
-### backend
-
-String. Name of cluster provider.
-
 ### workspace_root
 
-Base directory on remote cluster.
+Base directory on the shared cluster filesystem.
 
 ### cluster_subdir
 
-Subdirectory containing Codeswarm runtime files.
+Subdirectory under `workspace_root` containing Codeswarm runtime files.
 
----
+### slurm.partition
 
-# 3. SSH Section
+Required. Slurm partition used for job allocation.
 
-```json
-{
-  "ssh": {
-    "login_alias": "hpcfund",
-    "controlpersist_minutes": 10
-  }
-}
-```
+### slurm.time_limit
 
-Used by router and allocation script for remote execution.
+Required. Slurm time limit (HH:MM:SS).
+
+### slurm.account
+
+Optional. Slurm account string.
+
+### slurm.qos
+
+Optional. Slurm QoS string.
 
 ---
 
@@ -72,41 +93,25 @@ Used by router and allocation script for remote execution.
 ```json
 {
   "router": {
-    "ssh_max_workers": 6,
-    "heartbeat_timeout_seconds": 60
+    "inject_timeout_seconds": 60
   }
 }
 ```
 
-Defines router behavior.
+## Fields
+
+### inject_timeout_seconds
+
+Maximum time the router waits for an injection to complete before emitting an `inject_failed` event.
 
 ---
 
-# 5. Backend-Specific Configuration
+# 5. Invariants
 
-Each backend defines its own sub-object under `cluster`.
-
-Example for future AWS:
-
-```json
-{
-  "cluster": {
-    "backend": "aws",
-    "aws": {
-      "region": "us-east-1",
-      "instance_type": "p4d.24xlarge"
-    }
-  }
-}
-```
-
----
-
-# 6. Invariants
-
-- Protocol remains backend-neutral.
-- CLI does not expose backend-specific flags.
-- All backend parameters are config-driven.
+- SSH configuration must allow passwordless login.
+- Login node and compute nodes must share a filesystem.
+- Router state is persisted to `router_state.json`.
+- Slurm job discovery during router startup uses `squeue` over SSH.
 
 ---
 

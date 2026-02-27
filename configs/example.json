@@ -1,20 +1,18 @@
 {
   "ssh": {
-    "login_alias": "your-login-alias",
-    "controlpersist_minutes": 10
-  },
-  "slurm": {
-    "default_partition": null,
-    "default_time": "00:20:00",
-    "default_account": null,
-    "default_qos": null
+    "login_alias": "your-login-alias"
   },
   "cluster": {
     "workspace_root": "/path/to/shared/workspace",
-    "cluster_subdir": "codeswarm"
+    "cluster_subdir": "codeswarm",
+    "slurm": {
+      "partition": "compute",
+      "time_limit": "00:20:00",
+      "account": null,
+      "qos": null
+    }
   },
   "router": {
-    "ssh_max_workers": 6,
-    "heartbeat_timeout_seconds": 60
+    "inject_timeout_seconds": 60
   }
 }
