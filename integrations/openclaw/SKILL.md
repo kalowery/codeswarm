@@ -54,16 +54,38 @@ Then:
 1. Check if codeswarm_config_path exists in session memory.
    - If not set, ask the user to set it first.
 
-2. Use exec:
+2. Use exec in background mode:
 
    codeswarm launch --nodes <N> --prompt "OpenClaw-managed swarm session." --config <codeswarm_config_path>
 
-3. Parse output.
-4. Extract swarm_id.
-5. Store in session memory as:
-   codeswarm_swarm_id
-6. Confirm:
-   ✅ Swarm launched: <swarm_id>
+   - Run with background monitoring enabled.
+   - Do NOT block indefinitely waiting for completion.
+
+3. Monitor the process using the process tool:
+   - Poll periodically.
+   - Capture stdout.
+   - Detect success or failure.
+
+4. When launch completes:
+   - Parse output.
+   - Extract swarm_id and job_id.
+   - Add entry to codeswarm_swarms.
+   - Set codeswarm_active_swarm_id.
+
+5. Notify the user immediately upon completion.
+
+6. If launch fails:
+   - Surface the error clearly.
+   - Do not require the user to manually re-check status.
+
+The assistant should monitor background processes and report results when possible within the same execution window.
+
+IMPORTANT LIMITATION:
+If the execution window ends (timeout or control returns), the assistant cannot autonomously wake itself. In that case, it must clearly communicate:
+- That the process is still running in the background.
+- That it will check and report the latest status when the user next prompts it.
+
+Do NOT imply guaranteed automatic future updates if no wake mechanism exists.
 
 ---
 
@@ -71,14 +93,24 @@ Then:
 
 If the user provides a prompt and a swarm exists:
 
-1. Ensure codeswarm_swarm_id exists.
-   - If not, ask user to launch first.
+1. Resolve target swarm using multi-swarm rules.
 
-2. Use exec:
+2. Use exec in background mode:
 
-   codeswarm inject <codeswarm_swarm_id> --prompt "<user_prompt>" --config <codeswarm_config_path>
+   codeswarm inject <swarm_id> --prompt "<user_prompt>" --config <codeswarm_config_path>
 
-3. Allow streaming output to flow back to the user.
+3. Monitor process using the process tool:
+   - Stream output progressively.
+   - Detect turn completion.
+   - Detect failures.
+
+4. Automatically notify the user when the injection completes.
+
+5. Do NOT require the user to ask for results after injection.
+
+The assistant must attempt to proactively report completion or failure while actively executing.
+
+If execution control returns before completion, it must explicitly state that further updates require a user prompt.
 
 ---
 
@@ -93,16 +125,18 @@ If the user asks to:
 
 Then:
 
-1. Ensure codeswarm_swarm_id exists.
-2. Use exec in human streaming mode:
+1. Resolve target swarm using multi-swarm rules.
 
-   codeswarm attach <codeswarm_swarm_id> --config <codeswarm_config_path>
+2. Use exec in background streaming mode:
+
+   codeswarm attach <swarm_id> --config <codeswarm_config_path>
 
 3. Keep the exec session open.
-4. Continuously read and process streamed output without waiting for further user prompts.
-5. Expect human-formatted prefixes like:
-   [swarm <swarm_id> | node <node_id>]
-   and group content accordingly.
+4. Continuously read and process streamed output.
+5. Automatically surface lifecycle changes.
+6. Do not terminate monitoring unless explicitly instructed.
+
+The assistant must proactively stream updates without requiring additional prompts.
 
 ---
 
