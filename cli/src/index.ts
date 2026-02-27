@@ -364,6 +364,41 @@ async function createTransport(opts: any) {
 
 
 program
+  .command("terminate <swarmId>")
+  .description("Terminate a running swarm")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .action(async (swarmId: string, cmd: any) => {
+    const opts = cmd;
+
+    const transport = await createTransport(opts);
+    const client = new RouterClient(transport);
+
+    let requestId: string | null = null;
+
+    client.onEvent((e) => {
+      if (!requestId || e?.data?.request_id !== requestId) return;
+
+      switch (e.event) {
+        case "swarm_terminated":
+          console.log(`Swarm ${swarmId} terminated.`);
+          process.exit(0);
+          break;
+        case "command_rejected":
+          console.error("Terminate failed:", e.data?.reason || "Command rejected");
+          process.exit(1);
+          break;
+        default:
+          console.error("Unexpected response:", e.event);
+          process.exit(1);
+      }
+    });
+
+    requestId = client.terminate(swarmId);
+  });
+
+program
   .command("attach <swarmId>")
   .description("Attach to a running swarm and stream events continuously")
   .option("--config <path>", "Path to router config")

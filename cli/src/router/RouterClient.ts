@@ -41,6 +41,12 @@ export class RouterClient {
     });
   }
 
+  terminate(swarmId: string) {
+    return this.sendCommand("swarm_terminate", {
+      swarm_id: swarmId,
+    });
+  }
+
   onEvent(cb: (msg: any) => void) {
     this.transport.onMessage(cb);
   }
