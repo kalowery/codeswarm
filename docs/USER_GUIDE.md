@@ -193,7 +193,74 @@ Example cluster config (`configs/hpcfund.json`):
 
 # Running Codeswarm
 
-## 1. Allocate and Prepare
+Codeswarm supports both low-level router usage and the modern CLI workflow.
+
+---
+
+# Modern CLI Workflow (Recommended)
+
+Build and link the CLI from `codeswarm/cli`:
+
+```
+npm install
+npm run build
+npm link
+```
+
+## Launch a Swarm
+
+```
+codeswarm launch \
+  --nodes 4 \
+  --prompt "You are a distributed agent." \
+  --config configs/hpcfund.json
+```
+
+## List Active Swarms
+
+```
+codeswarm list --config configs/hpcfund.json
+```
+
+## Check Swarm Status
+
+```
+codeswarm status <swarm_id> --config configs/hpcfund.json
+```
+
+## Inject a Prompt
+
+```
+codeswarm inject <swarm_id> \
+  --prompt "Optimize GEMM tiling." \
+  --config configs/hpcfund.json
+```
+
+## Attach and Stream Output
+
+```
+codeswarm attach <swarm_id> --config configs/hpcfund.json
+```
+
+JSON streaming mode:
+
+```
+codeswarm attach <swarm_id> --config configs/hpcfund.json --json
+```
+
+## Terminate a Swarm
+
+```
+codeswarm terminate <swarm_id> --config configs/hpcfund.json
+```
+
+The CLI communicates with the router using the documented JSON protocol and is the preferred interface for production use.
+
+---
+
+# Low-Level Router Workflow (Advanced)
+
+## 1. Allocate and Prepare (Direct Slurm)
 
 ```
 python slurm/allocate_and_prepare.py --config configs/hpcfund.json
@@ -219,12 +286,12 @@ Optional debug mode:
 
 ---
 
-## 3. Inject Prompt
+## 3. Inject Prompt (Raw Protocol)
 
-Interactive:
+Example JSON message:
 
 ```json
-{"action":"inject","job_id":"272900","node_id":0,"content":"Hello"}
+{"command":"inject","swarm_id":"<swarm_id>","nodes":0,"content":"Hello"}
 ```
 
 ---

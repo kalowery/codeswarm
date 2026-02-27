@@ -107,6 +107,20 @@ codeswarm status <swarm_id> \
   --config ../configs/hpcfund.json
 ```
 
+List active swarms:
+
+```bash
+codeswarm list \
+  --config ../configs/hpcfund.json
+```
+
+Terminate a swarm:
+
+```bash
+codeswarm terminate <swarm_id> \
+  --config ../configs/hpcfund.json
+```
+
 Backend-specific parameters (partition, instance type, etc.) are defined in configuration, not in CLI flags.
 
 ---
