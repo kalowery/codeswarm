@@ -8,9 +8,42 @@ export interface SwarmRecord {
   created_at: number;
 }
 
+import fs from 'fs'
+import path from 'path'
+
 export class SwarmStateManager {
   private swarms = new Map<string, SwarmRecord>();
   private aliasIndex = new Map<string, string>();
+  private stateFile = path.resolve(__dirname, '../../state.json')
+
+  constructor() {
+    this.loadState()
+  }
+
+  private loadState() {
+    try {
+      if (!fs.existsSync(this.stateFile)) return
+      const raw = fs.readFileSync(this.stateFile, 'utf-8')
+      const data: SwarmRecord[] = JSON.parse(raw)
+      data.forEach((record) => {
+        this.swarms.set(record.swarm_id, record)
+        this.aliasIndex.set(record.alias.toLowerCase(), record.swarm_id)
+      })
+    } catch (err) {
+      console.error('Failed to load state.json', err)
+    }
+  }
+
+  private saveState() {
+    try {
+      const tmp = this.stateFile + '.tmp'
+      const data = JSON.stringify(Array.from(this.swarms.values()), null, 2)
+      fs.writeFileSync(tmp, data)
+      fs.renameSync(tmp, this.stateFile)
+    } catch (err) {
+      console.error('Failed to save state.json', err)
+    }
+  }
 
   createSwarm(swarm_id: string, alias: string, job_id: string, node_count: number) {
     const normalized = alias.toLowerCase();
@@ -29,6 +62,7 @@ export class SwarmStateManager {
 
     this.swarms.set(swarm_id, record);
     this.aliasIndex.set(normalized, swarm_id);
+    this.saveState();
     return record;
   }
 
@@ -51,6 +85,7 @@ export class SwarmStateManager {
     if (!record) return;
     this.aliasIndex.delete(record.alias.toLowerCase());
     this.swarms.delete(swarm_id);
+    this.saveState();
   }
 
   updateStatus(swarm_id: string, status: string, slurm_state?: string) {
@@ -58,5 +93,6 @@ export class SwarmStateManager {
     if (!swarm) return;
     swarm.status = status;
     swarm.slurm_state = slurm_state;
+    this.saveState();
   }
 }

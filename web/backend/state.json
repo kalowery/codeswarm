@@ -1,0 +1,11 @@
+[
+  {
+    "swarm_id": "ce7d4790-e8bc-439e-aa67-a6149be0921e",
+    "alias": "swarm-ce7d4790",
+    "job_id": "274547",
+    "node_count": 1,
+    "status": "running",
+    "created_at": 1772239524502,
+    "slurm_state": "RUNNING"
+  }
+]

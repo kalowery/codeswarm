@@ -23,6 +23,8 @@ export default function Home() {
   const swarmList = Object.values(swarms)
   const active = selected ? swarms[selected] : undefined
   const [showLaunch, setShowLaunch] = useState(false)
+  const [isSending, setIsSending] = useState(false)
+  const [isTerminating, setIsTerminating] = useState(false)
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex">
@@ -87,14 +89,28 @@ export default function Home() {
                 </div>
               </div>
               <button
+                disabled={isTerminating}
                 onClick={async () => {
-                  await fetch(`http://localhost:4000/terminate/${active.alias}`, {
-                    method: 'POST'
-                  })
+                  if (isTerminating) return
+                  if (!confirm(`Terminate ${active.alias}? This cannot be undone.`)) return
+
+                  try {
+                    setIsTerminating(true)
+                    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                    await fetch(`${apiBase}/terminate/${active.alias}`, {
+                      method: 'POST'
+                    })
+                  } finally {
+                    setIsTerminating(false)
+                  }
                 }}
-                className="px-3 py-1 bg-rose-600 rounded text-sm"
+                className={`px-3 py-1 rounded text-sm ${
+                  isTerminating
+                    ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                    : 'bg-rose-600 hover:bg-rose-500'
+                }`}
               >
-                Terminate
+                {isTerminating ? 'Terminating…' : 'Terminate'}
               </button>
             </div>
 
@@ -121,20 +137,33 @@ export default function Home() {
             <div className="mt-4">
               <textarea
                 placeholder="Enter prompt..."
-                className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-20"
+                disabled={isSending}
+                className={`w-full border rounded px-3 py-2 h-20 ${
+                  isSending
+                    ? 'bg-slate-700 border-slate-600 text-slate-400 cursor-not-allowed'
+                    : 'bg-slate-800 border-slate-700'
+                }`}
                 onKeyDown={async (e) => {
                   if (e.key === 'Enter' && !e.shiftKey) {
                     e.preventDefault()
+                    if (isSending) return
+
                     const value = (e.target as HTMLTextAreaElement).value
                     if (!value.trim()) return
-                    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
 
-    await fetch(`${apiBase}/inject/${active.alias}`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({ prompt: value })
-                    })
-                    ;(e.target as HTMLTextAreaElement).value = ''
+                    try {
+                      setIsSending(true)
+                      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                      await fetch(`${apiBase}/inject/${active.alias}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ prompt: value })
+                      })
+                      ;(e.target as HTMLTextAreaElement).value = ''
+                    } finally {
+                      // brief delay to avoid rapid double send
+                      setTimeout(() => setIsSending(false), 300)
+                    }
                   }
                 }}
               />
