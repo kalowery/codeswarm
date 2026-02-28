@@ -41,7 +41,10 @@ interface SwarmStore {
   pendingLaunches: Record<string, { alias: string }>
   selectedSwarm?: string
   pendingPrompt?: string
+  launchError: string | null
   setPendingPrompt: (prompt: string) => void
+  setLaunchError: (message: string) => void
+  clearLaunchError: () => void
   addPendingLaunch: (request_id: string, alias: string) => void
   removePendingLaunch: (request_id: string) => void
   setSwarms: (swarms: any[]) => void
@@ -62,7 +65,10 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
     pendingLaunches: {},
     selectedSwarm: undefined,
     pendingPrompt: undefined,
+    launchError: null,
     setPendingPrompt: (prompt: string) => set({ pendingPrompt: prompt }),
+    setLaunchError: (message: string) => set({ launchError: message }),
+    clearLaunchError: () => set({ launchError: null }),
     addPendingLaunch: (request_id: string, alias: string) =>
       set((state) => ({
         pendingLaunches: {
@@ -161,6 +167,16 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         // Remove pending launch ghost when real swarm is confirmed
         if (payload.request_id) {
           get().removePendingLaunch(payload.request_id)
+        }
+        // Clear any previous launch error
+        get().clearLaunchError()
+      }
+
+      if (type === 'command_rejected') {
+        const { request_id, reason } = payload || {}
+        if (request_id && get().pendingLaunches[request_id]) {
+          get().removePendingLaunch(request_id)
+          get().setLaunchError(reason || 'Launch failed.')
         }
       }
 

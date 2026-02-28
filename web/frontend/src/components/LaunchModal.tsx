@@ -8,18 +8,25 @@ interface Props {
 
 export default function LaunchModal({ onClose }: Props) {
   const [alias, setAlias] = useState('')
-  const [nodes, setNodes] = useState(1)
+  const [nodes, setNodes] = useState('1')
   const [prompt, setPrompt] = useState('')
   const [loading, setLoading] = useState(false)
 
   async function handleLaunch() {
+    const nodeCount = parseInt(nodes, 10)
+
+    if (isNaN(nodeCount) || nodeCount < 1) {
+      alert('Node count must be at least 1')
+      return
+    }
+
     try {
       setLoading(true)
       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
       const res = await fetch(`${apiBase}/launch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nodes, prompt, alias })
+        body: JSON.stringify({ nodes: nodeCount, prompt, alias })
       })
 
       const data = await res.json()
@@ -57,7 +64,7 @@ export default function LaunchModal({ onClose }: Props) {
               type="number"
               min={1}
               value={nodes}
-              onChange={(e) => setNodes(parseInt(e.target.value))}
+              onChange={(e) => setNodes(e.target.value)}
               className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
             />
           </div>

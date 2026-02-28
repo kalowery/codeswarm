@@ -11,6 +11,8 @@ export default function Home() {
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
   const selected = useSwarmStore((s) => s.selectedSwarm)
   const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
+  const launchError = useSwarmStore((s) => s.launchError)
+  const clearLaunchError = useSwarmStore((s) => s.clearLaunchError)
 
   const { status: wsStatus } = useWebSocket()
 
@@ -62,6 +64,26 @@ export default function Home() {
           </button>
         </div>
         <div className="space-y-2">
+          {/* Launch Error Banner */}
+          {launchError && (
+            <div className="p-3 rounded border bg-rose-900 border-rose-500 text-rose-200 text-sm">
+              <div className="flex justify-between items-start gap-2">
+                <div className="flex-1 min-w-0">
+                  ⚠ Launch failed:
+                  <div className="mt-1 text-xs whitespace-pre-wrap break-words max-h-40 overflow-y-auto">
+                    {launchError}
+                  </div>
+                </div>
+                <button
+                  onClick={clearLaunchError}
+                  className="text-xs text-rose-300 hover:underline"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Pending Launch Ghosts */}
           {Object.entries(pendingLaunches).map(([reqId, launch]) => (
             <div
