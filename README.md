@@ -144,6 +144,24 @@ A deterministic execution cycle that may include:
 
 # Quick Start
 
+## Development Setup
+
+Clone the repository and bootstrap all components:
+
+```bash
+git clone <repo-url>
+cd codeswarm
+npm run bootstrap
+```
+
+This will:
+
+- Install dependencies for CLI, backend, and frontend
+- Build the CLI
+- Link the `codeswarm` binary globally via `npm link`
+
+---
+
 ## Run Full Web Stack
 
 ```bash

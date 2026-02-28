@@ -1,0 +1,15 @@
+{
+  "name": "codeswarm-workspace",
+  "private": true,
+  "workspaces": [
+    "cli",
+    "web/backend",
+    "web/frontend"
+  ],
+  "scripts": {
+    "install:all": "npm install --workspaces",
+    "build:cli": "npm --workspace=cli run build",
+    "link:cli": "npm --workspace=cli link",
+    "bootstrap": "npm install --workspaces && npm --workspace=cli run build && npm --workspace=cli link"
+  }
+}
