@@ -1,87 +1,164 @@
 # Codeswarm
 
-Codeswarm is a backend-neutral distributed agent runtime with a pluggable cluster execution layer.
+Codeswarm is an open-source distributed execution fabric for orchestrating AI agents across multiple nodes.
 
-It provides a versioned TCP control plane, multi-swarm orchestration, deterministic injection lifecycle management, and streaming agent responses across distributed compute backends.
+It is built to explore what becomes possible when large language models are treated as execution actors — not chat interfaces.
 
-Codeswarm separates:
+Codeswarm provides:
 
-- **Control Plane** (Router)
-- **Intent Layer** (CLI)
-- **Execution Backend** (ClusterProvider)
+- A versioned control-plane protocol (`codeswarm.router.v1`)
+- Multi-swarm orchestration
+- Deterministic injection lifecycle management
+- Parallel multi-node execution
+- Normalized execution semantics
+- A hardened web control plane
 
-The execution backend is abstracted, enabling support for Slurm today and additional providers (AWS, Kubernetes, etc.) in the future.
+This project is experimental and research-oriented.
 
 ---
 
-# Architecture
+# Motivation
+
+Most LLM systems are built around chat metaphors.
+
+Codeswarm takes a different stance:
+
+> Agents are execution units. Swarms are distributed compute actors.
+
+We care about:
+
+- Lifecycle authority
+- Parallel execution
+- Deterministic state reconciliation
+- Explicit failure handling
+- Cluster-backed orchestration
+
+Execution > conversation.
+
+---
+
+# System Architecture
 
 ```
-CLI (Node.js)
-   ↓ TCP (codeswarm.router.v1)
-Router (Python daemon)
-   ↓
-ClusterProvider (pluggable backend)
-   ↓
-Execution Backend (e.g. Slurm)
-   ↓
-Workers (distributed agents)
+Slurm Worker Nodes (codex_worker.py)
+        ↓  JSON-RPC (raw)
+   Router (Python daemon)
+        ↓  codeswarm.router.v1 (normalized events)
+   Backend (Node + WebSocket bridge)
+        ↓
+   Frontend (Next.js control plane)
 ```
 
-## Core Components
+## Router (Authoritative Control Plane)
 
-- **CLI** – User-facing control client (`codeswarm`)
-- **Router** – Persistent control-plane daemon
-- **ClusterProvider** – Backend abstraction interface
-- **Provider Implementation** – e.g. `SlurmProvider`
-- **Worker Runtime** – Distributed agent processes
+The router is the single source of truth.
 
-The router never contains backend-specific logic.
-All execution details are encapsulated in provider implementations.
+Responsibilities:
 
----
+- Swarm launch / termination
+- Slurm job submission
+- swarm_id ↔ job_id binding
+- Event normalization
+- TTL-based terminated swarm retention
+- Background cleanup
 
-# Control Plane
-
-Transport:
-
-- Local TCP (`127.0.0.1:8765` by default)
-- Newline-delimited JSON (NDJSON)
-- Versioned protocol: `codeswarm.router.v1`
-
-The CLI communicates exclusively via this protocol.
-
-All commands are correlated by `request_id`.
-All runtime events include `swarm_id`, `node_id`, and `injection_id`.
+The router is authoritative. Other layers mirror.
 
 ---
 
-# Multi-Swarm Model
+## Backend (Mirror + Bridge)
 
-Codeswarm supports multiple concurrent swarms.
+The backend:
+
+- Connects to router via TCP
+- Broadcasts events via WebSocket
+- Performs symmetric reconciliation on `swarm_list`
+- Forwards structured failures (`command_rejected`)
+
+It never invents lifecycle state.
+
+---
+
+## Frontend (Execution-Aware UI)
+
+The web UI renders:
+
+- Per-node execution streams
+- Reasoning traces
+- Tool execution blocks
+- Token usage
+- Lifecycle transitions
+
+Optimistic UI is reconciled against router authority.
+
+---
+
+# Core Concepts
+
+## Swarm
+
+A distributed execution unit spanning one or more nodes.
 
 Each swarm has:
 
-- `swarm_id` (control-plane identifier)
-- `job_id` (backend identifier)
+- `swarm_id`
+- `job_id`
 - `node_count`
-- `system_prompt`
 - `status`
-
-The router maintains authoritative swarm state.
-Backends are queried via the provider abstraction.
 
 ---
 
-# Quick Start (CLI)
+## Node
 
-From `codeswarm/cli`:
+An isolated execution context within a swarm.
+
+Workspace layout:
+
+```
+runs/<job_id>/node_XX/
+```
+
+---
+
+## Injection
+
+A prompt stimulus delivered to one or more nodes.
+
+Each injection results in a bounded execution **Turn**.
+
+---
+
+## Turn
+
+A deterministic execution cycle that may include:
+
+- `turn_started`
+- `reasoning_delta`
+- `assistant_delta`
+- `command_started`
+- `command_completed`
+- `usage`
+- `turn_complete`
+
+---
+
+# Quick Start
+
+## Run Full Web Stack
 
 ```bash
-npm install
-npm run build
-npm link
+codeswarm web --config configs/hpcfund.json
 ```
+
+This launches:
+
+- Router (daemon)
+- Backend (WebSocket bridge)
+- Frontend (Next.js dev server)
+
+---
+
+## CLI Usage
 
 Launch a swarm:
 
@@ -89,136 +166,97 @@ Launch a swarm:
 codeswarm launch \
   --nodes 4 \
   --prompt "You are a focused autonomous agent." \
-  --config ../configs/hpcfund.json
+  --config configs/hpcfund.json
 ```
 
-Inject into swarm:
+Inject into a swarm:
 
 ```bash
 codeswarm inject <swarm_id> \
   --prompt "Optimize GEMM tiling." \
-  --config ../configs/hpcfund.json
+  --config configs/hpcfund.json
 ```
 
-Check status:
+List swarms:
 
 ```bash
-codeswarm status <swarm_id> \
-  --config ../configs/hpcfund.json
+codeswarm list --config configs/hpcfund.json
 ```
 
-List active swarms:
+Terminate:
 
 ```bash
-codeswarm list \
-  --config ../configs/hpcfund.json
+codeswarm terminate <swarm_id> --config configs/hpcfund.json
 ```
 
-Terminate a swarm:
+---
 
-```bash
-codeswarm terminate <swarm_id> \
-  --config ../configs/hpcfund.json
+# Multi-Node Execution
+
+Codeswarm supports multi-node swarms (subject to cluster policy).
+
+SBATCH configuration:
+
+```
+#SBATCH --nodes=N
+#SBATCH --ntasks=N
 ```
 
-Backend-specific parameters (partition, instance type, etc.) are defined in configuration, not in CLI flags.
+Each node runs an isolated worker instance.
+
+Parallel injection is supported.
+
+---
+
+# Failure Model
+
+Codeswarm treats distributed signals carefully:
+
+- SSH timeout ≠ termination
+- Single Slurm `NOT_FOUND` ≠ authoritative deletion
+- Failures propagate via `command_rejected`
+- Frontend reconciles optimistic state
+
+Terminated swarms are retained via TTL (default 15 minutes) to prevent lifecycle flapping.
 
 ---
 
 # Cluster Provider Abstraction
 
-The router delegates execution to a provider implementing:
+Execution backends are pluggable via a `ClusterProvider` interface.
 
-```python
-class ClusterProvider:
-    def launch(self, nodes: int) -> str
-    def terminate(self, job_id: str) -> None
-    def get_job_state(self, job_id: str) -> Optional[str]
-    def list_active_jobs(self) -> Dict[str, str]
-```
+Current production provider: **SlurmProvider**.
 
-This abstraction allows:
+Future providers may include:
 
-- Slurm-based HPC execution
-- Future AWS execution
-- Future Kubernetes execution
-- Local development providers
+- Kubernetes
+- AWS
+- Local development runtime
 
-No protocol changes are required to add new backends.
-
----
-
-# Example Backend: Slurm
-
-The current production provider is `SlurmProvider`.
-
-It:
-
-- Generates SBATCH scripts
-- Submits jobs
-- Queries job state via `squeue`
-- Cancels jobs via `scancel`
-
-All Slurm parameters are defined under:
-
-```json
-{
-  "cluster": {
-    "backend": "slurm",
-    "slurm": { ... }
-  }
-}
-```
-
-The router core remains unaware of Slurm-specific flags.
-
----
-
-# Transport Guarantees
-
-- Deterministic TCP handshake with retry
-- Buffered JSON framing
-- No stdio IPC
-- No UNIX sockets
-- Structured error propagation (`command_rejected`)
-- Client lifecycle management
-
----
-
-# Design Principles
-
-1. Backend-neutral protocol
-2. Provider encapsulation
-3. Deterministic lifecycle management
-4. No silent failures
-5. Router as authoritative control plane
-
----
-
-# Status (2026‑02‑26)
-
-Stable:
-
-- Backend-neutral ClusterProvider abstraction
-- SlurmProvider implementation
-- Multi-swarm orchestration
-- Deterministic inject lifecycle
-- Structured protocol documentation
-- CLI UX polish (`codeswarm` binary)
-
-Ready for:
-
-- Additional backend providers
-- Web UI reuse over same protocol
-- OpenClaw integration
-- Production distributed workflows
+Protocol remains stable regardless of provider.
 
 ---
 
 # Documentation
 
+- White paper: `WHITEPAPER.md`
+- Architecture reference: `docs/architecture.md`
 - CLI docs: `cli/README.md`
-- Architecture: `docs/ARCHITECTURE.md`
 - Protocol spec: `docs/PROTOCOL.md`
-- Provider interface: `docs/PROVIDER_INTERFACE.md`
-- Config schema: `docs/CONFIG_SCHEMA.md`
+
+---
+
+# Status
+
+Control-plane stable.
+Multi-swarm orchestration supported.
+Multi-node execution supported (policy-dependent).
+Web UI hardened for lifecycle reconciliation.
+
+Experimental by design.
+
+---
+
+# License
+
+Open source (TBD).
