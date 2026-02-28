@@ -21,9 +21,16 @@ const router = new RouterBridge();
 const state = new SwarmStateManager();
 const hub = new WebSocketHub(wss);
 
+// Track pending aliases keyed by launch request_id
+const pendingAliases: Record<string, string | undefined> = {};
+
+// Track request_id -> swarm_id for status/inject/terminate
+const requestSwarmMap: Record<string, string> = {};
+
 // --- Helper: request swarm status ---
 function requestStatus(swarm_id: string) {
-  router.send('swarm_status', { swarm_id });
+  const request_id = router.send('swarm_status', { swarm_id });
+  requestSwarmMap[request_id] = swarm_id;
 }
 
 // --- Router Event Handling ---
@@ -32,8 +39,12 @@ router.on('event', (msg: any) => {
   const { event, data } = msg;
 
   if (event === 'swarm_launched') {
-    const { swarm_id, job_id, node_count } = data;
-    const alias = `swarm-${swarm_id.slice(0, 8)}`;
+    const { swarm_id, job_id, node_count, request_id } = data;
+
+    // Use user-provided alias if available
+    const alias = pendingAliases[request_id] || `swarm-${swarm_id.slice(0, 8)}`;
+    delete pendingAliases[request_id];
+
     const record = state.createSwarm(swarm_id, alias, job_id, node_count);
 
     // Initially mark as pending until Slurm confirms
@@ -66,6 +77,21 @@ router.on('event', (msg: any) => {
     return;
   }
 
+  // Handle router rejections
+  if (event === 'command_rejected') {
+    const swarm_id = requestSwarmMap[data.request_id];
+
+    if (data.reason === 'unknown swarm_id' && swarm_id) {
+      console.warn('Removing unknown swarm from backend state:', swarm_id);
+      state.remove(swarm_id);
+      hub.broadcast({ type: 'swarm_removed', payload: { swarm_id } });
+    }
+
+    delete requestSwarmMap[data.request_id];
+    hub.broadcast({ type: 'command_rejected', payload: data });
+    return;
+  }
+
   // --- Generic passthrough for all other router events ---
   // This keeps backend decoupled from router protocol evolution.
   hub.broadcast({ type: event, payload: data });
@@ -89,7 +115,16 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'swarm_status') {
-    state.updateStatus(data.swarm_id, data.status, data.slurm_state);
+    const { swarm_id, status, slurm_state } = data;
+
+    // Do not treat NOT_FOUND as authoritative termination
+    if (slurm_state === 'NOT_FOUND') {
+      // Preserve existing status, only update slurm_state
+      state.updateStatus(swarm_id, undefined as any, slurm_state);
+    } else {
+      state.updateStatus(swarm_id, status, slurm_state);
+    }
+
     hub.broadcast({ type: 'status', payload: data });
   }
 
@@ -100,18 +135,29 @@ router.on('event', (msg: any) => {
 });
 
 // --- Periodic Status Refresh ---
-setInterval(() => {
-  for (const swarm of state.list()) {
-    if (swarm.status !== 'terminated') {
-      requestStatus(swarm.swarm_id);
-    }
-  }
-}, 5000); // every 5 seconds
+// SLURM POLL LOOP DISABLED (2026-02-28)
+// Reason: SSH squeue polling is causing lifecycle flapping and false terminations.
+// Status will now be driven by explicit router lifecycle events only.
+// setInterval(() => {
+//   for (const swarm of state.list()) {
+//     if (swarm.status !== 'terminated') {
+//       requestStatus(swarm.swarm_id);
+//     }
+//   }
+// }, 5000); // every 5 seconds
 
 // --- REST Endpoints ---
 app.post('/launch', (req, res) => {
-  const { nodes, prompt } = req.body;
-  const request_id = router.send('swarm_launch', { nodes, system_prompt: prompt });
+  const { nodes, prompt, alias } = req.body;
+
+  const request_id = router.send('swarm_launch', {
+    nodes,
+    system_prompt: prompt
+  });
+
+  // Store alias temporarily until swarm_launched event arrives
+  pendingAliases[request_id] = alias;
+
   res.json({ request_id });
 });
 
@@ -126,6 +172,8 @@ app.post('/inject/:alias', (req, res) => {
     content: prompt
   });
 
+  requestSwarmMap[request_id] = swarm.swarm_id;
+
   res.json({ request_id });
 });
 
@@ -134,6 +182,8 @@ app.post('/terminate/:alias', (req, res) => {
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
 
   const request_id = router.send('swarm_terminate', { swarm_id: swarm.swarm_id });
+  requestSwarmMap[request_id] = swarm.swarm_id;
+
   res.json({ request_id });
 });
 

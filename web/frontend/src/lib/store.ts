@@ -38,9 +38,12 @@ export interface SwarmRecord {
 
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
+  pendingLaunches: Record<string, { alias: string }>
   selectedSwarm?: string
   pendingPrompt?: string
   setPendingPrompt: (prompt: string) => void
+  addPendingLaunch: (request_id: string, alias: string) => void
+  removePendingLaunch: (request_id: string) => void
   setSwarms: (swarms: any[]) => void
   addOrUpdateSwarm: (swarm: SwarmRecord) => void
   removeSwarm: (swarm_id: string) => void
@@ -56,26 +59,54 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
   return {
     swarms: {},
+    pendingLaunches: {},
     selectedSwarm: undefined,
     pendingPrompt: undefined,
     setPendingPrompt: (prompt: string) => set({ pendingPrompt: prompt }),
+    addPendingLaunch: (request_id: string, alias: string) =>
+      set((state) => ({
+        pendingLaunches: {
+          ...state.pendingLaunches,
+          [request_id]: { alias }
+        }
+      })),
+    removePendingLaunch: (request_id: string) =>
+      set((state) => {
+        const copy = { ...state.pendingLaunches }
+        delete copy[request_id]
+        return { pendingLaunches: copy }
+      }),
 
     setSwarms: (swarms) => {
-      const map: Record<string, SwarmRecord> = {}
+      set((state) => {
+        const updated: Record<string, SwarmRecord> = {}
 
-      swarms.forEach((s) => {
-        const nodes: Record<number, NodeState> = {}
-        for (let i = 0; i < s.node_count; i++) {
-          nodes[i] = { node_id: i, turns: [] }
-        }
+        swarms.forEach((s) => {
+          const existing = state.swarms[s.swarm_id]
 
-        map[s.swarm_id] = {
-          ...s,
-          nodes
-        }
+          if (existing) {
+            // Preserve existing nodes and turns, update metadata
+            updated[s.swarm_id] = {
+              ...existing,
+              ...s,
+              nodes: existing.nodes
+            }
+          } else {
+            // Initialize fresh swarm
+            const nodes: Record<number, NodeState> = {}
+            for (let i = 0; i < s.node_count; i++) {
+              nodes[i] = { node_id: i, turns: [] }
+            }
+
+            updated[s.swarm_id] = {
+              ...s,
+              nodes
+            }
+          }
+        })
+
+        return { swarms: updated }
       })
-
-      set({ swarms: map })
     },
 
     addOrUpdateSwarm: (swarm) => {
@@ -126,6 +157,13 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         get().addOrUpdateSwarm(payload)
       }
 
+      if (type === 'swarm_launched') {
+        // Remove pending launch ghost when real swarm is confirmed
+        if (payload.request_id) {
+          get().removePendingLaunch(payload.request_id)
+        }
+      }
+
       if (type === 'reconcile') {
         get().setSwarms(payload)
       }
@@ -155,6 +193,11 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const turns = [...node.turns]
         const prompt = get().pendingPrompt || ''
 
+        // Check for provisional optimistic turn
+        const provisionalIndex = turns.findIndex(
+          (t) => t.injection_id.startsWith('temp-') && !t.completed
+        )
+
         const newTurn: NodeTurn = {
           injection_id: payload.injection_id,
           prompt,
@@ -179,7 +222,12 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           delete pendingComplete[payload.injection_id]
         }
 
-        turns.push(newTurn)
+        if (provisionalIndex !== -1) {
+          // Replace provisional turn with real injection_id
+          turns[provisionalIndex] = newTurn
+        } else {
+          turns.push(newTurn)
+        }
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -192,7 +240,6 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           }
         })
 
-        // clear pending prompt after attaching
         set({ pendingPrompt: undefined })
       }
 

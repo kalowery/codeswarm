@@ -13,14 +13,26 @@ export default function LaunchModal({ onClose }: Props) {
   const [loading, setLoading] = useState(false)
 
   async function handleLaunch() {
-    setLoading(true)
-    await fetch('http://localhost:4000/launch', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ nodes, prompt, alias })
-    })
-    setLoading(false)
-    onClose()
+    try {
+      setLoading(true)
+      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+      const res = await fetch(`${apiBase}/launch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ nodes, prompt, alias })
+      })
+
+      const data = await res.json()
+
+      if (data.request_id) {
+        const { addPendingLaunch } = require('@/lib/store').useSwarmStore.getState()
+        addPendingLaunch(data.request_id, alias || 'Launching swarm')
+      }
+
+      onClose()
+    } finally {
+      setLoading(false)
+    }
   }
 
   return (

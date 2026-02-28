@@ -21,12 +21,21 @@ export default function Home() {
       .then((data) => setSwarms(data))
   }, [setSwarms])
 
+  const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
   const swarmList = Object.values(swarms)
   const active = selected ? swarms[selected] : undefined
   const [showLaunch, setShowLaunch] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
   const [expandedReasoning, setExpandedReasoning] = useState<Record<string, boolean>>({})
+  const [dotCount, setDotCount] = useState(0)
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDotCount((d) => (d + 1) % 4)
+    }, 500)
+    return () => clearInterval(id)
+  }, [])
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex">
@@ -53,6 +62,22 @@ export default function Home() {
           </button>
         </div>
         <div className="space-y-2">
+          {/* Pending Launch Ghosts */}
+          {Object.entries(pendingLaunches).map(([reqId, launch]) => (
+            <div
+              key={reqId}
+              className="p-3 rounded border bg-slate-900 border-amber-500"
+            >
+              <div className="font-medium flex items-center gap-2">
+                {launch.alias}
+                <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              </div>
+              <div className="text-sm text-amber-400">
+                LAUNCHING...
+              </div>
+            </div>
+          ))}
+
           {swarmList.map((swarm) => (
             <div
               key={swarm.swarm_id}
@@ -134,8 +159,16 @@ export default function Home() {
                       <div className="flex justify-start">
                         <div className="max-w-[75%] bg-slate-800 border border-slate-700 px-3 py-2 rounded-lg rounded-bl-sm space-y-2">
 
-                          {/* Collapsible Reasoning */}
-                          {turn.reasoning.length > 0 && (
+                          {/* Activity Indicator */}
+                          {!turn.completed && (
+                            <div className="flex items-center gap-2 text-[10px] text-emerald-400">
+                              <span className="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                              <span>Working{'.'.repeat(dotCount)}</span>
+                            </div>
+                          )}
+
+                          {/* Collapsible Reasoning with Live Preview */}
+                          {(!turn.completed || turn.reasoning.length > 0) && (
                             <div className="text-xs">
                               <button
                                 className="text-amber-400 hover:underline"
@@ -146,10 +179,21 @@ export default function Home() {
                                   }))
                                 }
                               >
-                                🧠 Reasoning
+                                🧠 {expandedReasoning[turn.injection_id]
+                                  ? 'Hide reasoning'
+                                  : (() => {
+                                      if (!turn.reasoning && !turn.completed) {
+                                        return 'Thinking' + '.'.repeat(dotCount)
+                                      }
+                                      const preview = turn.reasoning.slice(0, 60)
+                                      return turn.completed
+                                        ? preview
+                                        : preview + '.'.repeat(dotCount)
+                                    })()
+                                }
                               </button>
 
-                              {expandedReasoning[turn.injection_id] && (
+                              {expandedReasoning[turn.injection_id] && turn.reasoning && (
                                 <div className="mt-1 text-amber-400 whitespace-pre-wrap">
                                   {turn.reasoning}
                                 </div>
@@ -231,15 +275,41 @@ export default function Home() {
                     try {
                       setIsSending(true)
                       setPendingPrompt(value)
+
+                      // Optimistically add provisional turn
+                      const store = useSwarmStore.getState()
+                      const swarm = store.swarms[active.swarm_id]
+                      const node = swarm.nodes[0]
+
+                      const provisional = {
+                        injection_id: `temp-${Date.now()}`,
+                        prompt: value,
+                        deltas: [],
+                        reasoning: '',
+                        commands: [],
+                        completed: false
+                      }
+
+                      store.addOrUpdateSwarm({
+                        ...swarm,
+                        nodes: {
+                          ...swarm.nodes,
+                          0: {
+                            ...node,
+                            turns: [...node.turns, provisional]
+                          }
+                        }
+                      })
+
                       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
                       await fetch(`${apiBase}/inject/${active.alias}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ prompt: value })
                       })
+
                       ;(e.target as HTMLTextAreaElement).value = ''
                     } finally {
-                      // brief delay to avoid rapid double send
                       setTimeout(() => setIsSending(false), 300)
                     }
                   }

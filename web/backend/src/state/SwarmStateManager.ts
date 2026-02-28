@@ -88,11 +88,19 @@ export class SwarmStateManager {
     this.saveState();
   }
 
-  updateStatus(swarm_id: string, status: string, slurm_state?: string) {
+  updateStatus(swarm_id: string, status?: string, slurm_state?: string) {
     const swarm = this.swarms.get(swarm_id);
     if (!swarm) return;
-    swarm.status = status;
-    swarm.slurm_state = slurm_state;
+
+    // Only update status if explicitly provided
+    if (typeof status === 'string') {
+      swarm.status = status;
+    }
+
+    if (typeof slurm_state !== 'undefined') {
+      swarm.slurm_state = slurm_state;
+    }
+
     this.saveState();
   }
 }
