@@ -10,6 +10,7 @@ export default function Home() {
   const setSwarms = useSwarmStore((s) => s.setSwarms)
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
   const selected = useSwarmStore((s) => s.selectedSwarm)
+  const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
 
   const { status: wsStatus } = useWebSocket()
 
@@ -85,7 +86,7 @@ export default function Home() {
               <div>
                 <h1 className="text-xl font-semibold">{active.alias}</h1>
                 <div className="text-sm text-slate-400">
-                  Status: {active.status} · Slurm: {active.slurm_state}
+                  Status: {active.status ? active.status : 'unknown'} · Slurm: {active.slurm_state}
                 </div>
               </div>
               <button
@@ -114,18 +115,77 @@ export default function Home() {
               </button>
             </div>
 
-            <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto font-mono text-sm">
+            <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
               {Object.values(active.nodes).map((node) => (
-                <div key={node.node_id} className="mb-4">
-                  <div className="text-indigo-400 mb-1">Node {node.node_id}</div>
+                <div key={node.node_id} className="space-y-4">
                   {node.turns.map((turn, idx) => (
-                    <div key={idx} className="mb-2">
-                      <div className="text-slate-400">Assistant:</div>
-                      <div>
-                        {turn.deltas.join('')}
-                        {!turn.completed && (
-                          <span className="animate-pulse">▌</span>
-                        )}
+                    <div key={idx} className="space-y-2">
+                      {/* User message */}
+                      {turn.prompt && (
+                        <div className="flex justify-end">
+                          <div className="max-w-[75%] bg-indigo-600 text-white px-3 py-2 rounded-lg rounded-br-sm">
+                            {turn.prompt}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Assistant + Execution Block */}
+                      <div className="flex justify-start">
+                        <div className="max-w-[75%] bg-slate-800 border border-slate-700 px-3 py-2 rounded-lg rounded-bl-sm space-y-2">
+
+                          {/* Reasoning (collapsed style) */}
+                          {turn.reasoning.length > 0 && (
+                            <div className="text-xs text-amber-400 whitespace-pre-wrap">
+                              🧠 {turn.reasoning.join('')}
+                            </div>
+                          )}
+
+                          {/* Command executions */}
+                          {turn.commands.map((cmd, i) => (
+                            <div key={i} className="text-xs bg-slate-900 border border-slate-700 rounded p-2">
+                              <div className="text-slate-400">
+                                $ {Array.isArray(cmd.command) ? cmd.command.join(' ') : cmd.command}
+                              </div>
+                              {cmd.status === 'completed' && (
+                                <div className="mt-1 text-emerald-400 whitespace-pre-wrap">
+                                  {cmd.stdout}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+
+                          {/* Assistant output */}
+                          {turn.deltas.length > 0 ? (
+                            <>
+                              <div className="whitespace-pre-wrap">
+                                {turn.deltas.join('')}
+                              </div>
+                              {!turn.completed && (
+                                <span className="animate-pulse">▌</span>
+                              )}
+                            </>
+                          ) : turn.completed ? (
+                            <span className="text-slate-400 italic">
+                              ✓ Completed (no user-visible output)
+                            </span>
+                          ) : (
+                            <span className="animate-pulse">▌</span>
+                          )}
+
+                          {/* Error */}
+                          {turn.error && (
+                            <div className="text-rose-400 text-xs">
+                              ⚠ {turn.error}
+                            </div>
+                          )}
+
+                          {/* Usage */}
+                          {turn.usage && (
+                            <div className="text-[10px] text-slate-500">
+                              Tokens: {turn.usage}
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -153,6 +213,7 @@ export default function Home() {
 
                     try {
                       setIsSending(true)
+                      setPendingPrompt(value)
                       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
                       await fetch(`${apiBase}/inject/${active.alias}`, {
                         method: 'POST',

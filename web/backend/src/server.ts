@@ -45,17 +45,30 @@ router.on('event', (msg: any) => {
     requestStatus(swarm_id);
   }
 
+  // --- Core conversational events (explicit mapping for backwards compatibility) ---
   if (event === 'turn_started') {
     hub.broadcast({ type: 'turn_started', payload: data });
+    return;
   }
 
   if (event === 'assistant_delta') {
     hub.broadcast({ type: 'delta', payload: data });
+    return;
+  }
+
+  if (event === 'assistant') {
+    hub.broadcast({ type: 'assistant', payload: data });
+    return;
   }
 
   if (event === 'turn_complete') {
     hub.broadcast({ type: 'turn_complete', payload: data });
+    return;
   }
+
+  // --- Generic passthrough for all other router events ---
+  // This keeps backend decoupled from router protocol evolution.
+  hub.broadcast({ type: event, payload: data });
 
   if (event === 'swarm_list') {
     // Full state reconciliation

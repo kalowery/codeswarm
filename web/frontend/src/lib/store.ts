@@ -1,8 +1,23 @@
 import { create } from 'zustand'
 
+export interface CommandExecution {
+  call_id: string
+  command: string[] | string
+  cwd?: string
+  stdout?: string
+  stderr?: string
+  exit_code?: number
+  status: 'started' | 'completed'
+}
+
 export interface NodeTurn {
   injection_id: string
+  prompt: string
   deltas: string[]
+  reasoning: string[]
+  commands: CommandExecution[]
+  error?: string
+  usage?: number
   completed: boolean
 }
 
@@ -24,6 +39,8 @@ export interface SwarmRecord {
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
   selectedSwarm?: string
+  pendingPrompt?: string
+  setPendingPrompt: (prompt: string) => void
   setSwarms: (swarms: any[]) => void
   addOrUpdateSwarm: (swarm: SwarmRecord) => void
   removeSwarm: (swarm_id: string) => void
@@ -34,10 +51,14 @@ interface SwarmStore {
 export const useSwarmStore = create<SwarmStore>((set, get) => {
   // Track completions that arrive before turn_started
   const pendingComplete: Record<string, boolean> = {}
+  const pendingDeltas: Record<string, string[]> = {}
+  const pendingAssistant: Record<string, string> = {}
 
   return {
     swarms: {},
     selectedSwarm: undefined,
+    pendingPrompt: undefined,
+    setPendingPrompt: (prompt: string) => set({ pendingPrompt: prompt }),
 
     setSwarms: (swarms) => {
       const map: Record<string, SwarmRecord> = {}
@@ -58,9 +79,34 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
     },
 
     addOrUpdateSwarm: (swarm) => {
-      set((state) => ({
-        swarms: { ...state.swarms, [swarm.swarm_id]: swarm }
-      }))
+      set((state) => {
+        const existing = state.swarms[swarm.swarm_id]
+
+        // Respect provided nodes if present (for immutable updates)
+        let nodes = swarm.nodes
+
+        if (!nodes) {
+          nodes = existing?.nodes
+        }
+
+        // Initialize nodes if still missing
+        if (!nodes) {
+          nodes = {}
+          for (let i = 0; i < swarm.node_count; i++) {
+            nodes[i] = { node_id: i, turns: [] }
+          }
+        }
+
+        return {
+          swarms: {
+            ...state.swarms,
+            [swarm.swarm_id]: {
+              ...swarm,
+              nodes
+            }
+          }
+        }
+      })
     },
 
     removeSwarm: (swarm_id) => {
@@ -88,6 +134,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const swarm = get().swarms[payload.swarm_id]
         if (!swarm) return
 
+        // Guard against malformed status payloads (e.g. error-only responses)
+        if (!payload.status) return
+
         get().addOrUpdateSwarm({
           ...swarm,
           status: payload.status,
@@ -104,11 +153,25 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!node) return
 
         const turns = [...node.turns]
+        const prompt = get().pendingPrompt || ''
 
         const newTurn: NodeTurn = {
           injection_id: payload.injection_id,
+          prompt,
           deltas: [],
+          reasoning: [],
+          commands: [],
           completed: false
+        }
+
+        if (pendingDeltas[payload.injection_id]) {
+          newTurn.deltas = [...pendingDeltas[payload.injection_id]]
+          delete pendingDeltas[payload.injection_id]
+        }
+
+        if (pendingAssistant[payload.injection_id] && newTurn.deltas.length === 0) {
+          newTurn.deltas = [pendingAssistant[payload.injection_id]]
+          delete pendingAssistant[payload.injection_id]
         }
 
         if (pendingComplete[payload.injection_id]) {
@@ -128,6 +191,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             }
           }
         })
+
+        // clear pending prompt after attaching
+        set({ pendingPrompt: undefined })
       }
 
       if (type === 'delta') {
@@ -142,9 +208,50 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const turn = turns.find(
           (t) => t.injection_id === payload.injection_id
         )
-        if (!turn) return
+
+        if (!turn) {
+          if (!pendingDeltas[payload.injection_id]) {
+            pendingDeltas[payload.injection_id] = []
+          }
+          pendingDeltas[payload.injection_id].push(payload.content)
+          return
+        }
 
         turn.deltas = [...turn.deltas, payload.content]
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: {
+              ...node,
+              turns
+            }
+          }
+        })
+      }
+
+      if (type === 'assistant') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const turns = [...node.turns]
+        const turn = turns.find(
+          (t) => t.injection_id === payload.injection_id
+        )
+
+        if (!turn) {
+          pendingAssistant[payload.injection_id] = payload.content
+          return
+        }
+
+        if (turn.deltas.length === 0) {
+          turn.deltas = [payload.content]
+        }
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -186,6 +293,139 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
               ...node,
               turns
             }
+          }
+        })
+      }
+
+      if (type === 'reasoning_delta') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? { ...t, reasoning: [...t.reasoning, payload.content] }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'command_started') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? {
+                ...t,
+                commands: [
+                  ...t.commands,
+                  {
+                    call_id: payload.call_id,
+                    command: payload.command,
+                    cwd: payload.cwd,
+                    status: 'started'
+                  }
+                ]
+              }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'command_completed') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) => {
+          if (t.injection_id !== payload.injection_id) return t
+          return {
+            ...t,
+            commands: t.commands.map((c) =>
+              c.call_id === payload.call_id
+                ? {
+                    ...c,
+                    status: 'completed',
+                    stdout: payload.stdout,
+                    stderr: payload.stderr,
+                    exit_code: payload.exit_code
+                  }
+                : c
+            )
+          }
+        })
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'agent_error') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? { ...t, error: payload.message }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'usage') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? { ...t, usage: payload.total_tokens }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
           }
         })
       }
