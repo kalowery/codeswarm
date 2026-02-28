@@ -774,6 +774,12 @@ def run_daemon(config, provider):
                         swarm["terminated_at"] = time.time()
                         save_state()
 
+                    # Provider-specific archival (best-effort)
+                    try:
+                        provider.archive(job_id, swarm_id)
+                    except Exception:
+                        pass
+
                     emit_event("swarm_terminated", {
                         "request_id": request_id,
                         "swarm_id": swarm_id
@@ -783,6 +789,17 @@ def run_daemon(config, provider):
 # ================================
 
 def main():
+    # Python version advisory (non-blocking)
+    import sys
+    min_version = (3, 11)
+    if sys.version_info < min_version:
+        print(
+            f"[warning] Codeswarm is developed against Python {min_version[0]}.{min_version[1]}+; "
+            f"detected {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}. "
+            "It may work, but this version is not tested.",
+            file=sys.stderr,
+        )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--daemon", action="store_true")

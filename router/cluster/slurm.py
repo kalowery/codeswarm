@@ -79,6 +79,12 @@ class SlurmProvider(ClusterProvider):
 
         subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
 
+    def archive(self, job_id: str, swarm_id: str) -> None:
+        # Archival for Slurm should be handled by cluster-side policy
+        # (e.g., SBATCH epilog or shared filesystem rules).
+        # Router does not enforce filesystem moves for Slurm backend.
+        return
+
     def get_job_state(self, job_id: str) -> Optional[str]:
         login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:

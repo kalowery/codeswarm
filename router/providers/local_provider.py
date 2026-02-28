@@ -1,5 +1,6 @@
 import subprocess
 import uuid
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -18,6 +19,9 @@ class LocalProvider:
         self.workspace_root = Path(
             self.config.get("workspace_root", "runs")
         )
+
+        # Archive root (optional)
+        self.archive_root = self.config.get("archive_root")
 
     def launch(self, nodes: int) -> str:
         job_id = f"local_{uuid.uuid4().hex[:8]}"
@@ -56,6 +60,24 @@ class LocalProvider:
                 pass
 
         self.jobs.pop(job_id, None)
+
+    def archive(self, job_id: str, swarm_id: str) -> None:
+        if not self.archive_root:
+            return
+
+        runs_dir = self.workspace_root / job_id
+        if not runs_dir.exists():
+            return
+
+        archive_root = Path(self.archive_root)
+        archive_root.mkdir(parents=True, exist_ok=True)
+
+        target = archive_root / f"swarm_{swarm_id}_{job_id}"
+
+        try:
+            shutil.move(str(runs_dir), str(target))
+        except Exception as e:
+            print(f"[archive] LocalProvider failed to archive {swarm_id}: {e}")
 
     def get_job_state(self, job_id: str) -> Optional[str]:
         procs = self.jobs.get(job_id)

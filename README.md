@@ -148,7 +148,7 @@ A deterministic execution cycle that may include:
 
 - Node.js (see `.nvmrc` for recommended version)
 - npm
-- Python 3
+- Python 3.11+ (stdlib only; no external packages currently required)
 - Access to a supported cluster backend (e.g. Slurm)
 
 If using `nvm`:
