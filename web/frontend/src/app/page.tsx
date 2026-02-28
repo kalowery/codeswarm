@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import { useSwarmStore } from '@/lib/store'
 import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
+import Image from 'next/image'
 
 export default function Home() {
   const swarms = useSwarmStore((s) => s.swarms)
@@ -43,9 +44,29 @@ export default function Home() {
     <div className="min-h-screen bg-slate-950 text-slate-100 flex">
       {/* Sidebar */}
       <div className="w-80 border-r border-slate-800 p-4">
-        <div className="flex items-center justify-between mb-4">
+        <div className="mb-4 space-y-3">
+
+          {/* Logo + Title */}
           <div className="flex items-center gap-3">
-            <h2 className="text-lg font-semibold">Swarms</h2>
+            <Image
+              src="/codeswarm.jpg"
+              alt="Codeswarm"
+              width={32}
+              height={32}
+              className="rounded-lg ring-1 ring-slate-700"
+            />
+            <div>
+              <div className="text-lg font-semibold tracking-wide">
+                Codeswarm
+              </div>
+              <div className="text-xs text-slate-500 -mt-1">
+                Swarm Control
+              </div>
+            </div>
+          </div>
+
+          {/* Status + Launch */}
+          <div className="flex items-center justify-between">
             <span className={`text-xs px-2 py-0.5 rounded border ${
               wsStatus === 'connected'
                 ? 'bg-emerald-900 border-emerald-500 text-emerald-400'
@@ -55,13 +76,14 @@ export default function Home() {
             }`}>
               WS: {wsStatus}
             </span>
+
+            <button
+              onClick={() => setShowLaunch(true)}
+              className="px-2 py-1 bg-indigo-600 rounded text-sm"
+            >
+              + Launch
+            </button>
           </div>
-          <button
-            onClick={() => setShowLaunch(true)}
-            className="px-2 py-1 bg-indigo-600 rounded text-sm"
-          >
-            + Launch
-          </button>
         </div>
         <div className="space-y-2">
           {/* Launch Error Banner */}
