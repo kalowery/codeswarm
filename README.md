@@ -191,6 +191,16 @@ Edit the file to match your cluster parameters.
 
 ## Run Full Web Stack
 
+### Local Mode (No Slurm Required)
+
+```bash
+codeswarm web --config configs/local.json
+```
+
+This uses the LocalProvider and launches worker processes directly on your machine.
+
+### Slurm Mode
+
 ```bash
 codeswarm web --config configs/hpcfund.json
 ```
