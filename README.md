@@ -259,4 +259,6 @@ Experimental by design.
 
 # License
 
-Open source (TBD).
+MIT License.
+
+See `LICENSE` for details.
