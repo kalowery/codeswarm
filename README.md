@@ -142,7 +142,22 @@ A deterministic execution cycle that may include:
 
 ---
 
-# Quick Start
+# Getting Started
+
+## Requirements
+
+- Node.js (see `.nvmrc` for recommended version)
+- npm
+- Python 3
+- Access to a supported cluster backend (e.g. Slurm)
+
+If using `nvm`:
+
+```bash
+nvm use
+```
+
+---
 
 ## Development Setup
 
@@ -159,6 +174,18 @@ This will:
 - Install dependencies for CLI, backend, and frontend
 - Build the CLI
 - Link the `codeswarm` binary globally via `npm link`
+
+---
+
+## Example Configuration
+
+Copy the example config and adapt it to your environment:
+
+```bash
+cp configs/local-dev.example.json configs/local-dev.json
+```
+
+Edit the file to match your cluster parameters.
 
 ---
 
