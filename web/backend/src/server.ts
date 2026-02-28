@@ -97,11 +97,20 @@ router.on('event', (msg: any) => {
   hub.broadcast({ type: event, payload: data });
 
   if (event === 'swarm_list') {
-    // Full state reconciliation
+    // Full authoritative reconciliation from router
     const swarms = data.swarms || {};
+
+    // Remove stale swarms not present in router
+    for (const existing of state.list()) {
+      if (!swarms[existing.swarm_id]) {
+        state.remove(existing.swarm_id);
+      }
+    }
+
+    // Add or update swarms from router
     for (const swarm_id of Object.keys(swarms)) {
+      const swarm = swarms[swarm_id];
       if (!state.getById(swarm_id)) {
-        const swarm = swarms[swarm_id];
         const alias = `swarm-${swarm_id.slice(0, 8)}`;
         state.createSwarm(
           swarm_id,
@@ -111,7 +120,9 @@ router.on('event', (msg: any) => {
         );
       }
     }
+
     hub.broadcast({ type: 'reconcile', payload: state.list() });
+    return;
   }
 
   if (event === 'swarm_status') {
@@ -131,6 +142,14 @@ router.on('event', (msg: any) => {
   if (event === 'swarm_terminated') {
     state.remove(data.swarm_id);
     hub.broadcast({ type: 'swarm_removed', payload: data });
+    return;
+  }
+
+  // Handle router-driven removal (TTL prune or other cleanup)
+  if (event === 'swarm_removed') {
+    state.remove(data.swarm_id);
+    hub.broadcast({ type: 'swarm_removed', payload: data });
+    return;
   }
 });
 

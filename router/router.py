@@ -10,6 +10,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import threading
 import re
+import time
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
@@ -26,6 +27,10 @@ DEBUG = False
 SWARMS = {}
 JOB_TO_SWARM = {}
 LAST_USAGE = {}
+
+# Retention policy
+TERMINATED_TTL_SECONDS = 900  # 15 minutes
+MAX_TERMINATED = 100
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
 
@@ -67,9 +72,12 @@ def reconcile(provider):
         else:
             to_remove.append((swarm_id, job_id))
 
-    # Remove terminated swarms from memory
+    # Mark terminated instead of immediate removal
     for swarm_id, job_id in to_remove:
-        SWARMS.pop(swarm_id, None)
+        swarm = SWARMS.get(swarm_id)
+        if swarm and swarm.get("status") != "terminated":
+            swarm["status"] = "terminated"
+            swarm["terminated_at"] = time.time()
         if job_id:
             JOB_TO_SWARM.pop(job_id, None)
 
@@ -78,6 +86,50 @@ def reconcile(provider):
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
+
+
+def cleanup_terminated():
+    now = time.time()
+
+    terminated = [
+        (sid, s)
+        for sid, s in SWARMS.items()
+        if s.get("status") == "terminated"
+    ]
+
+    # TTL prune
+    for sid, s in list(terminated):
+        if now - s.get("terminated_at", now) > TERMINATED_TTL_SECONDS:
+            SWARMS.pop(sid, None)
+            emit_event("swarm_removed", {"swarm_id": sid})
+
+    # Hard cap
+    terminated = [
+        (sid, s)
+        for sid, s in SWARMS.items()
+        if s.get("status") == "terminated"
+    ]
+
+    if len(terminated) > MAX_TERMINATED:
+        terminated.sort(key=lambda x: x[1].get("terminated_at", 0))
+        overflow = terminated[:-MAX_TERMINATED]
+
+        for sid, _ in overflow:
+            SWARMS.pop(sid, None)
+            emit_event("swarm_removed", {"swarm_id": sid})
+
+    save_state()
+
+
+def cleanup_loop():
+    while True:
+        time.sleep(60)
+        try:
+            cleanup_terminated()
+        except Exception:
+            pass
+
+threading.Thread(target=cleanup_loop, daemon=True).start()
 
 
 def emit_event(event_name, data):
@@ -669,14 +721,14 @@ def run_daemon(config, provider):
 
                         slurm_state = result.stdout.strip()
 
-                        # If job not found in Slurm, remove swarm entirely
+                        # If job not found in Slurm, mark swarm terminated (do not delete)
                         if not slurm_state:
                             slurm_state = "NOT_FOUND"
 
-                            # Remove terminated swarm from memory
-                            SWARMS.pop(swarm_id, None)
-                            JOB_TO_SWARM.pop(job_id, None)
-                            save_state()
+                            if swarm.get("status") != "terminated":
+                                swarm["status"] = "terminated"
+                                swarm["terminated_at"] = time.time()
+                                save_state()
 
                             emit_event("swarm_status", {
                                 "request_id": request_id,
@@ -716,10 +768,11 @@ def run_daemon(config, provider):
                     login_alias = config["ssh"]["login_alias"]
                     subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
 
-                    # Remove swarm immediately after termination
-                    SWARMS.pop(swarm_id, None)
-                    JOB_TO_SWARM.pop(job_id, None)
-                    save_state()
+                    # Mark swarm terminated (do not delete immediately)
+                    if swarm.get("status") != "terminated":
+                        swarm["status"] = "terminated"
+                        swarm["terminated_at"] = time.time()
+                        save_state()
 
                     emit_event("swarm_terminated", {
                         "request_id": request_id,
@@ -746,6 +799,13 @@ def main():
 
     # Load persisted state and reconcile with cluster backend
     load_state()
+
+    # Migration: ensure terminated swarms have terminated_at (for legacy entries)
+    for swarm in SWARMS.values():
+        if swarm.get("status") == "terminated" and "terminated_at" not in swarm:
+            swarm["terminated_at"] = time.time()
+    save_state()
+
     provider = build_provider(config)
     reconcile(provider)
 

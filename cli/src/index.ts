@@ -479,4 +479,89 @@ program
     await new Promise<void>(() => {});
   });
 
+// --- Web Stack Supervisor ---
+
+async function runWebStack(opts: any) {
+  const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../");
+
+  const routerPath = path.join(repoRoot, "router", "router.py");
+  const backendPath = path.join(repoRoot, "web", "backend");
+  const frontendPath = path.join(repoRoot, "web", "frontend");
+
+  const configPath = opts.config
+    ? path.resolve(process.cwd(), opts.config)
+    : path.join(repoRoot, "configs", "hpcfund.json");
+
+  console.log("[web] Starting Codeswarm web stack...\n");
+
+  const children: any[] = [];
+
+  function spawnWithPrefix(name: string, cmd: string, args: string[], cwd?: string) {
+    const child = spawn(cmd, args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    child.stdout.on("data", (data) => {
+      process.stdout.write(`[${name}] ${data}`);
+    });
+
+    child.stderr.on("data", (data) => {
+      process.stderr.write(`[${name}] ${data}`);
+    });
+
+    child.on("exit", (code) => {
+      console.log(`[${name}] exited with code ${code}`);
+    });
+
+    children.push(child);
+  }
+
+  // Router (debug mode)
+  spawnWithPrefix(
+    "router",
+    "python3",
+    [routerPath, "--config", configPath, "--debug"]
+  );
+
+  // Backend (dev mode)
+  spawnWithPrefix("backend", "npm", ["run", "dev"], backendPath);
+
+  // Frontend (dev mode)
+  spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
+
+  // Attempt to open browser (best-effort)
+  if (!opts.noOpen) {
+    try {
+      const url = "http://localhost:3000";
+      const opener = process.platform === "darwin" ? "open" : "xdg-open";
+      spawn(opener, [url], { detached: true, stdio: "ignore" }).unref();
+    } catch {
+      console.warn("[web] Warning: Could not open browser automatically.");
+    }
+  }
+
+  function shutdown() {
+    console.log("\n[web] Shutting down...");
+    for (const child of children) {
+      try {
+        child.kill("SIGTERM");
+      } catch {}
+    }
+    process.exit(0);
+  }
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+program
+  .command("web")
+  .description("Run full Codeswarm web stack locally")
+  .option("--config <path>", "Path to router config")
+  .option("--no-open", "Do not open browser automatically")
+  .action(async (cmd: any) => {
+    await runWebStack(cmd);
+  });
+
 program.parse(process.argv);
