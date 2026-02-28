@@ -324,6 +324,113 @@ def translate_event(event):
         LAST_USAGE[injection_id] = total
         return ("usage", {**base, "total_tokens": total})
 
+    # --- Task lifecycle normalization ---
+    if method == "codex/event/task_started":
+        return (
+            "task_started",
+            {
+                **base,
+                "raw": payload
+            }
+        )
+
+    if method == "codex/event/task_complete":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "task_complete",
+            {
+                **base,
+                "last_agent_message": msg.get("last_agent_message"),
+                "raw": payload
+            }
+        )
+
+    # --- Error normalization ---
+    if method == "codex/event/error":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "agent_error",
+            {
+                **base,
+                "message": msg.get("message"),
+                "error_code": msg.get("codex_error_info"),
+                "raw": payload
+            }
+        )
+
+    if method == "error":
+        err = payload.get("params", {}).get("error", {})
+        return (
+            "agent_error",
+            {
+                **base,
+                "message": err.get("message"),
+                "error_code": err.get("codexErrorInfo"),
+                "raw": payload
+            }
+        )
+
+    # --- Command execution normalization ---
+    if method == "codex/event/exec_command_begin":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "command_started",
+            {
+                **base,
+                "call_id": msg.get("call_id"),
+                "command": msg.get("command"),
+                "cwd": msg.get("cwd"),
+                "raw": payload
+            }
+        )
+
+    if method == "codex/event/exec_command_end":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "command_completed",
+            {
+                **base,
+                "call_id": msg.get("call_id"),
+                "command": msg.get("command"),
+                "cwd": msg.get("cwd"),
+                "stdout": msg.get("stdout"),
+                "stderr": msg.get("stderr"),
+                "exit_code": msg.get("exit_code"),
+                "duration": msg.get("duration"),
+                "raw": payload
+            }
+        )
+
+    # --- Reasoning normalization ---
+    if method == "codex/event/agent_reasoning_delta":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "reasoning_delta",
+            {
+                **base,
+                "content": msg.get("delta"),
+                "raw": payload
+            }
+        )
+
+    if method == "codex/event/agent_reasoning":
+        msg = payload.get("params", {}).get("msg", {})
+        return (
+            "reasoning",
+            {
+                **base,
+                "content": msg.get("text"),
+                "raw": payload
+            }
+        )
+
+    # ---- Unknown method debugging ----
+    if DEBUG and method:
+        print(
+            f"[router DEBUG] UNHANDLED METHOD: {method} | payload={json.dumps(payload)}",
+            flush=True
+        )
+
     return None
 
 
