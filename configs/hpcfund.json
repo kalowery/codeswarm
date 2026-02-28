@@ -1,0 +1,24 @@
+{
+  "cluster": {
+    "backend": "slurm",
+
+    "workspace_root": "/work1/amd/klowery/workspace",
+    "cluster_subdir": "codeswarm",
+
+    "slurm": {
+      "login_alias": "hpcfund",
+      "partition": "mi2101x",
+      "time_limit": "00:59:00"
+    }
+  },
+
+  "ssh": {
+    "login_alias": "hpcfund",
+    "controlpersist_minutes": 10
+  },
+
+  "router": {
+    "ssh_max_workers": 6,
+    "heartbeat_timeout_seconds": 60
+  }
+}
