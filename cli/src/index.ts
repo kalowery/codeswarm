@@ -481,8 +481,12 @@ program
 
 // --- Web Stack Supervisor ---
 
+import { fileURLToPath } from "url";
+
 async function runWebStack(opts: any) {
-  const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "../../");
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const repoRoot = path.resolve(__dirname, "../../");
 
   const routerPath = path.join(repoRoot, "router", "router.py");
   const backendPath = path.join(repoRoot, "web", "backend");
@@ -517,11 +521,11 @@ async function runWebStack(opts: any) {
     children.push(child);
   }
 
-  // Router (debug mode)
+  // Router (daemon + debug mode)
   spawnWithPrefix(
     "router",
     "python3",
-    [routerPath, "--config", configPath, "--debug"]
+    ["-u", routerPath, "--config", configPath, "--daemon", "--debug"]
   );
 
   // Backend (dev mode)
@@ -530,12 +534,22 @@ async function runWebStack(opts: any) {
   // Frontend (dev mode)
   spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
 
-  // Attempt to open browser (best-effort)
+  // Attempt to open browser (best-effort, fully safe)
   if (!opts.noOpen) {
     try {
       const url = "http://localhost:3000";
       const opener = process.platform === "darwin" ? "open" : "xdg-open";
-      spawn(opener, [url], { detached: true, stdio: "ignore" }).unref();
+
+      const browser = spawn(opener, [url], {
+        detached: true,
+        stdio: "ignore",
+      });
+
+      browser.on("error", () => {
+        console.warn("[web] Warning: Could not open browser automatically.");
+      });
+
+      browser.unref();
     } catch {
       console.warn("[web] Warning: Could not open browser automatically.");
     }
