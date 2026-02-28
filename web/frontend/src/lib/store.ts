@@ -14,7 +14,7 @@ export interface NodeTurn {
   injection_id: string
   prompt: string
   deltas: string[]
-  reasoning: string[]
+  reasoning: string
   commands: CommandExecution[]
   error?: string
   usage?: number
@@ -159,7 +159,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           injection_id: payload.injection_id,
           prompt,
           deltas: [],
-          reasoning: [],
+          reasoning: '',
           commands: [],
           completed: false
         }
@@ -306,7 +306,29 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, reasoning: [...t.reasoning, payload.content] }
+            ? { ...t, reasoning: (t.reasoning ?? '') + payload.content }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'reasoning') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? { ...t, reasoning: payload.content }
             : t
         )
 

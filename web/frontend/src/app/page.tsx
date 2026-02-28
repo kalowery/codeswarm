@@ -26,6 +26,7 @@ export default function Home() {
   const [showLaunch, setShowLaunch] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
+  const [expandedReasoning, setExpandedReasoning] = useState<Record<string, boolean>>({})
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex">
@@ -64,7 +65,7 @@ export default function Home() {
             >
               <div className="font-medium">{swarm.alias}</div>
               <div className="text-sm text-slate-400">
-                {swarm.status.toUpperCase()} · {swarm.node_count} node
+                {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} node
               </div>
             </div>
           ))}
@@ -133,10 +134,26 @@ export default function Home() {
                       <div className="flex justify-start">
                         <div className="max-w-[75%] bg-slate-800 border border-slate-700 px-3 py-2 rounded-lg rounded-bl-sm space-y-2">
 
-                          {/* Reasoning (collapsed style) */}
+                          {/* Collapsible Reasoning */}
                           {turn.reasoning.length > 0 && (
-                            <div className="text-xs text-amber-400 whitespace-pre-wrap">
-                              🧠 {turn.reasoning.join('')}
+                            <div className="text-xs">
+                              <button
+                                className="text-amber-400 hover:underline"
+                                onClick={() =>
+                                  setExpandedReasoning(prev => ({
+                                    ...prev,
+                                    [turn.injection_id]: !prev[turn.injection_id]
+                                  }))
+                                }
+                              >
+                                🧠 Reasoning
+                              </button>
+
+                              {expandedReasoning[turn.injection_id] && (
+                                <div className="mt-1 text-amber-400 whitespace-pre-wrap">
+                                  {turn.reasoning}
+                                </div>
+                              )}
                             </div>
                           )}
 
