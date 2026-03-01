@@ -1,153 +1,274 @@
 # Codeswarm Architecture
 
-This document describes the high-level architecture of Codeswarm after the introduction of the Cluster Provider abstraction.
+This document describes the current (post–provider abstraction) architecture of Codeswarm.
+
+Codeswarm is a **provider-agnostic control plane** that orchestrates distributed Codex workers across multiple execution backends.
+
+Currently supported providers:
+
+- ✅ Local (subprocess execution)
+- ✅ Slurm (HPC cluster execution)
+
+The Router is completely unaware of SSH or Slurm semantics.
 
 ---
 
 # 1. System Overview
 
-Codeswarm consists of three primary layers:
-
-1. **CLI (Intent Layer)**
-2. **Router (Control Plane)**
-3. **Cluster Provider (Execution Backend)**
-
+```mermaid
+flowchart TD
+    UI[Frontend (Next.js)] -->|WebSocket| BE[Backend (Express)]
+    BE -->|TCP codeswarm.router.v1| RT[Router]
+    RT --> PR[Provider Interface]
+    PR --> LP[Local Provider]
+    PR --> SP[Slurm Provider]
+    LP --> WK[Workers]
+    SP --> WK
+    WK --> CX[Codex App Server]
+    CX --> MB[Mailbox (JSONL)]
+    MB --> RT
 ```
-CLI  →  Router  →  ClusterProvider  →  Compute Backend
-```
-
-The router exposes a backend-neutral protocol (`codeswarm.router.v1`).
-All backend-specific logic is isolated behind the `ClusterProvider` interface.
 
 ---
 
-# 2. CLI (Intent Layer)
+# 2. Core Components
+
+## 2.1 Frontend (Next.js)
 
 Responsibilities:
 
-- Construct protocol-compliant JSON commands
-- Manage TCP transport lifecycle
-- Format streaming runtime events
-- Handle inject lifecycle logic
+- Render swarms and nodes
+- Stream assistant output
+- Derive attention indicators from completed turns
+- Manage multi-node navigation (HPC-safe horizontal scroll model)
 
-The CLI does NOT:
+The frontend is **event-sourced**.
 
-- Know about Slurm
-- Know about partitions, accounts, or QOS
-- Contain backend-specific logic
-
-Launch payloads are backend-neutral:
-
-```json
-{
-  "nodes": 2,
-  "system_prompt": "..."
-}
-```
+It does not poll cluster state.
+It reacts to streamed router events.
 
 ---
 
-# 3. Router (Control Plane)
-
-The router is a long-running daemon responsible for:
-
-- Swarm registry and state persistence
-- Translating worker runtime RPC into protocol events
-- Managing inject lifecycle
-- Delegating cluster operations to a provider
-
-The router does NOT:
-
-- Contain Slurm-specific logic
-- Contain AWS/Kubernetes logic
-- Know backend parameter semantics
-
----
-
-# 4. Cluster Provider Abstraction
-
-The router delegates execution backend operations to a provider implementing the `ClusterProvider` interface.
-
-```
-router/
-  cluster/
-    base.py
-    slurm.py
-    factory.py
-```
-
-## 4.1 ClusterProvider Interface
-
-Defined in `router/cluster/base.py`:
-
-```python
-class ClusterProvider(ABC):
-    def launch(self, nodes: int) -> str: ...
-    def terminate(self, job_id: str) -> None: ...
-    def get_job_state(self, job_id: str) -> Optional[str]: ...
-    def list_active_jobs(self) -> Dict[str, str]: ...
-```
-
-The interface is backend-neutral.
-
----
-
-## 4.2 SlurmProvider
-
-Implements `ClusterProvider`.
+## 2.2 Backend (Express)
 
 Responsibilities:
 
-- Generate SBATCH script
-- Submit jobs
-- Query job state via `squeue`
-- Cancel jobs via `scancel`
-- Pull Slurm-specific parameters from config
+- WebSocket bridge to frontend
+- TCP bridge to router
+- Durable swarm metadata (`state.json`)
+- Reconciliation via `swarm_status`
 
-All Slurm parameters live under:
+The backend does not perform cluster operations.
 
-```json
-cluster.slurm
+---
+
+## 2.3 Router (Control Plane)
+
+The Router is the heart of Codeswarm.
+
+Responsibilities:
+
+- Maintain in-memory swarm registry
+- Delegate cluster actions to provider
+- Normalize worker events into router protocol
+- Emit lifecycle events
+
+The Router MUST NOT:
+
+- Reference SSH
+- Reference Slurm
+- Reference login aliases
+
+All cluster semantics are delegated to the Provider.
+
+---
+
+# 3. Provider Abstraction
+
+The Router interacts with a provider via a minimal interface.
+
+```mermaid
+classDiagram
+    class Provider {
+        +launch()
+        +inject()
+        +terminate()
+        +get_job_state()
+        +archive()
+    }
+
+    Provider <|-- LocalProvider
+    Provider <|-- SlurmProvider
 ```
 
-The router never references partition/account/QOS directly.
+This ensures:
+
+- Router is backend-agnostic
+- New providers can be added without modifying router core
 
 ---
 
-# 5. Worker Runtime
+# 4. Worker Model
 
-Workers run inside cluster jobs.
+Workers run `codex_worker.py`.
 
-They:
+Workers depend only on:
 
-- Read mailbox inbox files
-- Emit runtime RPC events
-- Produce assistant responses
+```
+CODESWARM_JOB_ID
+CODESWARM_NODE_ID
+CODESWARM_BASE_DIR
+CODESWARM_CODEX_BIN (optional)
+```
 
-The router translates worker RPC into protocol events.
+Workers must NOT depend on:
 
----
+- SLURM_*
+- WORKSPACE_ROOT
+- CLUSTER_SUBDIR
 
-# 6. Design Principles
-
-1. **Backend Neutral Protocol**
-2. **Provider Encapsulation**
-3. **Single Source of Configuration**
-4. **Deterministic Control Plane**
-5. **No Silent Failures**
-
----
-
-# 7. Extending to New Backends
-
-To add a new backend:
-
-1. Implement `ClusterProvider`
-2. Add to `cluster/factory.py`
-3. Add backend-specific config section
-
-No protocol changes required.
+This guarantees portability.
 
 ---
 
-End of Architecture Document.
+# 5. Mailbox Contract
+
+Workers communicate via JSONL mailbox files.
+
+## Inbox
+
+Used for injection.
+
+```
+mailbox/inbox/<job_id>_<node>.jsonl
+```
+
+## Outbox
+
+Used for streaming events.
+
+```
+mailbox/outbox/<job_id>_<node>.jsonl
+```
+
+The Router follows outbox files and converts JSONL entries into protocol events.
+
+---
+
+# 6. Execution Models
+
+## 6.1 Local Provider
+
+```mermaid
+flowchart TD
+    Router -->|spawn subprocess| Worker
+    Worker --> Codex
+    Codex --> Outbox
+    Router --> Follow
+```
+
+- Workers run as local subprocesses
+- Codex must be globally installed
+- No SSH involved
+
+Mailbox root:
+
+```
+runs/mailbox/
+```
+
+---
+
+## 6.2 Slurm Provider
+
+```mermaid
+flowchart TD
+    Router -->|ssh login_alias| SBATCH
+    SBATCH -->|allocate job| SlurmCluster
+    SlurmCluster -->|srun| Worker
+    Worker --> Codex
+    Codex --> Outbox
+    Router --> Follow
+```
+
+- Router delegates SSH to provider
+- SBATCH script exports CODESWARM_* variables
+- Workers run on compute nodes
+
+Mailbox root:
+
+```
+<workspace>/<cluster_subdir>/mailbox/
+```
+
+---
+
+# 7. Injection Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant Backend
+    participant Router
+    participant Provider
+    participant Worker
+    participant Codex
+
+    UI->>Backend: POST /inject
+    Backend->>Router: inject command
+    Router->>Provider: write inbox JSONL
+    Worker->>Codex: forward prompt
+    Codex->>Worker: stream response
+    Worker->>Outbox: append JSONL
+    Router->>Backend: emit delta events
+    Backend->>UI: WebSocket update
+```
+
+---
+
+# 8. Termination Model
+
+Termination is provider-driven.
+
+```
+provider.terminate(job_id)
+```
+
+Local:
+- Kill subprocesses
+
+Slurm:
+- `scancel` via SSH
+
+Router:
+- Marks swarm terminated
+- Emits `swarm_terminated`
+
+Router never executes SSH directly.
+
+---
+
+# 9. UI Scalability Model
+
+Designed for HPC-scale swarms.
+
+Features:
+
+- Horizontal scroll with navigation arrows
+- Non-shrinking node tiles
+- Attention indicators
+- Derived "needs input" state
+
+The UI remains responsive for 1–128+ nodes.
+
+---
+
+# 10. Architectural Guarantees
+
+- Router is provider-agnostic
+- Workers are provider-neutral
+- Mailbox is the single source of truth
+- UI is event-driven
+- Termination unified across providers
+
+This architecture supports future providers (e.g., Kubernetes, Nomad, Ray) without modifying the control plane core.

@@ -1,319 +1,216 @@
 # Codeswarm
 
-Codeswarm is an open-source distributed execution fabric for orchestrating AI agents across multiple nodes.
+Codeswarm is a distributed, provider-agnostic execution system for running coordinated Codex workers across either:
 
-It is built to explore what becomes possible when large language models are treated as execution actors — not chat interfaces.
+- **Local processes** (single machine development mode)
+- **Slurm clusters** (HPC production mode)
 
-Codeswarm provides:
-
-- A versioned control-plane protocol (`codeswarm.router.v1`)
-- Multi-swarm orchestration
-- Deterministic injection lifecycle management
-- Parallel multi-node execution
-- Normalized execution semantics
-- A hardened web control plane
-
-This project is experimental and research-oriented.
+It provides a real-time, event-driven web UI for orchestrating multi-node AI swarms with durable state, streaming output, and clean backend abstraction.
 
 ---
 
-# Motivation
+# Core Design Principles
 
-Most LLM systems are built around chat metaphors.
-
-Codeswarm takes a different stance:
-
-> Agents are execution units. Swarms are distributed compute actors.
-
-We care about:
-
-- Lifecycle authority
-- Parallel execution
-- Deterministic state reconciliation
-- Explicit failure handling
-- Cluster-backed orchestration
-
-Execution > conversation.
+- **Provider abstraction** — Router never depends on SSH or Slurm semantics.
+- **Event-sourced UI** — Frontend derives state entirely from streamed events.
+- **Mailbox contract** — Workers communicate via JSONL inbox/outbox files.
+- **Stateless router** — JSONL logs are the source of truth.
+- **Provider-neutral worker runtime** — No SLURM_* leakage into worker.
 
 ---
 
-# System Architecture
+# High-Level Architecture
 
-```
-Slurm Worker Nodes (codex_worker.py)
-        ↓  JSON-RPC (raw)
-   Router (Python daemon)
-        ↓  codeswarm.router.v1 (normalized events)
-   Backend (Node + WebSocket bridge)
-        ↓
-   Frontend (Next.js control plane)
-```
-
-## Router (Authoritative Control Plane)
-
-The router is the single source of truth.
-
-Responsibilities:
-
-- Swarm launch / termination
-- Slurm job submission
-- swarm_id ↔ job_id binding
-- Event normalization
-- TTL-based terminated swarm retention
-- Background cleanup
-
-The router is authoritative. Other layers mirror.
-
----
-
-## Backend (Mirror + Bridge)
-
-The backend:
-
-- Connects to router via TCP
-- Broadcasts events via WebSocket
-- Performs symmetric reconciliation on `swarm_list`
-- Forwards structured failures (`command_rejected`)
-
-It never invents lifecycle state.
-
----
-
-## Frontend (Execution-Aware UI)
-
-The web UI renders:
-
-- Per-node execution streams
-- Reasoning traces
-- Tool execution blocks
-- Token usage
-- Lifecycle transitions
-
-Optimistic UI is reconciled against router authority.
-
----
-
-# Core Concepts
-
-## Swarm
-
-A distributed execution unit spanning one or more nodes.
-
-Each swarm has:
-
-- `swarm_id`
-- `job_id`
-- `node_count`
-- `status`
-
----
-
-## Node
-
-An isolated execution context within a swarm.
-
-Workspace layout:
-
-```
-runs/<job_id>/node_XX/
+```mermaid
+flowchart TD
+    UI[Frontend (Next.js)] -->|WebSocket| BE[Backend (Express)]
+    BE -->|TCP codeswarm.router.v1| RT[Router (Control Plane)]
+    RT --> PR[Provider Interface]
+    PR -->|Local| LP[Local Provider]
+    PR -->|Slurm| SP[Slurm Provider]
+    LP --> WK[Worker Nodes]
+    SP --> WK
+    WK --> CX[Codex App Server]
+    CX --> MB[Mailbox (JSONL)]
+    MB --> RT
 ```
 
 ---
 
-## Injection
+# Providers
 
-A prompt stimulus delivered to one or more nodes.
+Codeswarm currently supports two providers.
 
-Each injection results in a bounded execution **Turn**.
+## ✅ Local Provider
+
+Runs workers as subprocesses on the local machine.
+
+Requirements:
+- `codex` must be installed globally and authenticated.
+
+Execution model:
+
+```mermaid
+flowchart TD
+    Router -->|spawn subprocess| Worker
+    Worker -->|CODESWARM_* env| Codex
+    Codex -->|writes| Outbox
+    Router -->|reads| Outbox
+```
+
+Mailbox layout:
+
+```
+runs/mailbox/
+  inbox/
+  outbox/
+```
+
+No SSH. No Slurm. Pure local execution.
 
 ---
 
-## Turn
+## ✅ Slurm Provider
 
-A deterministic execution cycle that may include:
+Runs workers via SBATCH on an HPC cluster.
 
-- `turn_started`
-- `reasoning_delta`
-- `assistant_delta`
-- `command_started`
-- `command_completed`
-- `usage`
-- `turn_complete`
+Execution model:
+
+```mermaid
+flowchart TD
+    Router -->|ssh login node| SBATCH
+    SBATCH -->|allocate job| SlurmCluster
+    SlurmCluster -->|srun| Worker
+    Worker --> Codex
+    Codex --> Mailbox
+    Router -->|follow outbox| Events
+```
+
+Mailbox layout:
+
+```
+<workspace>/<cluster_subdir>/mailbox/
+  inbox/
+  outbox/
+```
+
+Router does **not** know about SSH — that logic lives entirely inside the Slurm provider.
 
 ---
 
-# Getting Started
+# Worker Contract
 
-## Requirements
+Workers depend only on these environment variables:
 
-- Node.js (see `.nvmrc` for recommended version)
-- npm
-- Python 3.11+ (stdlib only; no external packages currently required)
-- Access to a supported cluster backend (e.g. Slurm)
+```
+CODESWARM_JOB_ID
+CODESWARM_NODE_ID
+CODESWARM_BASE_DIR
+CODESWARM_CODEX_BIN (optional)
+```
 
-If using `nvm`:
+Workers must NOT depend on:
+
+- SLURM_*
+- WORKSPACE_ROOT
+- CLUSTER_SUBDIR
+
+This guarantees provider neutrality.
+
+---
+
+# Launch → Inject → Stream Lifecycle
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI
+    participant Backend
+    participant Router
+    participant Provider
+    participant Worker
+    participant Codex
+
+    User->>UI: Inject prompt
+    UI->>Backend: HTTP POST /inject
+    Backend->>Router: inject command
+    Router->>Provider: write inbox
+    Worker->>Codex: forward prompt
+    Codex->>Worker: stream response
+    Worker->>Outbox: append JSONL
+    Router->>Backend: stream events
+    Backend->>UI: WebSocket updates
+```
+
+---
+
+# Termination Model
+
+Router delegates termination to provider:
+
+```
+provider.terminate(job_id)
+```
+
+- Local → kill subprocesses
+- Slurm → `scancel` via SSH
+
+Router never references SSH directly.
+
+---
+
+# UI Model
+
+- Multiple swarms
+- Each swarm has 1–N nodes
+- Nodes render independent turn streams
+- Attention indicators derive from completed turns
+- HPC-safe horizontal node navigation with overflow controls
+
+---
+
+# Running Codeswarm
+
+## Local Mode
 
 ```bash
-nvm use
+python -m router.router --config configs/local.json --daemon
 ```
 
----
-
-## Development Setup
-
-Clone the repository and bootstrap all components:
+Ensure:
 
 ```bash
-git clone <repo-url>
-cd codeswarm
-npm run bootstrap
+printenv OPENAI_API_KEY | codex login --with-api-key
 ```
 
-This will:
-
-- Install dependencies for CLI, backend, and frontend
-- Build the CLI
-- Link the `codeswarm` binary globally via `npm link`
+Then start frontend + backend.
 
 ---
 
-## Example Configuration
-
-Copy the example config and adapt it to your environment:
+## Slurm Mode
 
 ```bash
-cp configs/local-dev.example.json configs/local-dev.json
+python -m router.router --config configs/hpcfund.json --daemon
 ```
 
-Edit the file to match your cluster parameters.
+Requires:
+- SSH login alias configured
+- Slurm cluster access
 
 ---
 
-## Run Full Web Stack
+# Current Status
 
-### Local Mode (No Slurm Required)
-
-```bash
-codeswarm web --config configs/local.json
-```
-
-This uses the LocalProvider and launches worker processes directly on your machine.
-
-### Slurm Mode
-
-```bash
-codeswarm web --config configs/hpcfund.json
-```
-
-This launches:
-
-- Router (daemon)
-- Backend (WebSocket bridge)
-- Frontend (Next.js dev server)
+- ✅ Local provider stable
+- ✅ Slurm provider stable
+- ✅ Provider abstraction complete
+- ✅ Multi-node UI stable
+- ✅ Termination unified across providers
 
 ---
 
-## CLI Usage
+For deeper details, see:
 
-Launch a swarm:
-
-```bash
-codeswarm launch \
-  --nodes 4 \
-  --prompt "You are a focused autonomous agent." \
-  --config configs/hpcfund.json
-```
-
-Inject into a swarm:
-
-```bash
-codeswarm inject <swarm_id> \
-  --prompt "Optimize GEMM tiling." \
-  --config configs/hpcfund.json
-```
-
-List swarms:
-
-```bash
-codeswarm list --config configs/hpcfund.json
-```
-
-Terminate:
-
-```bash
-codeswarm terminate <swarm_id> --config configs/hpcfund.json
-```
-
----
-
-# Multi-Node Execution
-
-Codeswarm supports multi-node swarms (subject to cluster policy).
-
-SBATCH configuration:
-
-```
-#SBATCH --nodes=N
-#SBATCH --ntasks=N
-```
-
-Each node runs an isolated worker instance.
-
-Parallel injection is supported.
-
----
-
-# Failure Model
-
-Codeswarm treats distributed signals carefully:
-
-- SSH timeout ≠ termination
-- Single Slurm `NOT_FOUND` ≠ authoritative deletion
-- Failures propagate via `command_rejected`
-- Frontend reconciles optimistic state
-
-Terminated swarms are retained via TTL (default 15 minutes) to prevent lifecycle flapping.
-
----
-
-# Cluster Provider Abstraction
-
-Execution backends are pluggable via a `ClusterProvider` interface.
-
-Current production provider: **SlurmProvider**.
-
-Future providers may include:
-
-- Kubernetes
-- AWS
-- Local development runtime
-
-Protocol remains stable regardless of provider.
-
----
-
-# Documentation
-
-- White paper: `WHITEPAPER.md`
-- Architecture reference: `docs/architecture.md`
-- CLI docs: `cli/README.md`
-- Protocol spec: `docs/PROTOCOL.md`
-
----
-
-# Status
-
-Control-plane stable.
-Multi-swarm orchestration supported.
-Multi-node execution supported (policy-dependent).
-Web UI hardened for lifecycle reconciliation.
-
-Experimental by design.
-
----
-
-# License
-
-MIT License.
-
-See `LICENSE` for details.
+- `docs/ARCHITECTURE.md`
+- `docs/PROVIDER_INTERFACE.md`
+- `docs/USER_GUIDE.md`
