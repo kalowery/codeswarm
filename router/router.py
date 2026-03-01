@@ -713,9 +713,16 @@ def run_daemon(config, provider):
                 swarm_id = payload.get("swarm_id")
                 swarm = SWARMS.get(swarm_id)
                 if swarm:
-                    job_id = swarm["job_id"]
-                    login_alias = config["ssh"]["login_alias"]
-                    subprocess.run(["ssh", login_alias, f"scancel {job_id}"])
+                    job_id = swarm.get("job_id")
+
+                    try:
+                        provider.terminate(job_id)
+                    except Exception as e:
+                        emit_event("command_rejected", {
+                            "request_id": request_id,
+                            "reason": str(e)
+                        })
+                        continue
 
                     # Mark swarm terminated (do not delete immediately)
                     if swarm.get("status") != "terminated":

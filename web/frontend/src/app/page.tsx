@@ -224,27 +224,40 @@ export default function Home() {
 
                 return (
                   <>
-                    <div className="flex gap-2 mb-3 border-b border-slate-800 pb-2">
-                      {Object.keys(active.nodes).map((nodeId) => {
-                        const id = Number(nodeId)
-                        const isActive = id === activeNodeId
-                        return (
-                          <button
-                            key={nodeId}
-                            onClick={() => setActiveNode(active.swarm_id, id)}
-                            className={`relative px-3 py-1 text-sm rounded ${
-                              isActive
-                                ? 'bg-indigo-600 text-white'
-                                : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
-                            }`}
-                          >
-                            {nodeNeedsAttention(active.swarm_id, id) && (
-                              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                            )}
-                            Node {nodeId}
-                          </button>
-                        )
-                      })}
+                    <div className="mb-3 border-b border-slate-800 pb-3">
+                      <div className="text-xs text-slate-500 mb-2">
+                        Nodes ({Object.keys(active.nodes).length})
+                      </div>
+                      <div className="grid grid-cols-6 sm:grid-cols-8 md:grid-cols-10 lg:grid-cols-12 gap-1 max-h-40 overflow-y-auto pr-1">
+                        {Object.keys(active.nodes).map((nodeId) => {
+                          const id = Number(nodeId)
+                          const isActive = id === activeNodeId
+                          const needsAttention = nodeNeedsAttention(active.swarm_id, id)
+                          const node = active.nodes[id]
+                          const lastTurn = node.turns[node.turns.length - 1]
+                          const isWorking = lastTurn && !lastTurn.completed
+
+                          return (
+                            <button
+                              key={nodeId}
+                              onClick={() => setActiveNode(active.swarm_id, id)}
+                              className={`relative px-3 py-2 text-xs rounded-t-md transition border-b-2 ${
+                                isActive
+                                  ? 'bg-slate-800 text-white border-indigo-500'
+                                  : 'bg-slate-900 text-slate-400 border-transparent hover:bg-slate-800'
+                              }`}
+                            >
+                              {needsAttention && (
+                                <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                              )}
+                              {isWorking && !isActive && (
+                                <span className="absolute bottom-1 left-1 w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                              )}
+                              {id}
+                            </button>
+                          )
+                        })}
+                      </div>
                     </div>
 
                     <div className="space-y-4">
