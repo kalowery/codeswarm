@@ -186,10 +186,38 @@ export default function Home() {
             </div>
 
             <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
-              {Object.values(active.nodes).map((node) => (
-                <div key={node.node_id} className="space-y-4">
-                  {node.turns.map((turn, idx) => (
-                    <div key={idx} className="space-y-2">
+              {/* Node Tabs */}
+              {(() => {
+                const activeNodeBySwarm = useSwarmStore.getState().activeNodeBySwarm
+                const setActiveNode = useSwarmStore.getState().setActiveNode
+                const activeNodeId = activeNodeBySwarm[active.swarm_id] ?? 0
+                const activeNode = active.nodes[activeNodeId]
+
+                return (
+                  <>
+                    <div className="flex gap-2 mb-3 border-b border-slate-800 pb-2">
+                      {Object.keys(active.nodes).map((nodeId) => {
+                        const id = Number(nodeId)
+                        const isActive = id === activeNodeId
+                        return (
+                          <button
+                            key={nodeId}
+                            onClick={() => setActiveNode(active.swarm_id, id)}
+                            className={`px-3 py-1 text-sm rounded ${
+                              isActive
+                                ? 'bg-indigo-600 text-white'
+                                : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
+                            }`}
+                          >
+                            Node {nodeId}
+                          </button>
+                        )
+                      })}
+                    </div>
+
+                    <div className="space-y-4">
+                      {activeNode.turns.map((turn, idx) => (
+                        <div key={idx} className="space-y-2">
                       {/* User message */}
                       {turn.prompt && (
                         <div className="flex justify-end">
@@ -293,9 +321,11 @@ export default function Home() {
                         </div>
                       </div>
                     </div>
-                  ))}
-                </div>
-              ))}
+                      ))}
+                    </div>
+                  </>
+                )
+              })()}
             </div>
 
             {/* Inject Box */}
@@ -323,33 +353,64 @@ export default function Home() {
                       // Optimistically add provisional turn
                       const store = useSwarmStore.getState()
                       const swarm = store.swarms[active.swarm_id]
-                      const node = swarm.nodes[0]
+                      const activeNodeId = store.activeNodeBySwarm[active.swarm_id] ?? 0
 
-                      const provisional = {
-                        injection_id: `temp-${Date.now()}`,
-                        prompt: value,
-                        deltas: [],
-                        reasoning: '',
-                        commands: [],
-                        completed: false
+                      function parseInput(input: string) {
+                        const trimmed = input.trim()
+
+                        if (trimmed.startsWith('/all ')) {
+                          return {
+                            targets: Object.keys(swarm.nodes).map(n => Number(n)),
+                            content: trimmed.slice(5).trim()
+                          }
+                        }
+
+                        const match = trimmed.match(/^\/node\[(\d+)\]\s+(.*)/)
+                        if (match) {
+                          const nodeId = Number(match[1])
+                          return {
+                            targets: [nodeId],
+                            content: match[2]
+                          }
+                        }
+
+                        return {
+                          targets: [activeNodeId],
+                          content: input
+                        }
+                      }
+
+                      const { targets, content } = parseInput(value)
+
+                      const updatedNodes = { ...swarm.nodes }
+
+                      for (const target of targets) {
+                        const node = updatedNodes[target]
+                        const provisional = {
+                          injection_id: `temp-${Date.now()}-${target}`,
+                          prompt: content,
+                          deltas: [],
+                          reasoning: '',
+                          commands: [],
+                          completed: false
+                        }
+
+                        updatedNodes[target] = {
+                          ...node,
+                          turns: [...node.turns, provisional]
+                        }
                       }
 
                       store.addOrUpdateSwarm({
                         ...swarm,
-                        nodes: {
-                          ...swarm.nodes,
-                          0: {
-                            ...node,
-                            turns: [...node.turns, provisional]
-                          }
-                        }
+                        nodes: updatedNodes
                       })
 
                       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
                       await fetch(`${apiBase}/inject/${active.alias}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ prompt: value })
+                        body: JSON.stringify({ prompt: content, nodes: targets })
                       })
 
                       ;(e.target as HTMLTextAreaElement).value = ''

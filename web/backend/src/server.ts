@@ -184,10 +184,24 @@ app.post('/inject/:alias', (req, res) => {
   const swarm = state.getByAlias(req.params.alias);
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
 
-  const { prompt } = req.body;
+  const { prompt, nodes } = req.body;
+
+  if (!prompt || typeof prompt !== 'string') {
+    return res.status(400).json({ error: 'Invalid prompt' });
+  }
+
+  const targets: number[] = Array.isArray(nodes)
+    ? nodes
+        .map((n: any) => Number(n))
+        .filter((n: number) => !isNaN(n) && n >= 0 && n < swarm.node_count)
+    : Array.from({ length: swarm.node_count }, (_, i) => i);
+
+  const payloadTargets =
+    targets.length === swarm.node_count ? "all" : targets;
+
   const request_id = router.send('inject', {
     swarm_id: swarm.swarm_id,
-    nodes: 'all',
+    nodes: payloadTargets,
     content: prompt
   });
 

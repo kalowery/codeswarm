@@ -42,6 +42,8 @@ interface SwarmStore {
   selectedSwarm?: string
   pendingPrompt?: string
   launchError: string | null
+  activeNodeBySwarm: Record<string, number>
+  setActiveNode: (swarm_id: string, node_id: number) => void
   setPendingPrompt: (prompt: string) => void
   setLaunchError: (message: string) => void
   clearLaunchError: () => void
@@ -66,6 +68,14 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
     selectedSwarm: undefined,
     pendingPrompt: undefined,
     launchError: null,
+    activeNodeBySwarm: {},
+    setActiveNode: (swarm_id, node_id) =>
+      set((state) => ({
+        activeNodeBySwarm: {
+          ...state.activeNodeBySwarm,
+          [swarm_id]: node_id
+        }
+      })),
     setPendingPrompt: (prompt: string) => set({ pendingPrompt: prompt }),
     setLaunchError: (message: string) => set({ launchError: message }),
     clearLaunchError: () => set({ launchError: null }),
@@ -207,8 +217,6 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!node) return
 
         const turns = [...node.turns]
-        const prompt = get().pendingPrompt || ''
-
         // Check for provisional optimistic turn
         const provisionalIndex = turns.findIndex(
           (t) => t.injection_id.startsWith('temp-') && !t.completed
@@ -216,7 +224,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         const newTurn: NodeTurn = {
           injection_id: payload.injection_id,
-          prompt,
+          prompt: '',
           deltas: [],
           reasoning: '',
           commands: [],

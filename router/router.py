@@ -14,7 +14,7 @@ import time
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
-from cluster.factory import build_provider
+from .cluster.factory import build_provider
 
 
 # ================================

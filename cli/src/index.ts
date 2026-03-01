@@ -335,10 +335,15 @@ async function createTransport(opts: any) {
         console.error("[codeswarm] Starting embedded router...");
       }
 
+      const repoRoot = path.resolve(__dirname, "../../");
+
       const routerProcess = spawn(
         "python3",
-        ["-u", routerPath, "--config", opts.config, "--daemon"],
-        { stdio: "ignore" }
+        ["-u", "-m", "router.router", "--config", opts.config, "--daemon"],
+        {
+          stdio: "ignore",
+          cwd: repoRoot
+        }
       );
 
       const shutdown = () => {
@@ -488,7 +493,8 @@ async function runWebStack(opts: any) {
   const __dirname = path.dirname(__filename);
   const repoRoot = path.resolve(__dirname, "../../");
 
-  const routerPath = path.join(repoRoot, "router", "router.py");
+  // routerPath no longer used (router launched as module)
+  const routerModule = "router.router";
   const backendPath = path.join(repoRoot, "web", "backend");
   const frontendPath = path.join(repoRoot, "web", "frontend");
 
@@ -525,7 +531,8 @@ async function runWebStack(opts: any) {
   spawnWithPrefix(
     "router",
     "python3",
-    ["-u", routerPath, "--config", configPath, "--daemon", "--debug"]
+    ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
+    repoRoot
   );
 
   // Backend (dev mode)
