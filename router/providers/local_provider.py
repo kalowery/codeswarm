@@ -142,3 +142,23 @@ class LocalProvider(ClusterProvider):
 
         with open(inbox_path, "a") as f:
             f.write(json.dumps(payload) + "\n")
+
+    def send_control(self, job_id: str, node_id: int, message: dict) -> None:
+        """
+        Send control message (e.g., exec_approval_response) to a specific worker node.
+        Mirrors the inject() path so the worker reads it from the same inbox stream.
+        """
+        node_index = f"{int(node_id):02d}"
+
+        inbox_dir = self.workspace_root.resolve() / "mailbox" / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+
+        inbox_path = inbox_dir / f"{job_id}_{node_index}.jsonl"
+
+        payload = {
+            "type": "control",
+            "payload": message
+        }
+
+        with open(inbox_path, "a") as f:
+            f.write(json.dumps(payload) + "\n")

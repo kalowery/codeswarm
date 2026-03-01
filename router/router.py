@@ -27,6 +27,7 @@ DEBUG = False
 SWARMS = {}
 JOB_TO_SWARM = {}
 LAST_USAGE = {}
+PENDING_APPROVALS = {}
 
 # Retention policy
 TERMINATED_TTL_SECONDS = 900  # 15 minutes
@@ -389,6 +390,47 @@ def translate_event(event):
         )
 
     # --- Command execution normalization ---
+    if method in ("codex/event/exec_approval_request", "item/commandExecution/requestApproval"):
+        params = payload.get("params", {})
+        msg = params.get("msg")
+
+        if msg:
+            # Shape A: codex/event/exec_approval_request
+            call_id = msg.get("call_id")
+            command = msg.get("command")
+            reason = msg.get("reason")
+            cwd = msg.get("cwd")
+        else:
+            # Shape B: item/commandExecution/requestApproval
+            call_id = params.get("itemId")
+            command = params.get("command")
+            reason = params.get("reason")
+            cwd = params.get("cwd")
+
+        rpc_id = payload.get("id")
+
+        if call_id:
+            PENDING_APPROVALS[(job_id, call_id)] = {
+                "swarm_id": swarm_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                "rpc_id": rpc_id,
+                "approval_method": method,
+            }
+            pass  # debug removed
+
+        return (
+            "exec_approval_required",
+            {
+                **base,
+                "call_id": call_id,
+                "command": command,
+                "reason": reason,
+                "cwd": cwd,
+                "raw": payload,
+            },
+        )
+
     if method == "codex/event/exec_command_begin":
         msg = payload.get("params", {}).get("msg", {})
         return (
@@ -573,7 +615,7 @@ def run_daemon(config, provider):
             request_id = cmd.get("request_id")
             payload = cmd.get("payload", {})
 
-            debug_event(f"command received: {command!r}")
+            pass  # debug removed
 
             if command == "swarm_launch":
                 nodes = payload.get("nodes", 1)
@@ -708,6 +750,65 @@ def run_daemon(config, provider):
                         })
 
                 threading.Thread(target=handle_swarm_status, daemon=True).start()
+
+            elif command == "approve_execution":
+                job_id = payload.get("job_id")
+                call_id = payload.get("call_id")
+                approved = payload.get("approved")
+
+                key = (str(job_id), call_id)
+                pass  # debug removed
+                meta = PENDING_APPROVALS.get(key)
+
+                if not meta:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown approval request"
+                    })
+                    continue
+
+                try:
+                    rpc_id = meta.get("rpc_id")
+
+                    if rpc_id is not None:
+                        # JSON-RPC request-style approval (must send response with same id)
+                        control_payload = {
+                            "type": "rpc_response",
+                            "rpc_id": rpc_id,
+                            "result": {
+                                "approved": approved
+                            }
+                        }
+                    else:
+                        # Notification-style approval
+                        control_payload = {
+                            "method": "exec/approvalResponse",
+                            "params": {
+                                "call_id": call_id,
+                                "approved": approved,
+                            },
+                        }
+
+                    provider.send_control(
+                        job_id,
+                        meta["node_id"],
+                        control_payload,
+                    )
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e)
+                    })
+                    continue
+
+                del PENDING_APPROVALS[key]
+
+                emit_event("exec_approval_resolved", {
+                    "request_id": request_id,
+                    "job_id": job_id,
+                    "call_id": call_id,
+                    "approved": approved,
+                })
 
             elif command == "swarm_terminate":
                 swarm_id = payload.get("swarm_id")

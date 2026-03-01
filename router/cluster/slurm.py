@@ -160,3 +160,34 @@ class SlurmProvider(ClusterProvider):
 
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
+
+    def send_control(self, job_id: str, node_id: int, message: dict) -> None:
+        """
+        Send control message (e.g., exec_approval_response) to a specific worker node
+        via SSH, mirroring the inject() path.
+        """
+        login_alias = self.config["ssh"]["login_alias"]
+        workspace_root = self.config["cluster"]["workspace_root"]
+        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+
+        inbox_path = (
+            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
+            f"{job_id}_{int(node_id):02d}.jsonl"
+        )
+
+        payload = {
+            "type": "control",
+            "payload": message
+        }
+
+        json_line = json.dumps(payload)
+        remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
+
+        result = subprocess.run(
+            ["ssh", login_alias, remote_cmd],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())

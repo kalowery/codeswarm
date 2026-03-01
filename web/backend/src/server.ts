@@ -224,6 +224,22 @@ app.get('/swarms', (req, res) => {
   res.json(state.list());
 });
 
+app.post('/approval', (req, res) => {
+  const { job_id, call_id, approved } = req.body;
+
+  if (!job_id || !call_id) {
+    return res.status(400).json({ error: 'Missing job_id or call_id' });
+  }
+
+  const request_id = router.send('approve_execution', {
+    job_id,
+    call_id,
+    approved: !!approved
+  });
+
+  res.json({ request_id });
+});
+
 async function connectWithRetry() {
   while (true) {
     try {

@@ -62,9 +62,14 @@ def main():
 
     codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
 
+    codex_home = str(Path.home() / ".codex")
+
     proc = subprocess.Popen(
         [
             str(codex_bin),
+            "--sandbox", "workspace-write",
+            "--ask-for-approval", "never",
+            "--add-dir", codex_home,
             "app-server",
             "--listen", "stdio://"
         ],
@@ -97,6 +102,16 @@ def main():
     def send_notification(method, params=None):
         msg = jsonrpc_notification(method, params)
         proc.stdin.write(msg + "\n")
+        proc.stdin.flush()
+
+    def send_response(id_, result=None):
+        msg = {
+            "jsonrpc": "2.0",
+            "id": id_
+        }
+        if result is not None:
+            msg["result"] = result
+        proc.stdin.write(json.dumps(msg) + "\n")
         proc.stdin.flush()
 
     with open(outbox_path, "a", buffering=1) as outbox:
@@ -195,6 +210,21 @@ def main():
                                 }
                             ]
                         })
+
+                    elif event.get("type") == "control":
+                        payload = event.get("payload", {})
+
+                        if payload.get("type") == "rpc_response":
+                            rpc_id = payload.get("rpc_id")
+                            result = payload.get("result")
+                            send_response(rpc_id, result)
+                        else:
+                            method = payload.get("method")
+                            params = payload.get("params")
+
+                            if method:
+                                # Forward control notification directly to Codex app-server
+                                send_notification(method, params)
 
                     elif event.get("type") == "shutdown":
                         running = False

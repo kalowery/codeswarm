@@ -1,13 +1,23 @@
 import { create } from 'zustand'
 
-export interface CommandExecution {
+export type TurnPhase =
+  | 'idle'
+  | 'streaming'
+  | 'awaiting_approval'
+  | 'executing'
+  | 'completed'
+  | 'error'
+
+export interface ExecutionState {
   call_id: string
   command: string[] | string
   cwd?: string
   stdout?: string
   stderr?: string
   exit_code?: number
-  status: 'started' | 'completed'
+  started_at?: number
+  completed_at?: number
+  status: 'running' | 'completed'
 }
 
 export interface NodeTurn {
@@ -15,10 +25,16 @@ export interface NodeTurn {
   prompt: string
   deltas: string[]
   reasoning: string
-  commands: CommandExecution[]
+  phase: TurnPhase
+  execution?: ExecutionState
+  approval?: {
+    call_id: string
+    command: string[] | string
+    reason: string
+    cwd?: string
+  }
   error?: string
   usage?: number
-  completed: boolean
 }
 
 export interface NodeState {
@@ -58,7 +74,7 @@ interface SwarmStore {
 
 export const useSwarmStore = create<SwarmStore>((set, get) => {
   // Track completions that arrive before turn_started
-  const pendingComplete: Record<string, boolean> = {}
+  const pendingComplete: Record<string, boolean> = {} // deprecated
   const pendingDeltas: Record<string, string[]> = {}
   const pendingAssistant: Record<string, string> = {}
 
@@ -229,8 +245,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           prompt: '',
           deltas: [],
           reasoning: '',
-          commands: [],
-          completed: false
+          phase: 'streaming'
         }
 
         if (pendingDeltas[payload.injection_id]) {
@@ -244,7 +259,6 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
 
         if (pendingComplete[payload.injection_id]) {
-          newTurn.completed = true
           delete pendingComplete[payload.injection_id]
         }
 
@@ -352,11 +366,10 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         )
 
         if (!turn) {
-          pendingComplete[payload.injection_id] = true
           return
         }
 
-        turn.completed = true
+        turn.phase = 'completed'
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -414,6 +427,68 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         })
       }
 
+      if (type === 'exec_approval_required') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.injection_id === payload.injection_id
+            ? {
+                ...t,
+                phase: 'awaiting_approval',
+                approval: {
+                  call_id: payload.call_id,
+                  command: payload.command,
+                  reason: payload.reason,
+                  cwd: payload.cwd
+                }
+              }
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: updatedTurns }
+          }
+        })
+      }
+
+      if (type === 'exec_approval_resolved') {
+        const swarm = Object.values(get().swarms).find(
+          (s) => s.job_id === payload.job_id
+        )
+        if (!swarm) return
+
+        const updatedNodes = { ...swarm.nodes }
+
+        for (const nodeKey of Object.keys(updatedNodes)) {
+          const node = updatedNodes[Number(nodeKey)]
+
+          updatedNodes[Number(nodeKey)] = {
+            ...node,
+            turns: node.turns.map((t) =>
+              t.approval?.call_id === payload.call_id
+                ? {
+                    ...t,
+                    phase: 'streaming',
+                    approval: undefined
+                  }
+                : t
+            )
+          }
+        }
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: updatedNodes
+        })
+      }
+
       if (type === 'command_started') {
         const swarm = get().swarms[payload.swarm_id]
         if (!swarm) return
@@ -425,15 +500,14 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           t.injection_id === payload.injection_id
             ? {
                 ...t,
-                commands: [
-                  ...t.commands,
-                  {
-                    call_id: payload.call_id,
-                    command: payload.command,
-                    cwd: payload.cwd,
-                    status: 'started'
-                  }
-                ]
+                phase: 'executing',
+                execution: {
+                  call_id: payload.call_id,
+                  command: payload.command,
+                  cwd: payload.cwd,
+                  started_at: Date.now(),
+                  status: 'running'
+                }
               }
             : t
         )
@@ -456,19 +530,19 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         const updatedTurns = node.turns.map((t) => {
           if (t.injection_id !== payload.injection_id) return t
+          if (!t.execution) return t
+
           return {
             ...t,
-            commands: t.commands.map((c) =>
-              c.call_id === payload.call_id
-                ? {
-                    ...c,
-                    status: 'completed',
-                    stdout: payload.stdout,
-                    stderr: payload.stderr,
-                    exit_code: payload.exit_code
-                  }
-                : c
-            )
+            phase: 'streaming',
+            execution: {
+              ...t.execution,
+              status: 'completed',
+              completed_at: Date.now(),
+              stdout: payload.stdout,
+              stderr: payload.stderr,
+              exit_code: payload.exit_code
+            }
           }
         })
 
@@ -490,7 +564,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, error: payload.message }
+            ? { ...t, phase: 'error', error: payload.message }
             : t
         )
 
