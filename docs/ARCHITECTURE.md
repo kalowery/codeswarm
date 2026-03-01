@@ -17,15 +17,15 @@ The Router is completely unaware of SSH or Slurm semantics.
 
 ```mermaid
 flowchart TD
-    UI[Frontend (Next.js)] -->|WebSocket| BE[Backend (Express)]
-    BE -->|TCP codeswarm.router.v1| RT[Router]
-    RT --> PR[Provider Interface]
-    PR --> LP[Local Provider]
-    PR --> SP[Slurm Provider]
-    LP --> WK[Workers]
+    UI["Frontend (Next.js)"] -->|WebSocket| BE["Backend (Express)"]
+    BE -->|TCP codeswarm.router.v1| RT["Router"]
+    RT --> PR["Provider Interface"]
+    PR --> LP["Local Provider"]
+    PR --> SP["Slurm Provider"]
+    LP --> WK["Workers"]
     SP --> WK
-    WK --> CX[Codex App Server]
-    CX --> MB[Mailbox (JSONL)]
+    WK --> CX["Codex App Server"]
+    CX --> MB["Mailbox (JSONL)"]
     MB --> RT
 ```
 

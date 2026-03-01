@@ -23,15 +23,15 @@ It provides a real-time, event-driven web UI for orchestrating multi-node AI swa
 
 ```mermaid
 flowchart TD
-    UI[Frontend (Next.js)] -->|WebSocket| BE[Backend (Express)]
-    BE -->|TCP codeswarm.router.v1| RT[Router (Control Plane)]
-    RT --> PR[Provider Interface]
-    PR -->|Local| LP[Local Provider]
-    PR -->|Slurm| SP[Slurm Provider]
-    LP --> WK[Worker Nodes]
+    UI["Frontend (Next.js)"] -->|WebSocket| BE["Backend (Express)"]
+    BE -->|TCP codeswarm.router.v1| RT["Router (Control Plane)"]
+    RT --> PR["Provider Interface"]
+    PR -->|Local| LP["Local Provider"]
+    PR -->|Slurm| SP["Slurm Provider"]
+    LP --> WK["Worker Nodes"]
     SP --> WK
-    WK --> CX[Codex App Server]
-    CX --> MB[Mailbox (JSONL)]
+    WK --> CX["Codex App Server"]
+    CX --> MB["Mailbox (JSONL)"]
     MB --> RT
 ```
 
