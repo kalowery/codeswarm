@@ -219,7 +219,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const turns = [...node.turns]
         // Check for provisional optimistic turn
         const provisionalIndex = turns.findIndex(
-          (t) => t.injection_id.startsWith('temp-') && !t.completed
+          (t) =>
+            t.injection_id === payload.injection_id ||
+            t.injection_id === `temp-${payload.injection_id}`
         )
 
         const newTurn: NodeTurn = {
