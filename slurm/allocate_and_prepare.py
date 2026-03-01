@@ -60,11 +60,13 @@ def build_sbatch_script(args, config):
 
     if args.launch_codex_run:
         lines.extend([
-            f"export WORKSPACE_ROOT={workspace_root}",
-            f"export CLUSTER_SUBDIR={cluster_subdir}",
             "",
             "# Per-node working directory isolation (use existing runs/<job_id>/node_XX layout)",
             f"srun bash -c '\n"
+            f"export CODESWARM_JOB_ID=$SLURM_JOB_ID\n"
+            f"export CODESWARM_NODE_ID=$SLURM_PROCID\n"
+            f"export CODESWARM_BASE_DIR={hpc_base}\n"
+            f"export CODESWARM_CODEX_BIN={hpc_base}/tools/npm-global/bin/codex\n"
             f"NODE_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
             f"NODE_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/node_${{NODE_INDEX}}\"\n"
             f"mkdir -p \"$NODE_WORKDIR\"\n"

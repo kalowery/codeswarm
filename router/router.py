@@ -253,7 +253,7 @@ def launch_swarm(config, nodes, partition, time_limit, account=None, qos=None):
 # Injection
 # ================================
 
-def perform_injection(config, request_id, swarm_id, job_id, node_id, content):
+def perform_injection(config, provider, request_id, swarm_id, job_id, node_id, content):
     injection_id = str(uuid.uuid4())
 
     emit_event("inject_ack", {
@@ -264,48 +264,14 @@ def perform_injection(config, request_id, swarm_id, job_id, node_id, content):
     })
 
     try:
-        login_alias = config["ssh"]["login_alias"]
-        workspace_root = config["cluster"]["workspace_root"]
-        cluster_subdir = config["cluster"]["cluster_subdir"]
+        provider.inject(job_id, node_id, content, injection_id)
 
-        inbox_path = (
-            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
-            f"{job_id}_{int(node_id):02d}.jsonl"
-        )
-
-        payload = {
-            "type": "user",
-            "content": content,
-            "injection_id": injection_id
-        }
-
-        json_line = json.dumps(payload)
-        remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
-
-        timeout = config.get("router", {}).get("inject_timeout_seconds", 60)
-
-        result = subprocess.run(
-            ["ssh", login_alias, remote_cmd],
-            capture_output=True,
-            text=True,
-            timeout=timeout
-        )
-
-        if result.returncode == 0:
-            emit_event("inject_delivered", {
-                "request_id": request_id,
-                "swarm_id": swarm_id,
-                "injection_id": injection_id,
-                "node_id": node_id
-            })
-        else:
-            emit_event("inject_failed", {
-                "request_id": request_id,
-                "swarm_id": swarm_id,
-                "injection_id": injection_id,
-                "node_id": node_id,
-                "error": result.stderr.strip()
-            })
+        emit_event("inject_delivered", {
+            "request_id": request_id,
+            "swarm_id": swarm_id,
+            "injection_id": injection_id,
+            "node_id": node_id
+        })
 
     except Exception as e:
         emit_event("inject_failed", {
@@ -548,7 +514,7 @@ def run_daemon(config, provider):
     def start_follower_async():
         nonlocal proc
         try:
-            proc = start_remote_follower(config)
+            proc = provider.start_follower()
         except Exception as e:
             print(f"Follower failed to start: {e}", flush=True)
 
@@ -569,7 +535,7 @@ def run_daemon(config, provider):
         )
 
         # Follower stdout
-        if proc.stdout in ready:
+        if proc and proc.stdout in ready:
             chunk = os.read(proc.stdout.fileno(), 4096)
             if chunk:
                 stdout_buffer += chunk
@@ -645,7 +611,7 @@ def run_daemon(config, provider):
                 for node_id in range(nodes):
                     threading.Thread(
                         target=perform_injection,
-                        args=(config, request_id, swarm_id, job_id, node_id, system_prompt),
+                        args=(config, provider, request_id, swarm_id, job_id, node_id, system_prompt),
                         daemon=True
                     ).start()
 
@@ -671,7 +637,7 @@ def run_daemon(config, provider):
                 for node_id in targets:
                     threading.Thread(
                         target=perform_injection,
-                        args=(config, request_id, swarm_id, job_id, node_id, content),
+                        args=(config, provider, request_id, swarm_id, job_id, node_id, content),
                         daemon=True
                     ).start()
 
@@ -696,7 +662,6 @@ def run_daemon(config, provider):
                     try:
                         job_id = swarm.get("job_id")
 
-                        # If job_id is missing, swarm is considered terminated
                         if not job_id:
                             swarm["status"] = "terminated"
                             save_state()
@@ -705,26 +670,13 @@ def run_daemon(config, provider):
                                 "swarm_id": swarm_id,
                                 "job_id": None,
                                 "node_count": swarm.get("node_count"),
-                                "status": "terminated",
-                                "slurm_state": "MISSING_JOB_ID"
+                                "status": "terminated"
                             })
                             return
 
-                        login_alias = config["ssh"]["login_alias"]
+                        state = provider.get_job_state(job_id)
 
-                        result = subprocess.run(
-                            ["ssh", login_alias, f"squeue -j {job_id} -h -o '%T'"],
-                            capture_output=True,
-                            text=True,
-                            timeout=15
-                        )
-
-                        slurm_state = result.stdout.strip()
-
-                        # If job not found in Slurm, mark swarm terminated (do not delete)
-                        if not slurm_state:
-                            slurm_state = "NOT_FOUND"
-
+                        if not state:
                             if swarm.get("status") != "terminated":
                                 swarm["status"] = "terminated"
                                 swarm["terminated_at"] = time.time()
@@ -735,10 +687,8 @@ def run_daemon(config, provider):
                                 "swarm_id": swarm_id,
                                 "job_id": job_id,
                                 "node_count": swarm.get("node_count"),
-                                "status": "terminated",
-                                "slurm_state": slurm_state
+                                "status": "terminated"
                             })
-                            return
                         else:
                             swarm["status"] = "running"
                             save_state()
@@ -748,8 +698,7 @@ def run_daemon(config, provider):
                                 "swarm_id": swarm_id,
                                 "job_id": job_id,
                                 "node_count": swarm["node_count"],
-                                "status": swarm["status"],
-                                "slurm_state": slurm_state
+                                "status": swarm["status"]
                             })
                     except Exception as e:
                         emit_event("swarm_status", {

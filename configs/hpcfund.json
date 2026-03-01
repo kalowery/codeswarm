@@ -7,7 +7,7 @@
 
     "slurm": {
       "login_alias": "hpcfund",
-      "partition": "mi2101x",
+      "partition": "mi2508x",
       "time_limit": "00:59:00"
     }
   },

@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Dict, Optional
+import subprocess
 
 
 class ClusterProvider(ABC):
@@ -21,4 +22,20 @@ class ClusterProvider(ABC):
     @abstractmethod
     def list_active_jobs(self) -> Dict[str, str]:
         """Return mapping of job_id -> state."""
+        pass
+
+    @abstractmethod
+    def start_follower(self) -> subprocess.Popen | None:
+        """Return a process streaming worker events via stdout."""
+        pass
+
+    @abstractmethod
+    def inject(
+        self,
+        job_id: str,
+        node_id: int,
+        content: str,
+        injection_id: str
+    ) -> None:
+        """Deliver injection to worker."""
         pass

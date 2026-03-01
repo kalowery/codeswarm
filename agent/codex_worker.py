@@ -48,14 +48,11 @@ def main():
         pass
 
 
-    job_id = os.environ["SLURM_JOB_ID"]
-    node_id = int(os.environ["SLURM_NODEID"])
+    job_id = os.environ["CODESWARM_JOB_ID"]
+    node_id = int(os.environ["CODESWARM_NODE_ID"])
     hostname = os.uname().nodename
 
-    workspace_root = os.environ["WORKSPACE_ROOT"]
-    cluster_subdir = os.environ["CLUSTER_SUBDIR"]
-
-    base = Path(workspace_root) / cluster_subdir
+    base = Path(os.environ["CODESWARM_BASE_DIR"])
 
     inbox_path = base / "mailbox" / "inbox" / f"{job_id}_{node_id:02d}.jsonl"
     outbox_path = base / "mailbox" / "outbox" / f"{job_id}_{node_id:02d}.jsonl"
@@ -63,7 +60,7 @@ def main():
     inbox_path.parent.mkdir(parents=True, exist_ok=True)
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
 
-    codex_bin = base / "tools" / "npm-global" / "bin" / "codex"
+    codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
 
     proc = subprocess.Popen(
         [

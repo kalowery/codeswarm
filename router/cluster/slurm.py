@@ -1,5 +1,7 @@
 import subprocess
 import re
+import json
+import shlex
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -125,3 +127,36 @@ class SlurmProvider(ClusterProvider):
             running_jobs[job_id] = state
 
         return running_jobs
+
+    def start_follower(self):
+        # Defer to router SSH-based follower
+        from ..router import start_remote_follower
+        return start_remote_follower(self.config)
+
+    def inject(self, job_id, node_id, content, injection_id):
+        login_alias = self.config["ssh"]["login_alias"]
+        workspace_root = self.config["cluster"]["workspace_root"]
+        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+
+        inbox_path = (
+            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
+            f"{job_id}_{int(node_id):02d}.jsonl"
+        )
+
+        payload = {
+            "type": "user",
+            "content": content,
+            "injection_id": injection_id
+        }
+
+        json_line = json.dumps(payload)
+        remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
+
+        result = subprocess.run(
+            ["ssh", login_alias, remote_cmd],
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())

@@ -1,11 +1,7 @@
 {
   "cluster": {
     "backend": "local",
-    "local": {
-      "workspace_root": "runs"
-    }
-  },
-  "ssh": {
-    "login_alias": "local"
+    "workspace_root": "runs",
+    "archive_root": "/tmp/archives"
   }
 }

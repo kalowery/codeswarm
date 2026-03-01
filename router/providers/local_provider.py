@@ -1,11 +1,16 @@
 import subprocess
 import uuid
 import shutil
+import json
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
 
-class LocalProvider:
+from ..cluster.base import ClusterProvider
+
+
+class LocalProvider(ClusterProvider):
     """
     Local execution provider.
     Spawns agent workers directly on the host machine.
@@ -39,11 +44,17 @@ class LocalProvider:
                 / "codex_worker.py"
             )
 
+            env = os.environ.copy()
+            env.update({
+                "CODESWARM_JOB_ID": job_id,
+                "CODESWARM_NODE_ID": str(i),
+                "CODESWARM_BASE_DIR": str(self.workspace_root.resolve()),
+            })
+
             p = subprocess.Popen(
                 ["python3", str(worker_path)],
                 cwd=str(node_dir),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                env=env,
             )
 
             procs.append(p)
@@ -98,3 +109,36 @@ class LocalProvider:
             if state:
                 states[job_id] = state
         return states
+
+    def start_follower(self):
+        follower_path = (
+            Path(__file__).resolve().parents[2]
+            / "agent"
+            / "outbox_follower.py"
+        )
+
+        outbox_dir = self.workspace_root.resolve() / "mailbox" / "outbox"
+        outbox_dir.mkdir(parents=True, exist_ok=True)
+
+        return subprocess.Popen(
+            ["python3", str(follower_path), str(outbox_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def inject(self, job_id, node_id, content, injection_id):
+        node_index = f"{int(node_id):02d}"
+
+        inbox_dir = self.workspace_root.resolve() / "mailbox" / "inbox"
+        inbox_dir.mkdir(parents=True, exist_ok=True)
+
+        inbox_path = inbox_dir / f"{job_id}_{node_index}.jsonl"
+
+        payload = {
+            "type": "user",
+            "content": content,
+            "injection_id": injection_id
+        }
+
+        with open(inbox_path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
