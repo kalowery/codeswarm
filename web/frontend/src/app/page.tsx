@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useRef } from 'react'
 import { useSwarmStore } from '@/lib/store'
 import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
@@ -54,6 +54,28 @@ export default function Home() {
   }
 
   const [showLaunch, setShowLaunch] = useState(false)
+  const nodeScrollRef = useRef<HTMLDivElement | null>(null)
+  const [canScrollLeft, setCanScrollLeft] = useState(false)
+  const [canScrollRight, setCanScrollRight] = useState(false)
+
+  function updateScrollButtons() {
+    const el = nodeScrollRef.current
+    if (!el) return
+    setCanScrollLeft(el.scrollLeft > 0)
+    setCanScrollRight(el.scrollLeft + el.clientWidth < el.scrollWidth - 1)
+  }
+
+  useEffect(() => {
+    function handleResize() {
+      updateScrollButtons()
+    }
+
+    window.addEventListener('resize', handleResize)
+    // Run once after mount / active change
+    setTimeout(updateScrollButtons, 0)
+
+    return () => window.removeEventListener('resize', handleResize)
+  }, [active])
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
   const [expandedReasoning, setExpandedReasoning] = useState<Record<string, boolean>>({})
@@ -67,9 +89,9 @@ export default function Home() {
   }, [])
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex overflow-x-hidden">
       {/* Sidebar */}
-      <div className="w-80 border-r border-slate-800 p-4">
+      <div className="w-80 shrink-0 border-r border-slate-800 p-4">
         <div className="mb-4 space-y-3">
 
           {/* Logo + Title */}
@@ -174,7 +196,7 @@ export default function Home() {
       </div>
 
       {/* Detail Panel */}
-      <div className="flex-1 p-6">
+      <div className="flex-1 min-w-0 p-6">
         {!active && (
           <div className="text-slate-500">Select a swarm to view details</div>
         )}
@@ -214,7 +236,7 @@ export default function Home() {
               </button>
             </div>
 
-            <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
+            <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto overflow-x-hidden text-sm space-y-4">
               {/* Node Tabs */}
               {(() => {
                 const activeNodeBySwarm = useSwarmStore.getState().activeNodeBySwarm
@@ -224,11 +246,38 @@ export default function Home() {
 
                 return (
                   <>
-                    <div className="mb-3 border-b border-slate-800 pb-3">
+                    <div className="mb-3 border-b border-slate-800 pb-3 relative">
                       <div className="text-xs text-slate-500 mb-2">
                         Nodes ({Object.keys(active.nodes).length})
                       </div>
-                      <div className="grid grid-cols-6 sm:grid-cols-8 md:grid-cols-10 lg:grid-cols-12 gap-1 max-h-40 overflow-y-auto pr-1">
+
+                      {canScrollLeft && (
+                        <button
+                          onClick={() => {
+                            nodeScrollRef.current?.scrollBy({ left: -200, behavior: 'smooth' })
+                          }}
+                          className="absolute left-0 top-8 z-10 px-2 py-1 bg-slate-900 border border-slate-700 rounded"
+                        >
+                          ◀
+                        </button>
+                      )}
+
+                      {canScrollRight && (
+                        <button
+                          onClick={() => {
+                            nodeScrollRef.current?.scrollBy({ left: 200, behavior: 'smooth' })
+                          }}
+                          className="absolute right-0 top-8 z-10 px-2 py-1 bg-slate-900 border border-slate-700 rounded"
+                        >
+                          ▶
+                        </button>
+                      )}
+
+                      <div
+                        ref={nodeScrollRef}
+                        onScroll={updateScrollButtons}
+                        className="flex flex-nowrap gap-2 overflow-x-auto pr-8 pl-8 w-full"
+                      >
                         {Object.keys(active.nodes).map((nodeId) => {
                           const id = Number(nodeId)
                           const isActive = id === activeNodeId
@@ -241,10 +290,10 @@ export default function Home() {
                             <button
                               key={nodeId}
                               onClick={() => setActiveNode(active.swarm_id, id)}
-                              className={`relative px-3 py-2 text-xs rounded-t-md transition border-b-2 ${
+                              className={`relative min-w-[72px] shrink-0 px-3 py-2 text-xs rounded-t-md transition border-b-2 ${
                                 isActive
                                   ? 'bg-slate-800 text-white border-indigo-500'
-                                  : 'bg-slate-900 text-slate-400 border-transparent hover:bg-slate-800'
+                                  : 'bg-slate-900 text-slate-400 border-slate-700 hover:bg-slate-800'
                               }`}
                             >
                               {needsAttention && (
