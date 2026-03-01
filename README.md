@@ -171,6 +171,39 @@ Router never references SSH directly.
 
 # Running Codeswarm
 
+## ⚠️ Codex Sandbox & Approval Configuration (Important)
+
+Codeswarm manages its own execution approval lifecycle at the router + UI layer.
+
+For full functionality (including file writes from tools like `skill-creator`),
+your local Codex configuration must allow workspace writes and disable
+internal approval prompts.
+
+Recommended `~/.codex/config.toml` settings:
+
+```toml
+sandbox = "workspace-write"
+approvalPolicy = "never"
+```
+
+Alternatively, you may configure equivalent behavior via CLI flags when running
+Codex manually:
+
+```bash
+codex --sandbox workspace-write --ask-for-approval never
+```
+
+If Codex is left in `read-only` or `on-request` mode, you may observe:
+
+- Repeated escalation prompts
+- "Sandbox rejected write" messages
+- Commands executing but files not being written
+
+Codeswarm assumes sandbox + approval are configured to allow execution after
+UI approval.
+
+---
+
 ## Local Mode
 
 ```bash
