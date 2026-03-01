@@ -7,3 +7,11 @@ router_state.json
 
 # OS junk
 .DS_Store
+
+# Local provider runtime artifacts
+runs/
+web/backend/state.json
+
+# Python cache
+**/__pycache__/
+*.pyc
