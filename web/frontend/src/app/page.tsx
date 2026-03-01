@@ -27,6 +27,32 @@ export default function Home() {
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
   const swarmList = Object.values(swarms)
   const active = selected ? swarms[selected] : undefined
+
+  function nodeNeedsAttention(swarmId: string, nodeId: number) {
+    const swarm = swarms[swarmId]
+    if (!swarm) return false
+
+    const node = swarm.nodes[nodeId]
+    if (!node || node.turns.length === 0) return false
+
+    const last = node.turns[node.turns.length - 1]
+    if (!last.completed) return false
+
+    const activeNode = useSwarmStore.getState().activeNodeBySwarm[swarmId] ?? 0
+    const isActive = swarmId === selected && nodeId === activeNode
+
+    return !isActive
+  }
+
+  function swarmNeedsAttention(swarmId: string) {
+    const swarm = swarms[swarmId]
+    if (!swarm) return false
+
+    return Object.keys(swarm.nodes).some((id) =>
+      nodeNeedsAttention(swarmId, Number(id))
+    )
+  }
+
   const [showLaunch, setShowLaunch] = useState(false)
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
@@ -126,12 +152,15 @@ export default function Home() {
             <div
               key={swarm.swarm_id}
               onClick={() => selectSwarm(swarm.swarm_id)}
-              className={`p-3 rounded cursor-pointer border transition ${
+              className={`p-3 rounded cursor-pointer border transition relative ${
                 selected === swarm.swarm_id
                   ? 'bg-slate-800 border-indigo-500'
                   : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
               }`}
             >
+              {swarmNeedsAttention(swarm.swarm_id) && (
+                <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              )}
               <div className="font-medium">{swarm.alias}</div>
               <div className="text-sm text-slate-400">
                 {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} node
@@ -203,12 +232,15 @@ export default function Home() {
                           <button
                             key={nodeId}
                             onClick={() => setActiveNode(active.swarm_id, id)}
-                            className={`px-3 py-1 text-sm rounded ${
+                            className={`relative px-3 py-1 text-sm rounded ${
                               isActive
                                 ? 'bg-indigo-600 text-white'
                                 : 'bg-slate-800 text-slate-400 hover:bg-slate-700'
                             }`}
                           >
+                            {nodeNeedsAttention(active.swarm_id, id) && (
+                              <span className="absolute -top-1 -right-1 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                            )}
                             Node {nodeId}
                           </button>
                         )
