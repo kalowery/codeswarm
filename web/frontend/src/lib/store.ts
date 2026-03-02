@@ -243,9 +243,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
 
         // Force-close any non-terminal turns to avoid multiple active bubbles
-        const cleanedTurns = node.turns.map((t) =>
+        const cleanedTurns: NodeTurn[] = node.turns.map((t) =>
           t.phase !== 'completed' && t.phase !== 'error'
-            ? { ...t, phase: 'completed' }
+            ? ({ ...t, phase: 'completed' } as NodeTurn)
             : t
         )
 
