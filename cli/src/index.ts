@@ -8,6 +8,7 @@ import { EventFormatter } from "./formatter/EventFormatter.js";
 import path from "path";
 import process from "process";
 import net from "net";
+import { runDoctor } from "./commands/doctor.js";
 
 const program = new Command();
 
@@ -583,6 +584,14 @@ program
   .option("--no-open", "Do not open browser automatically")
   .action(async (cmd: any) => {
     await runWebStack(cmd);
+  });
+
+
+program
+  .command("doctor")
+  .description("Run environment diagnostics")
+  .action(() => {
+    runDoctor();
   });
 
 program.parse(process.argv);
