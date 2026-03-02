@@ -446,7 +446,7 @@ export default function Home() {
                         if (!promptText) return
                         targetNodes = 'all'
                       } else {
-                        const nodeMatch = trimmed.match(/^\/node\[(.+?)\]\s+([\s\S]+)$/)
+                        const nodeMatch = trimmed.match(/^\/node\[(.+?)\]\s*([\s\S]+)$/)
                         if (nodeMatch) {
                           const expr = nodeMatch[1].trim()
                           promptText = nodeMatch[2].trim()

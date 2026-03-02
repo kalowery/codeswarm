@@ -1,5 +1,7 @@
 import { create } from 'zustand'
 
+const MAX_TURNS_PER_NODE = 300
+
 export type TurnPhase =
   | 'idle'
   | 'streaming'
@@ -41,6 +43,11 @@ export interface NodeState {
   node_id: number
   turns: NodeTurn[]
 }
+
+const capTurns = (turns: NodeTurn[]) =>
+  turns.length > MAX_TURNS_PER_NODE
+    ? turns.slice(-MAX_TURNS_PER_NODE)
+    : turns
 
 export interface SwarmRecord {
   swarm_id: string
@@ -287,7 +294,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             ...swarm.nodes,
             [nodeId]: {
               ...node,
-              turns
+              turns: capTurns(turns)
             }
           }
         })
@@ -324,7 +331,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             ...swarm.nodes,
             [nodeId]: {
               ...node,
-              turns
+              turns: capTurns(turns)
             }
           }
         })
@@ -358,7 +365,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             ...swarm.nodes,
             [nodeId]: {
               ...node,
-              turns
+              turns: capTurns(turns)
             }
           }
         })
@@ -502,7 +509,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           ...swarm,
           nodes: {
             ...swarm.nodes,
-            [nodeId]: { ...node, turns: updatedTurns }
+            [nodeId]: { ...node, turns: capTurns(updatedTurns) }
           }
         })
       }
@@ -533,7 +540,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           ...swarm,
           nodes: {
             ...swarm.nodes,
-            [nodeId]: { ...node, turns: updatedTurns }
+            [nodeId]: { ...node, turns: capTurns(updatedTurns) }
           }
         })
       }
