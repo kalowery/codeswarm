@@ -61,9 +61,8 @@ fi
 
 echo "Using codex at: $(command -v codex)"
 
-CODEX_USER="$(codex whoami 2>/dev/null || true)"
-
-if [ -z "$CODEX_USER" ]; then
+# Check Codex authentication (non-interactive)
+if ! codex auth status >/dev/null 2>&1; then
   echo ""
   echo "❌ Codex CLI is not logged in."
   echo "Run:"
@@ -72,7 +71,7 @@ if [ -z "$CODEX_USER" ]; then
   exit 1
 fi
 
-echo "✅ Codex authenticated as: $CODEX_USER"
+echo "✅ Codex CLI detected and authenticated."
 
 echo ""
 echo "✅ Bootstrap complete."
