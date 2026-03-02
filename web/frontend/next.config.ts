@@ -1,12 +1,5 @@
 import type { NextConfig } from "next";
 
-const nextConfig: NextConfig = {
-  experimental: {
-    turbopack: {
-      root: __dirname,
-    },
-    turbopackUseSystemTlsCerts: true,
-  },
-};
+const nextConfig: NextConfig = {};
 
 export default nextConfig;
