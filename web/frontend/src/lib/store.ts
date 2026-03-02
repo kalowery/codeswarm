@@ -283,7 +283,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             ...newTurn,
             prompt: provisional.prompt,
             reasoning: provisional.reasoning
-          }
+          } as NodeTurn
         } else {
           turns.push(newTurn)
         }
