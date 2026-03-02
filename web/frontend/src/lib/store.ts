@@ -423,11 +423,11 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         if (turnIndex >= 0) {
           const existing = turns[turnIndex]
-          turns[turnIndex] = {
+          turns[turnIndex] = ({
             ...existing,
             phase: 'completed',
             deltas: content ? [content] : existing.deltas
-          }
+          } as NodeTurn)
         } else {
           const provisionalIndex = turns.findIndex(
             (t) =>
@@ -437,7 +437,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             provisionalIndex >= 0 ? turns[provisionalIndex].prompt : ''
           const provisionalReasoning =
             provisionalIndex >= 0 ? turns[provisionalIndex].reasoning : ''
-          const completedTurn = {
+          const completedTurn: NodeTurn = {
             injection_id: payload.injection_id,
             prompt: provisionalPrompt,
             deltas: content ? [content] : [],
