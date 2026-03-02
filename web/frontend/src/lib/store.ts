@@ -231,15 +231,20 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const nodeId = Number(payload.node_id)
         const node = swarm.nodes[nodeId]
         if (!node) return
+        if (node.turns.some((t) => t.injection_id === payload.injection_id)) {
+          return
+        }
 
-        const turns = [...node.turns]
-        // Check for provisional optimistic turn
-        const provisionalIndex = turns.findIndex(
-          (t) =>
-            t.injection_id === payload.injection_id ||
-            t.injection_id === `temp-${payload.injection_id}`
+        // Force-close any non-terminal turns to avoid multiple active bubbles
+        const cleanedTurns = node.turns.map((t) =>
+          t.phase !== 'completed' && t.phase !== 'error'
+            ? { ...t, phase: 'completed' }
+            : t
         )
 
+        const turns = [...cleanedTurns]
+
+        // Replace only the last provisional turn if present
         const newTurn: NodeTurn = {
           injection_id: payload.injection_id,
           prompt: '',
@@ -262,9 +267,16 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           delete pendingComplete[payload.injection_id]
         }
 
-        if (provisionalIndex !== -1) {
-          // Replace provisional turn with real injection_id
-          turns[provisionalIndex] = newTurn
+        if (
+          turns.length > 0 &&
+          turns[turns.length - 1].injection_id.startsWith('temp-')
+        ) {
+          const provisional = turns[turns.length - 1]
+          turns[turns.length - 1] = {
+            ...newTurn,
+            prompt: provisional.prompt,
+            reasoning: provisional.reasoning
+          }
         } else {
           turns.push(newTurn)
         }
@@ -383,16 +395,83 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         })
       }
 
-      if (type === 'reasoning_delta') {
+      if (type === 'task_complete') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const turns = [...node.turns]
+        const turnIndex = turns.findIndex(
+          (t) => t.injection_id === payload.injection_id
+        )
+        const content =
+          typeof payload.last_agent_message === 'string'
+            ? payload.last_agent_message
+            : typeof payload.content === 'string'
+            ? payload.content
+            : undefined
+
+        if (turnIndex >= 0) {
+          const existing = turns[turnIndex]
+          turns[turnIndex] = {
+            ...existing,
+            phase: 'completed',
+            deltas: content ? [content] : existing.deltas
+          }
+        } else {
+          const provisionalIndex = turns.findIndex(
+            (t) =>
+              t.injection_id.startsWith('temp-') && t.phase !== 'completed'
+          )
+          const provisionalPrompt =
+            provisionalIndex >= 0 ? turns[provisionalIndex].prompt : ''
+          const provisionalReasoning =
+            provisionalIndex >= 0 ? turns[provisionalIndex].reasoning : ''
+          const completedTurn = {
+            injection_id: payload.injection_id,
+            prompt: provisionalPrompt,
+            deltas: content ? [content] : [],
+            reasoning: provisionalReasoning,
+            phase: 'completed'
+          }
+
+          if (provisionalIndex >= 0) {
+            turns[provisionalIndex] = completedTurn
+          } else {
+            turns.push(completedTurn)
+          }
+        }
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: {
+              ...node,
+              turns
+            }
+          }
+        })
+      }
+
+      if (
+        type === 'reasoning_delta' ||
+        type === 'agent_reasoning_delta' ||
+        type === 'reasoning_content_delta'
+      ) {
         const swarm = get().swarms[payload.swarm_id]
         if (!swarm) return
         const nodeId = Number(payload.node_id)
         const node = swarm.nodes[nodeId]
         if (!node) return
 
+        const delta = payload.content ?? payload.msg?.delta
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, reasoning: (t.reasoning ?? '') + payload.content }
+            ? { ...t, reasoning: (t.reasoning ?? '') + (delta ?? '') }
             : t
         )
 
@@ -405,16 +484,17 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         })
       }
 
-      if (type === 'reasoning') {
+      if (type === 'reasoning' || type === 'agent_reasoning') {
         const swarm = get().swarms[payload.swarm_id]
         if (!swarm) return
         const nodeId = Number(payload.node_id)
         const node = swarm.nodes[nodeId]
         if (!node) return
 
+        const text = payload.content ?? payload.msg?.text
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, reasoning: payload.content }
+            ? { ...t, reasoning: text ?? '' }
             : t
         )
 

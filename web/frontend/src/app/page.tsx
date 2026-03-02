@@ -5,6 +5,21 @@ import { useSwarmStore } from '@/lib/store'
 import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
 import Image from 'next/image'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+function normalizeMarkdown(content: string, phase: string) {
+  if (phase !== 'completed') return content
+
+  const fenceMatches = content.match(/```/g)
+  if (!fenceMatches || fenceMatches.length !== 2) return content
+
+  const fencePattern = /^([\s\S]*?)^```markdown[ \t]*\r?\n([\s\S]*?)^```[ \t]*\s*$/m
+  const match = content.match(fencePattern)
+  if (!match) return content
+
+  return match[2].trim()
+}
 
 export default function Home() {
   const swarms = useSwarmStore((s) => s.swarms)
@@ -262,9 +277,14 @@ export default function Home() {
                               )}
 
                               {turn.reasoning && (
-                                <div className="text-xs text-amber-400 whitespace-pre-wrap">
-                                  {turn.reasoning}
-                                </div>
+                                <details className="text-xs text-amber-400">
+                                  <summary className="cursor-pointer select-none text-amber-300">
+                                    Reasoning
+                                  </summary>
+                                  <div className="mt-1 whitespace-pre-wrap">
+                                    {turn.reasoning}
+                                  </div>
+                                </details>
                               )}
 
                               {turn.phase === 'awaiting_approval' && turn.approval && (
@@ -325,7 +345,7 @@ export default function Home() {
                                       : turn.execution.command}
                                   </div>
                                   {turn.execution.stdout && (
-                                    <div className="mt-1 text-emerald-400 whitespace-pre-wrap">
+                                    <div className="mt-1 text-emerald-400 whitespace-pre-wrap break-words overflow-x-auto">
                                       {turn.execution.stdout}
                                     </div>
                                   )}
@@ -337,11 +357,40 @@ export default function Home() {
                                 </div>
                               )}
 
-                              {turn.deltas.length > 0 && (
-                                <div className="whitespace-pre-wrap">
-                                  {turn.deltas.join('')}
-                                </div>
-                              )}
+                              {turn.deltas.length > 0 && (() => {
+                                const raw = turn.deltas.join('').trim()
+
+                                if (turn.phase !== 'completed') {
+                                  return (
+                                    <div className="markdown-content break-words overflow-x-auto text-sm leading-relaxed">
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                        {raw}
+                                      </ReactMarkdown>
+                                    </div>
+                                  )
+                                }
+
+                                const formatted = normalizeMarkdown(raw, turn.phase)
+                                const showRaw = raw !== formatted
+
+                                return (
+                                  <div className="markdown-content break-words overflow-x-auto text-sm leading-relaxed space-y-2">
+                                    {showRaw && (
+                                      <details className="text-xs text-slate-300">
+                                        <summary className="cursor-pointer select-none text-slate-400">
+                                          Raw Output
+                                        </summary>
+                                        <div className="mt-1 whitespace-pre-wrap">
+                                          {raw}
+                                        </div>
+                                      </details>
+                                    )}
+                                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                                      {formatted}
+                                    </ReactMarkdown>
+                                  </div>
+                                )
+                              })()}
 
                               {turn.phase === 'error' && turn.error && (
                                 <div className="text-rose-400 text-xs">
