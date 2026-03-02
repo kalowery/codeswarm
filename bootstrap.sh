@@ -39,17 +39,27 @@ npm install
 npm run build
 cd ../..
 
+# --- Ensure Homebrew paths (macOS) ---
+if [ -d "/opt/homebrew/bin" ]; then
+  export PATH="/opt/homebrew/bin:$PATH"
+fi
+
+if [ -d "/usr/local/bin" ]; then
+  export PATH="/usr/local/bin:$PATH"
+fi
+
 # --- Check Codex ---
 if ! command -v codex >/dev/null 2>&1; then
   echo ""
-  echo "❌ Codex CLI is not installed."
-  echo "Codeswarm currently requires Codex."
+  echo "❌ Codex CLI not found in PATH."
+  echo "Current PATH: $PATH"
   echo ""
-  echo "Install Codex:"
-  echo "  npm install -g @openai/codex"
+  echo "If installed via Homebrew, ensure brew is configured correctly."
   echo ""
   exit 1
 fi
+
+echo "Using codex at: $(command -v codex)"
 
 if ! codex whoami >/dev/null 2>&1; then
   echo ""
