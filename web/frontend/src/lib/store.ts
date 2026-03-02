@@ -521,9 +521,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
-        const updatedTurns = node.turns.map((t) =>
+        const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? {
+            ? ({
                 ...t,
                 phase: 'awaiting_approval',
                 approval: {
@@ -532,7 +532,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
                   reason: payload.reason,
                   cwd: payload.cwd
                 }
-              }
+              } as NodeTurn)
             : t
         )
 
