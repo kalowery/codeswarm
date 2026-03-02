@@ -301,6 +301,7 @@ export default function Home() {
                                     <button
                                       className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500"
                                       onClick={async () => {
+                                        if (!turn.approval) return;
                                         const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
                                         await fetch(`${apiBase}/approval`, {
                                           method: 'POST',
@@ -319,6 +320,7 @@ export default function Home() {
                                     <button
                                       className="px-2 py-1 bg-rose-600 rounded text-xs hover:bg-rose-500"
                                       onClick={async () => {
+                                        if (!turn.approval) return;
                                         const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
                                         await fetch(`${apiBase}/approval`, {
                                           method: 'POST',
