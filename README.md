@@ -9,6 +9,100 @@ It provides a real-time, event-driven web UI for orchestrating multi-node AI swa
 
 ---
 
+# 🚀 Quick Start (Local Mode)
+
+Codeswarm supports a one-command bootstrap setup.
+
+## 1. Clone
+
+```bash
+git clone https://github.com/kalowery/codeswarm.git
+cd codeswarm
+```
+
+## 2. Bootstrap
+
+```bash
+./bootstrap.sh
+```
+
+Bootstrap will:
+
+- Install `nvm` if missing
+- Install Node.js 24.13.0
+- Install all dependencies (root, backend, frontend)
+- Build the frontend
+- Verify Codex CLI is installed
+- Verify Codex CLI is authenticated
+
+If Codex is not installed:
+
+```bash
+npm install -g @openai/codex
+```
+
+If Codex is not logged in:
+
+```bash
+codex login
+```
+
+---
+
+## 3. Create a Local Config
+
+Create a file named `local.json` in the repo root:
+
+```json
+{
+  "cluster": {
+    "backend": "local",
+    "workspace_root": "runs",
+    "archive_root": "/tmp/archives"
+  }
+}
+```
+
+---
+
+## 4. Launch the Web UI
+
+```bash
+npx codeswarm web --config local.json
+```
+
+---
+
+# 🛠 Troubleshooting
+
+## ❌ Codex CLI not installed
+
+```bash
+npm install -g @openai/codex
+```
+
+## ❌ Codex CLI not logged in
+
+```bash
+codex login
+```
+
+## ❌ Node version mismatch
+
+Codeswarm requires Node 24.13.0.
+
+```bash
+nvm install 24.13.0
+nvm use 24.13.0
+```
+
+## ❌ Long-running sessions slow down browser
+
+Codeswarm caps turn history at 300 turns per node to prevent unbounded DOM growth.
+Modify `web/frontend/src/lib/store.ts` to adjust.
+
+
+
 # Core Design Principles
 
 - **Provider abstraction** — Router never depends on SSH or Slurm semantics.
