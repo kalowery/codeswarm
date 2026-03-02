@@ -39,6 +39,13 @@ npm install
 npm run build
 cd ../..
 
+# --- Install CLI ---
+echo "📦 Installing CLI..."
+cd cli
+npm install
+npm run build
+cd ..
+
 # --- Ensure Homebrew paths (macOS) ---
 if [ -d "/opt/homebrew/bin" ]; then
   export PATH="/opt/homebrew/bin:$PATH"
