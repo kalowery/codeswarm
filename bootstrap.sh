@@ -37,6 +37,7 @@ echo "📦 Installing frontend..."
 cd web/frontend
 npm install
 npm run build
+npm link
 cd ../..
 
 # --- Install CLI ---
@@ -44,6 +45,7 @@ echo "📦 Installing CLI..."
 cd cli
 npm install
 npm run build
+npm link
 cd ..
 
 # --- Ensure Homebrew paths (macOS) ---
@@ -84,4 +86,4 @@ echo ""
 echo "✅ Bootstrap complete."
 echo ""
 echo "You can now run:"
-echo "  npx codeswarm <command>"
+echo "  codeswarm <command>"
