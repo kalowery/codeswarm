@@ -484,7 +484,7 @@ export default function Home() {
                           : targetNodes
 
                       nodeIds.forEach((nodeId) => {
-                        const provisional = {
+                        const provisional: NodeTurn = {
                           injection_id: `temp-${Date.now()}-${nodeId}`,
                           prompt: promptText,
                           deltas: [],
