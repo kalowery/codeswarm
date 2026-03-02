@@ -6,6 +6,7 @@ import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
 import Image from 'next/image'
 import ReactMarkdown from 'react-markdown'
+import type { NodeTurn } from '@/lib/store'
 import remarkGfm from 'remark-gfm'
 
 function normalizeMarkdown(content: string, phase: string) {
