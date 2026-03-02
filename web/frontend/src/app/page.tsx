@@ -241,7 +241,7 @@ export default function Home() {
                               {isWorking && !isActive && (
                                 <span className="absolute bottom-1 left-1 w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
                               )}
-                              {id}
+                              Node {id}
                             </button>
                           )
                         })}
@@ -431,25 +431,70 @@ export default function Home() {
 
                     try {
                       setIsSending(true)
-                      setPendingPrompt(value)
                       const store = useSwarmStore.getState()
                       const swarm = store.swarms[active.swarm_id]
                       const activeNodeId = store.activeNodeBySwarm[active.swarm_id] ?? 0
 
+                      const trimmed = value.trim()
+                      let promptText = trimmed
+                      let targetNodes: number[] | 'all' = [activeNodeId]
+                      const nodeIdSet = new Set(Object.keys(swarm.nodes).map((id) => Number(id)))
+
+                      const allMatch = trimmed.match(/^\/all\s+([\s\S]+)$/)
+                      if (allMatch) {
+                        promptText = allMatch[1].trim()
+                        if (!promptText) return
+                        targetNodes = 'all'
+                      } else {
+                        const nodeMatch = trimmed.match(/^\/node\[(.+?)\]\s+([\s\S]+)$/)
+                        if (nodeMatch) {
+                          const expr = nodeMatch[1].trim()
+                          promptText = nodeMatch[2].trim()
+                          if (!promptText) return
+                          const resolved = new Set<number>()
+                          expr.split(',').forEach((part) => {
+                            const chunk = part.trim()
+                            if (!chunk) return
+                            if (/^\d+$/.test(chunk)) {
+                              resolved.add(Number(chunk))
+                              return
+                            }
+                            const rangeMatch = chunk.match(/^(\d+)\s*-\s*(\d+)$/)
+                            if (!rangeMatch) return
+                            const start = Number(rangeMatch[1])
+                            const end = Number(rangeMatch[2])
+                            if (start > end) return
+                            for (let i = start; i <= end; i += 1) {
+                              resolved.add(i)
+                            }
+                          })
+                          const resolvedNodes = Array.from(resolved).filter((id) => nodeIdSet.has(id))
+                          if (resolvedNodes.length === 0) return
+                          targetNodes = resolvedNodes
+                        }
+                      }
+
+                      setPendingPrompt(promptText)
                       const updatedNodes = { ...swarm.nodes }
+                      const nodeIds =
+                        targetNodes === 'all'
+                          ? Object.keys(swarm.nodes).map((id) => Number(id))
+                          : targetNodes
 
-                      const provisional = {
-                        injection_id: `temp-${Date.now()}-${activeNodeId}`,
-                        prompt: value,
-                        deltas: [],
-                        reasoning: '',
-                        phase: 'streaming'
-                      }
+                      nodeIds.forEach((nodeId) => {
+                        const provisional = {
+                          injection_id: `temp-${Date.now()}-${nodeId}`,
+                          prompt: promptText,
+                          deltas: [],
+                          reasoning: '',
+                          phase: 'streaming'
+                        }
 
-                      updatedNodes[activeNodeId] = {
-                        ...updatedNodes[activeNodeId],
-                        turns: [...updatedNodes[activeNodeId].turns, provisional]
-                      }
+                        updatedNodes[nodeId] = {
+                          ...updatedNodes[nodeId],
+                          turns: [...updatedNodes[nodeId].turns, provisional]
+                        }
+                      })
 
                       store.addOrUpdateSwarm({
                         ...swarm,
@@ -457,10 +502,14 @@ export default function Home() {
                       })
 
                       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                      const payload =
+                        targetNodes === 'all'
+                          ? { prompt: promptText }
+                          : { prompt: promptText, nodes: nodeIds }
                       await fetch(`${apiBase}/inject/${active.alias}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ prompt: value })
+                        body: JSON.stringify(payload)
                       })
 
                       ;(e.target as HTMLTextAreaElement).value = ''
