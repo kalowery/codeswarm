@@ -649,9 +649,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
-        const updatedTurns = node.turns.map((t) =>
+        const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, phase: 'error', error: payload.message }
+            ? ({ ...t, phase: 'error', error: payload.message } as NodeTurn)
             : t
         )
 
@@ -671,9 +671,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
-        const updatedTurns = node.turns.map((t) =>
+        const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? { ...t, usage: payload.total_tokens }
+            ? ({ ...t, usage: payload.total_tokens } as NodeTurn)
             : t
         )
 
