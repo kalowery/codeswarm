@@ -62,7 +62,7 @@ fi
 echo "Using codex at: $(command -v codex)"
 
 # Check Codex authentication (non-interactive)
-if ! codex auth status >/dev/null 2>&1; then
+if ! codex login status >/dev/null 2>&1; then
   echo ""
   echo "❌ Codex CLI is not logged in."
   echo "Run:"
