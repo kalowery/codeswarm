@@ -476,7 +476,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!node) return
 
         const delta = payload.content ?? payload.msg?.delta
-        const updatedTurns = node.turns.map((t) =>
+        const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
             ? { ...t, reasoning: (t.reasoning ?? '') + (delta ?? '') }
             : t
@@ -560,11 +560,11 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             ...node,
             turns: node.turns.map((t) =>
               t.approval?.call_id === payload.call_id
-                ? {
+                ? ({
                     ...t,
                     phase: 'streaming',
                     approval: undefined
-                  }
+                  } as NodeTurn)
                 : t
             )
           }
@@ -585,7 +585,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? {
+            ? ({
                 ...t,
                 phase: 'executing',
                 execution: {
@@ -595,7 +595,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
                   started_at: Date.now(),
                   status: 'running'
                 }
-              }
+              } as NodeTurn)
             : t
         )
 
@@ -615,11 +615,11 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
-        const updatedTurns = node.turns.map((t) => {
+        const updatedTurns: NodeTurn[] = node.turns.map((t) => {
           if (t.injection_id !== payload.injection_id) return t
           if (!t.execution) return t
 
-          return {
+          return ({
             ...t,
             phase: 'streaming',
             execution: {
@@ -630,7 +630,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
               stderr: payload.stderr,
               exit_code: payload.exit_code
             }
-          }
+          } as NodeTurn)
         })
 
         get().addOrUpdateSwarm({
