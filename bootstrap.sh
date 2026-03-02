@@ -24,6 +24,30 @@ nvm use "$NODE_VERSION"
 
 echo "✅ Using Node $(node -v)"
 
+# --- Ensure Python 3.10+ ---
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "❌ python3 not found in PATH. Install Python 3.10+ (e.g., brew install python@3.11)."
+  exit 1
+fi
+
+PY_VERSION=$(python3 - <<'PY'
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+)
+
+PY_MAJOR=$(echo "$PY_VERSION" | cut -d. -f1)
+PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
+
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
+  echo "❌ Python 3.10+ required. Found $PY_VERSION."
+  echo "Install a modern Python (e.g., brew install python@3.11) and ensure it is first in PATH."
+  exit 1
+fi
+
+echo "✅ Using Python $(python3 --version)"
+
+
 # --- Install dependencies ---
 echo "📦 Installing root dependencies..."
 npm install
