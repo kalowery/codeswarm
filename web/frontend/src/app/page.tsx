@@ -94,6 +94,77 @@ export default function Home() {
     return () => clearInterval(id)
   }, [])
 
+  async function sendApproval(
+    job_id: string,
+    call_id: string,
+    approved: boolean,
+    decision?: unknown
+  ) {
+    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+    await fetch(`${apiBase}/approval`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id,
+        call_id,
+        approved,
+        decision
+      })
+    })
+  }
+
+  function approvalHasPolicyOption(availableDecisions: Array<string | Record<string, any>> | undefined) {
+    if (!Array.isArray(availableDecisions)) return false
+    return availableDecisions.some(
+      (d) =>
+        typeof d === 'object' &&
+        d !== null &&
+        (
+          'approved_execpolicy_amendment' in d ||
+          'acceptWithExecpolicyAmendment' in d
+        )
+    )
+  }
+
+  function buildPolicyDecision(
+    availableDecisions: Array<string | Record<string, any>> | undefined,
+    amendment: string[]
+  ) {
+    const hasAcceptStyle = Array.isArray(availableDecisions) &&
+      availableDecisions.some(
+        (d) =>
+          typeof d === 'object' &&
+          d !== null &&
+          'acceptWithExecpolicyAmendment' in d
+      )
+
+    if (hasAcceptStyle) {
+      return {
+        acceptWithExecpolicyAmendment: {
+          execpolicy_amendment: amendment
+        }
+      }
+    }
+
+    return {
+      approved_execpolicy_amendment: {
+        proposed_execpolicy_amendment: amendment
+      }
+    }
+  }
+
+  function approveToken(availableDecisions: Array<string | Record<string, any>> | undefined) {
+    return Array.isArray(availableDecisions) && availableDecisions.includes('accept')
+      ? 'accept'
+      : 'approved'
+  }
+
+  function denyToken(availableDecisions: Array<string | Record<string, any>> | undefined) {
+    return Array.isArray(availableDecisions) && availableDecisions.includes('cancel')
+      ? 'cancel'
+      : 'abort'
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex overflow-x-hidden">
       <div className="w-80 shrink-0 border-r border-slate-800 p-4">
@@ -303,35 +374,49 @@ export default function Home() {
                                       className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500"
                                       onClick={async () => {
                                         if (!turn.approval) return;
-                                        const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
-                                        await fetch(`${apiBase}/approval`, {
-                                          method: 'POST',
-                                          headers: { 'Content-Type': 'application/json' },
-                                          body: JSON.stringify({
-                                            job_id: active.job_id,
-                                            call_id: turn.approval.call_id,
-                                            approved: true
-                                          })
-                                        })
+                                        await sendApproval(
+                                          active.job_id,
+                                          turn.approval.call_id,
+                                          true,
+                                          approveToken(turn.approval.available_decisions)
+                                        )
                                       }}
                                     >
                                       Approve
                                     </button>
 
+                                    {Array.isArray(turn.approval.proposed_execpolicy_amendment) &&
+                                      turn.approval.proposed_execpolicy_amendment.length > 0 &&
+                                      approvalHasPolicyOption(turn.approval.available_decisions) && (
+                                        <button
+                                          className="px-2 py-1 bg-teal-600 rounded text-xs hover:bg-teal-500"
+                                          onClick={async () => {
+                                            if (!turn.approval?.proposed_execpolicy_amendment) return
+                                            await sendApproval(
+                                              active.job_id,
+                                              turn.approval.call_id,
+                                              true,
+                                              buildPolicyDecision(
+                                                turn.approval.available_decisions,
+                                                turn.approval.proposed_execpolicy_amendment
+                                              )
+                                            )
+                                          }}
+                                        >
+                                          Approve + policy
+                                        </button>
+                                      )}
+
                                     <button
                                       className="px-2 py-1 bg-rose-600 rounded text-xs hover:bg-rose-500"
                                       onClick={async () => {
                                         if (!turn.approval) return;
-                                        const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
-                                        await fetch(`${apiBase}/approval`, {
-                                          method: 'POST',
-                                          headers: { 'Content-Type': 'application/json' },
-                                          body: JSON.stringify({
-                                            job_id: active.job_id,
-                                            call_id: turn.approval.call_id,
-                                            approved: false
-                                          })
-                                        })
+                                        await sendApproval(
+                                          active.job_id,
+                                          turn.approval.call_id,
+                                          false,
+                                          denyToken(turn.approval.available_decisions)
+                                        )
                                       }}
                                     >
                                       Deny

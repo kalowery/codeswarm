@@ -34,6 +34,8 @@ export interface NodeTurn {
     command: string[] | string
     reason: string
     cwd?: string
+    proposed_execpolicy_amendment?: string[]
+    available_decisions?: Array<string | Record<string, any>>
   }
   error?: string
   usage?: number
@@ -530,7 +532,9 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
                   call_id: payload.call_id,
                   command: payload.command,
                   reason: payload.reason,
-                  cwd: payload.cwd
+                  cwd: payload.cwd,
+                  proposed_execpolicy_amendment: payload.proposed_execpolicy_amendment,
+                  available_decisions: payload.available_decisions
                 }
               } as NodeTurn)
             : t

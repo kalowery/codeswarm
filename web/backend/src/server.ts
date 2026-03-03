@@ -225,16 +225,24 @@ app.get('/swarms', (req, res) => {
 });
 
 app.post('/approval', (req, res) => {
-  const { job_id, call_id, approved } = req.body;
+  const { job_id, call_id, approved, decision } = req.body;
 
   if (!job_id || !call_id) {
     return res.status(400).json({ error: 'Missing job_id or call_id' });
   }
 
+  const normalizedApproved =
+    typeof approved === 'boolean'
+      ? approved
+      : decision === 'abort'
+      ? false
+      : true;
+
   const request_id = router.send('approve_execution', {
     job_id,
     call_id,
-    approved: !!approved
+    approved: normalizedApproved,
+    decision
   });
 
   res.json({ request_id });

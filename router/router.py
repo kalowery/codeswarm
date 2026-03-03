@@ -400,12 +400,16 @@ def translate_event(event):
             command = msg.get("command")
             reason = msg.get("reason")
             cwd = msg.get("cwd")
+            proposed_execpolicy_amendment = msg.get("proposed_execpolicy_amendment")
+            available_decisions = msg.get("available_decisions")
         else:
             # Shape B: item/commandExecution/requestApproval
             call_id = params.get("itemId")
             command = params.get("command")
             reason = params.get("reason")
             cwd = params.get("cwd")
+            proposed_execpolicy_amendment = params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
+            available_decisions = params.get("availableDecisions") or params.get("available_decisions")
 
         rpc_id = payload.get("id")
 
@@ -416,6 +420,8 @@ def translate_event(event):
                 "injection_id": injection_id,
                 "rpc_id": rpc_id,
                 "approval_method": method,
+                "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
+                "available_decisions": available_decisions,
             }
             pass  # debug removed
 
@@ -427,6 +433,8 @@ def translate_event(event):
                 "command": command,
                 "reason": reason,
                 "cwd": cwd,
+                "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
+                "available_decisions": available_decisions,
                 "raw": payload,
             },
         )
@@ -755,6 +763,7 @@ def run_daemon(config, provider):
                 job_id = payload.get("job_id")
                 call_id = payload.get("call_id")
                 approved = payload.get("approved")
+                decision = payload.get("decision")
 
                 key = (str(job_id), call_id)
                 pass  # debug removed
@@ -769,24 +778,113 @@ def run_daemon(config, provider):
 
                 try:
                     rpc_id = meta.get("rpc_id")
+                    available_decisions = meta.get("available_decisions") or []
+
+                    def _extract_amendment_from_decision(d):
+                        if not isinstance(d, dict):
+                            return None
+                        if isinstance(d.get("approved_execpolicy_amendment"), dict):
+                            inner = d["approved_execpolicy_amendment"]
+                            if isinstance(inner.get("proposed_execpolicy_amendment"), list):
+                                return inner["proposed_execpolicy_amendment"]
+                        if isinstance(d.get("acceptWithExecpolicyAmendment"), dict):
+                            inner = d["acceptWithExecpolicyAmendment"]
+                            if isinstance(inner.get("execpolicy_amendment"), list):
+                                return inner["execpolicy_amendment"]
+                        return None
+
+                    def _normalize_approved_decision(d, approved_flag):
+                        if d is None:
+                            return "approved" if approved_flag else "abort"
+                        if isinstance(d, str):
+                            if d in ("approved", "abort"):
+                                return d
+                            if d == "accept":
+                                return "approved"
+                            if d == "cancel":
+                                return "abort"
+                            return "approved" if approved_flag else "abort"
+                        if isinstance(d, dict):
+                            amendment = _extract_amendment_from_decision(d)
+                            if amendment:
+                                return {
+                                    "approved_execpolicy_amendment": {
+                                        "proposed_execpolicy_amendment": amendment
+                                    }
+                                }
+                        return "approved" if approved_flag else "abort"
+
+                    def _normalize_accept_decision(d, approved_flag):
+                        if d is None:
+                            return "accept" if approved_flag else "cancel"
+                        if isinstance(d, str):
+                            if d in ("accept", "cancel"):
+                                return d
+                            if d == "approved":
+                                return "accept"
+                            if d == "abort":
+                                return "cancel"
+                            return "accept" if approved_flag else "cancel"
+                        if isinstance(d, dict):
+                            amendment = _extract_amendment_from_decision(d)
+                            if amendment:
+                                return {
+                                    "acceptWithExecpolicyAmendment": {
+                                        "execpolicy_amendment": amendment
+                                    }
+                                }
+                        return "accept" if approved_flag else "cancel"
+
+                    has_accept = any(
+                        (isinstance(d, str) and d in ("accept", "cancel")) or
+                        (isinstance(d, dict) and "acceptWithExecpolicyAmendment" in d)
+                        for d in available_decisions
+                    )
 
                     if rpc_id is not None:
                         # JSON-RPC request-style approval (must send response with same id)
+                        if has_accept:
+                            result_payload = _normalize_accept_decision(decision, bool(approved))
+                        else:
+                            normalized = _normalize_approved_decision(decision, bool(approved))
+                            # Request-style API expects accept/cancel naming.
+                            if normalized == "approved":
+                                result_payload = "accept"
+                            elif normalized == "abort":
+                                result_payload = "cancel"
+                            elif isinstance(normalized, dict):
+                                amendment = _extract_amendment_from_decision(normalized)
+                                result_payload = {
+                                    "acceptWithExecpolicyAmendment": {
+                                        "execpolicy_amendment": amendment or []
+                                    }
+                                }
+                            else:
+                                result_payload = "accept" if bool(approved) else "cancel"
+
                         control_payload = {
                             "type": "rpc_response",
                             "rpc_id": rpc_id,
-                            "result": {
-                                "approved": approved
-                            }
+                            "result": result_payload
                         }
                     else:
                         # Notification-style approval
+                        normalized = _normalize_approved_decision(decision, bool(approved))
+                        params_payload = {
+                            "call_id": call_id,
+                            "approved": bool(approved),
+                        }
+                        if normalized == "approved":
+                            params_payload["approved"] = True
+                        elif normalized == "abort":
+                            params_payload["approved"] = False
+                        elif isinstance(normalized, dict):
+                            params_payload.update(normalized)
+                            params_payload["approved"] = True
+
                         control_payload = {
                             "method": "exec/approvalResponse",
-                            "params": {
-                                "call_id": call_id,
-                                "approved": approved,
-                            },
+                            "params": params_payload,
                         }
 
                     provider.send_control(
@@ -808,6 +906,7 @@ def run_daemon(config, provider):
                     "job_id": job_id,
                     "call_id": call_id,
                     "approved": approved,
+                    "decision": decision,
                 })
 
             elif command == "swarm_terminate":
@@ -899,4 +998,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
