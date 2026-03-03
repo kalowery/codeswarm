@@ -28,6 +28,8 @@ export default function Home() {
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
   const selected = useSwarmStore((s) => s.selectedSwarm)
   const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
+  const interSwarmQueue = useSwarmStore((s) => s.interSwarmQueue)
+  const setInterSwarmQueue = useSwarmStore((s) => s.setInterSwarmQueue)
   const launchError = useSwarmStore((s) => s.launchError)
   const clearLaunchError = useSwarmStore((s) => s.clearLaunchError)
 
@@ -38,7 +40,10 @@ export default function Home() {
     fetch(`${apiBase}/swarms`)
       .then((res) => res.json())
       .then((data) => setSwarms(data))
-  }, [setSwarms])
+    fetch(`${apiBase}/queue`)
+      .then((res) => res.json())
+      .then((data) => setInterSwarmQueue(data))
+  }, [setSwarms, setInterSwarmQueue])
 
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
   const swarmList = Object.values(swarms)
@@ -165,6 +170,11 @@ export default function Home() {
       : 'abort'
   }
 
+  function formatPolicyRule(rule: string[] | undefined) {
+    if (!Array.isArray(rule) || rule.length === 0) return 'N/A'
+    return rule.join(' ')
+  }
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex overflow-x-hidden">
       <div className="w-80 shrink-0 border-r border-slate-800 p-4">
@@ -237,6 +247,42 @@ export default function Home() {
           {swarmList.length === 0 && (
             <div className="text-slate-500 text-sm">No active swarms</div>
           )}
+
+          <div className="pt-3 mt-3 border-t border-slate-800">
+            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+              Queued Cross-Swarm Work ({interSwarmQueue.length})
+            </div>
+            {interSwarmQueue.length === 0 ? (
+              <div className="text-xs text-slate-600">No queued inter-swarm prompts.</div>
+            ) : (
+              <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+                {interSwarmQueue.map((item) => {
+                  const sourceAlias = item.source_swarm_id && swarms[item.source_swarm_id]
+                    ? swarms[item.source_swarm_id].alias
+                    : item.source_swarm_id ?? 'unknown'
+                  const targetAlias = item.target_swarm_id && swarms[item.target_swarm_id]
+                    ? swarms[item.target_swarm_id].alias
+                    : item.target_swarm_id
+                  const ageSec = item.created_at
+                    ? Math.max(0, Math.floor(Date.now() / 1000 - item.created_at))
+                    : 0
+                  return (
+                    <div key={item.queue_id} className="p-2 rounded bg-slate-900 border border-slate-800 text-xs">
+                      <div className="text-slate-300">
+                        {sourceAlias} {'->'} {targetAlias}
+                      </div>
+                      <div className="text-slate-500">
+                        selector={item.selector ?? 'idle'} · age={ageSec}s
+                      </div>
+                      {item.content && (
+                        <div className="text-slate-400 truncate">{item.content}</div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -369,6 +415,46 @@ export default function Home() {
                                   </div>
                                   <div className="mt-1 text-slate-300">{turn.approval.reason}</div>
 
+                                  <div className="mt-2 space-y-1 text-slate-200">
+                                    <div className="font-medium text-amber-200">Approval choices</div>
+                                    <div>
+                                      <span className="text-emerald-300">Approve once:</span> run this command now only.
+                                    </div>
+                                    {approvalHasPolicyOption(turn.approval.available_decisions) && (
+                                      <div>
+                                        <span className="text-teal-300">Approve + save policy:</span> run now and allow similar commands later.
+                                      </div>
+                                    )}
+                                    <div>
+                                      <span className="text-rose-300">Deny:</span> reject this command.
+                                    </div>
+                                  </div>
+
+                                  {Array.isArray(turn.approval.proposed_execpolicy_amendment) &&
+                                    turn.approval.proposed_execpolicy_amendment.length > 0 && (
+                                      <div className="mt-2 bg-slate-900 border border-slate-700 rounded p-2">
+                                        <div className="text-slate-400">Proposed policy rule</div>
+                                        <div className="mt-1 font-mono text-[11px] text-slate-200 break-words">
+                                          {formatPolicyRule(turn.approval.proposed_execpolicy_amendment)}
+                                        </div>
+                                      </div>
+                                    )}
+
+                                  <div className="mt-2 bg-slate-900 border border-slate-700 rounded p-2">
+                                    <div className="text-slate-400">Current policy rules (known in this session)</div>
+                                    {Array.isArray(active.known_exec_policies) && active.known_exec_policies.length > 0 ? (
+                                      <div className="mt-1 space-y-1">
+                                        {active.known_exec_policies.map((rule, idx) => (
+                                          <div key={`${idx}-${rule.join(' ')}`} className="font-mono text-[11px] text-slate-200 break-words">
+                                            {formatPolicyRule(rule)}
+                                          </div>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <div className="mt-1 text-slate-500">No saved policy rules recorded yet.</div>
+                                    )}
+                                  </div>
+
                                   <div className="mt-2 flex gap-2">
                                     <button
                                       className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500"
@@ -382,7 +468,7 @@ export default function Home() {
                                         )
                                       }}
                                     >
-                                      Approve
+                                      Approve once
                                     </button>
 
                                     {Array.isArray(turn.approval.proposed_execpolicy_amendment) &&
@@ -403,7 +489,7 @@ export default function Home() {
                                             )
                                           }}
                                         >
-                                          Approve + policy
+                                          Approve + save policy
                                         </button>
                                       )}
 
@@ -526,14 +612,58 @@ export default function Home() {
                       const trimmed = value.trim()
                       let promptText = trimmed
                       let targetNodes: number[] | 'all' = [activeNodeId]
+                      let targetAlias: string | undefined
+                      let selector: 'all' | 'nodes' | 'idle' | undefined
                       const nodeIdSet = new Set(Object.keys(swarm.nodes).map((id) => Number(id)))
 
-                      const allMatch = trimmed.match(/^\/all\s+([\s\S]+)$/)
-                      if (allMatch) {
-                        promptText = allMatch[1].trim()
-                        if (!promptText) return
+                      const crossAllMatch = trimmed.match(/^\/swarm\[(.+?)\]\/all\s+([\s\S]+)$/)
+                      const crossIdleMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)\s+([\s\S]+)$/)
+                      const crossNodeMatch = trimmed.match(/^\/swarm\[(.+?)\]\/node\[(.+?)\]\s*([\s\S]+)$/)
+
+                      if (crossAllMatch) {
+                        targetAlias = crossAllMatch[1].trim()
+                        promptText = crossAllMatch[2].trim()
+                        if (!targetAlias || !promptText) return
+                        selector = 'all'
                         targetNodes = 'all'
+                      } else if (crossIdleMatch) {
+                        targetAlias = crossIdleMatch[1].trim()
+                        promptText = crossIdleMatch[3].trim()
+                        if (!targetAlias || !promptText) return
+                        selector = 'idle'
+                      } else if (crossNodeMatch) {
+                        targetAlias = crossNodeMatch[1].trim()
+                        const expr = crossNodeMatch[2].trim()
+                        promptText = crossNodeMatch[3].trim()
+                        if (!targetAlias || !promptText) return
+                        selector = 'nodes'
+                        const resolved = new Set<number>()
+                        expr.split(',').forEach((part) => {
+                          const chunk = part.trim()
+                          if (!chunk) return
+                          if (/^\d+$/.test(chunk)) {
+                            resolved.add(Number(chunk))
+                            return
+                          }
+                          const rangeMatch = chunk.match(/^(\d+)\s*-\s*(\d+)$/)
+                          if (!rangeMatch) return
+                          const start = Number(rangeMatch[1])
+                          const end = Number(rangeMatch[2])
+                          if (start > end) return
+                          for (let i = start; i <= end; i += 1) {
+                            resolved.add(i)
+                          }
+                        })
+                        const resolvedNodes = Array.from(resolved)
+                        if (resolvedNodes.length === 0) return
+                        targetNodes = resolvedNodes
                       } else {
+                        const allMatch = trimmed.match(/^\/all\s+([\s\S]+)$/)
+                        if (allMatch) {
+                          promptText = allMatch[1].trim()
+                          if (!promptText) return
+                          targetNodes = 'all'
+                        } else {
                         const nodeMatch = trimmed.match(/^\/node\[(.+?)\]\s*([\s\S]+)$/)
                         if (nodeMatch) {
                           const expr = nodeMatch[1].trim()
@@ -561,39 +691,55 @@ export default function Home() {
                           targetNodes = resolvedNodes
                         }
                       }
+                      }
 
                       setPendingPrompt(promptText)
-                      const updatedNodes = { ...swarm.nodes }
-                      const nodeIds =
+                      // Provisional bubbles are only added for local swarm routing.
+                      if (!targetAlias) {
+                        const updatedNodes = { ...swarm.nodes }
+                        const nodeIds =
+                          targetNodes === 'all'
+                            ? Object.keys(swarm.nodes).map((id) => Number(id))
+                            : targetNodes
+
+                        nodeIds.forEach((nodeId) => {
+                          const provisional: NodeTurn = {
+                            injection_id: `temp-${Date.now()}-${nodeId}`,
+                            prompt: promptText,
+                            deltas: [],
+                            reasoning: '',
+                            phase: 'streaming'
+                          }
+
+                          updatedNodes[nodeId] = {
+                            ...updatedNodes[nodeId],
+                            turns: [...updatedNodes[nodeId].turns, provisional]
+                          }
+                        })
+
+                        store.addOrUpdateSwarm({
+                          ...swarm,
+                          nodes: updatedNodes
+                        })
+                      }
+
+                      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                      const localNodeIds =
                         targetNodes === 'all'
                           ? Object.keys(swarm.nodes).map((id) => Number(id))
                           : targetNodes
-
-                      nodeIds.forEach((nodeId) => {
-                        const provisional: NodeTurn = {
-                          injection_id: `temp-${Date.now()}-${nodeId}`,
-                          prompt: promptText,
-                          deltas: [],
-                          reasoning: '',
-                          phase: 'streaming'
-                        }
-
-                        updatedNodes[nodeId] = {
-                          ...updatedNodes[nodeId],
-                          turns: [...updatedNodes[nodeId].turns, provisional]
-                        }
-                      })
-
-                      store.addOrUpdateSwarm({
-                        ...swarm,
-                        nodes: updatedNodes
-                      })
-
-                      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
-                      const payload =
-                        targetNodes === 'all'
-                          ? { prompt: promptText }
-                          : { prompt: promptText, nodes: nodeIds }
+                      const payload = targetAlias
+                        ? {
+                            prompt: promptText,
+                            target_alias: targetAlias,
+                            selector: selector ?? (targetNodes === 'all' ? 'all' : 'nodes'),
+                            ...(targetNodes === 'all' ? {} : { nodes: targetNodes })
+                          }
+                        : (
+                          targetNodes === 'all'
+                            ? { prompt: promptText }
+                            : { prompt: promptText, nodes: localNodeIds }
+                        )
                       await fetch(`${apiBase}/inject/${active.alias}`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -607,7 +753,9 @@ export default function Home() {
                   }
                 }}
               />
-              <div className="text-xs text-slate-500 mt-1">Press Enter to send (Shift+Enter for newline)</div>
+              <div className="text-xs text-slate-500 mt-1">
+                Enter to send. Supported prefixes: <code>/all</code>, <code>/node[0,2-4]</code>, <code>/swarm[alias]/idle</code>, <code>/swarm[alias]/all</code>, <code>/swarm[alias]/node[...]</code>.
+              </div>
             </div>
           </div>
         )}

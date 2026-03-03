@@ -58,11 +58,23 @@ export interface SwarmRecord {
   node_count: number
   status: string
   slurm_state?: string
+  known_exec_policies?: string[][]
   nodes: Record<number, NodeState>
+}
+
+export interface InterSwarmQueueItem {
+  queue_id: string
+  request_id?: string
+  source_swarm_id?: string
+  target_swarm_id: string
+  selector?: string
+  content?: string
+  created_at?: number
 }
 
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
+  interSwarmQueue: InterSwarmQueueItem[]
   pendingLaunches: Record<string, { alias: string }>
   selectedSwarm?: string
   pendingPrompt?: string
@@ -75,6 +87,7 @@ interface SwarmStore {
   addPendingLaunch: (request_id: string, alias: string) => void
   removePendingLaunch: (request_id: string) => void
   setSwarms: (swarms: any[]) => void
+  setInterSwarmQueue: (items: InterSwarmQueueItem[]) => void
   addOrUpdateSwarm: (swarm: SwarmRecord) => void
   removeSwarm: (swarm_id: string) => void
   selectSwarm: (swarm_id: string) => void
@@ -87,9 +100,31 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
   const pendingReasoningDeltas: Record<string, string[]> = {}
   const pendingReasoning: Record<string, string> = {}
   const pendingTaskComplete: Record<string, { content?: string }> = {}
+  const extractExecPolicyAmendment = (decision: unknown): string[] | undefined => {
+    if (!decision || typeof decision !== 'object') return undefined
+    const d = decision as Record<string, any>
+    const approvedAmendment = d.approved_execpolicy_amendment
+    if (
+      approvedAmendment &&
+      typeof approvedAmendment === 'object' &&
+      Array.isArray(approvedAmendment.proposed_execpolicy_amendment)
+    ) {
+      return approvedAmendment.proposed_execpolicy_amendment
+    }
+    const acceptAmendment = d.acceptWithExecpolicyAmendment
+    if (
+      acceptAmendment &&
+      typeof acceptAmendment === 'object' &&
+      Array.isArray(acceptAmendment.execpolicy_amendment)
+    ) {
+      return acceptAmendment.execpolicy_amendment
+    }
+    return undefined
+  }
 
   return {
     swarms: {},
+    interSwarmQueue: [],
     pendingLaunches: {},
     selectedSwarm: undefined,
     pendingPrompt: undefined,
@@ -103,6 +138,8 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
       })),
     setPendingPrompt: (prompt: string) => set({ pendingPrompt: prompt }),
+    setInterSwarmQueue: (items: InterSwarmQueueItem[]) =>
+      set({ interSwarmQueue: Array.isArray(items) ? items : [] }),
     setLaunchError: (message: string) => set({ launchError: message }),
     clearLaunchError: () => set({ launchError: null }),
     addPendingLaunch: (request_id: string, alias: string) =>
@@ -142,6 +179,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
             updated[s.swarm_id] = {
               ...s,
+              known_exec_policies: [],
               nodes
             }
           }
@@ -174,7 +212,10 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           swarms: {
             ...state.swarms,
             [swarm.swarm_id]: {
+              ...existing,
               ...swarm,
+              known_exec_policies:
+                swarm.known_exec_policies ?? existing?.known_exec_policies ?? [],
               nodes
             }
           }
@@ -231,6 +272,37 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           ...swarm,
           status: payload.status,
           slurm_state: payload.slurm_state
+        })
+      }
+
+      if (type === 'queue_updated') {
+        get().setInterSwarmQueue(payload?.items ?? [])
+      }
+
+      if (type === 'thread_status') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+
+        // Fallback for missing turn_complete/task_complete events: when a thread
+        // is idle, ensure no node stays in a perpetual working state.
+        if (payload.status?.type !== 'idle') return
+
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const updatedTurns = node.turns.map((t) =>
+          t.phase === 'streaming' || t.phase === 'executing'
+            ? ({ ...t, phase: 'completed' } as NodeTurn)
+            : t
+        )
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: { ...node, turns: capTurns(updatedTurns) }
+          }
         })
       }
 
@@ -587,6 +659,16 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!swarm) return
 
         const updatedNodes = { ...swarm.nodes }
+        const currentPolicies = swarm.known_exec_policies ?? []
+        const newAmendment = payload.approved
+          ? extractExecPolicyAmendment(payload.decision)
+          : undefined
+        const hasPolicy = Array.isArray(newAmendment) && newAmendment.length > 0
+        const keyOf = (rule: string[]) => JSON.stringify(rule)
+        const policySeen = new Set(currentPolicies.map((p) => keyOf(p)))
+        const nextPolicies = hasPolicy && !policySeen.has(keyOf(newAmendment as string[]))
+          ? [...currentPolicies, newAmendment as string[]]
+          : currentPolicies
 
         for (const nodeKey of Object.keys(updatedNodes)) {
           const node = updatedNodes[Number(nodeKey)]
@@ -607,6 +689,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
 
         get().addOrUpdateSwarm({
           ...swarm,
+          known_exec_policies: nextPolicies,
           nodes: updatedNodes
         })
       }

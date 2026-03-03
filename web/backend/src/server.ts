@@ -26,6 +26,7 @@ const pendingAliases: Record<string, string | undefined> = {};
 
 // Track request_id -> swarm_id for status/inject/terminate
 const requestSwarmMap: Record<string, string> = {};
+let interSwarmQueueItems: any[] = [];
 
 // --- Helper: request swarm status ---
 function requestStatus(swarm_id: string) {
@@ -90,6 +91,11 @@ router.on('event', (msg: any) => {
     delete requestSwarmMap[data.request_id];
     hub.broadcast({ type: 'command_rejected', payload: data });
     return;
+  }
+
+  if (event === 'queue_updated') {
+    interSwarmQueueItems = Array.isArray(data?.items) ? data.items : [];
+    // Continue with generic passthrough below.
   }
 
   // --- Generic passthrough for all other router events ---
@@ -184,10 +190,47 @@ app.post('/inject/:alias', (req, res) => {
   const swarm = state.getByAlias(req.params.alias);
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
 
-  const { prompt, nodes } = req.body;
+  const { prompt, nodes, target_alias, selector } = req.body;
 
   if (!prompt || typeof prompt !== 'string') {
     return res.status(400).json({ error: 'Invalid prompt' });
+  }
+
+  // Cross-swarm routing mode: frontend can request that prompt be delivered
+  // to another swarm with selector semantics (e.g. first idle node).
+  if (typeof target_alias === 'string' && target_alias.trim()) {
+    const targetSwarm = state.getByAlias(target_alias);
+    if (!targetSwarm) return res.status(404).json({ error: 'Unknown target swarm' });
+
+    const mode = typeof selector === 'string' ? selector : 'idle';
+
+    if (mode === 'idle' || mode === 'first-idle') {
+      const request_id = router.send('enqueue_inject', {
+        source_swarm_id: swarm.swarm_id,
+        target_swarm_id: targetSwarm.swarm_id,
+        selector: 'idle',
+        content: prompt
+      });
+      requestSwarmMap[request_id] = targetSwarm.swarm_id;
+      return res.json({ request_id });
+    }
+
+    const targets: number[] = Array.isArray(nodes)
+      ? nodes
+          .map((n: any) => Number(n))
+          .filter((n: number) => !isNaN(n) && n >= 0 && n < targetSwarm.node_count)
+      : Array.from({ length: targetSwarm.node_count }, (_, i) => i);
+
+    const payloadTargets =
+      targets.length === targetSwarm.node_count ? 'all' : targets;
+
+    const request_id = router.send('inject', {
+      swarm_id: targetSwarm.swarm_id,
+      nodes: payloadTargets,
+      content: prompt
+    });
+    requestSwarmMap[request_id] = targetSwarm.swarm_id;
+    return res.json({ request_id });
   }
 
   const targets: number[] = Array.isArray(nodes)
@@ -224,6 +267,10 @@ app.get('/swarms', (req, res) => {
   res.json(state.list());
 });
 
+app.get('/queue', (req, res) => {
+  res.json(interSwarmQueueItems);
+});
+
 app.post('/approval', (req, res) => {
   const { job_id, call_id, approved, decision } = req.body;
 
@@ -256,6 +303,7 @@ async function connectWithRetry() {
 
       // Initial reconciliation
       router.send('swarm_list', {});
+      router.send('queue_list', {});
 
       break;
     } catch (err) {

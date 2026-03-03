@@ -194,6 +194,64 @@ Data:
 - `request_id`
 - `swarm_id`
 
+### 3.7 `enqueue_inject`
+
+Payload:
+
+```json
+{
+  "source_swarm_id": "...",
+  "target_swarm_id": "...",
+  "selector": "idle|all|nodes",
+  "nodes": [0, 2],
+  "content": "..."
+}
+```
+
+Behavior:
+
+- `selector = "idle"`: enqueue prompt and dispatch to first idle node in target swarm.
+- `selector = "all"`: immediate fanout to all nodes in target swarm.
+- `selector = "nodes"`: immediate inject to provided node list.
+
+Result events:
+
+- `inter_swarm_enqueued`
+- `inter_swarm_dispatched`
+- `inter_swarm_blocked`
+- `inter_swarm_dropped`
+
+### 3.8 `queue_list`
+
+Payload:
+
+```json
+{}
+```
+
+Result event:
+
+- `queue_list`
+
+Data:
+
+```json
+{
+  "request_id": "...",
+  "items": [
+    {
+      "queue_id": "...",
+      "request_id": "...",
+      "source_swarm_id": "...",
+      "target_swarm_id": "...",
+      "selector": "idle",
+      "content": "...",
+      "created_at": 0
+    }
+  ]
+}
+```
+
 ## 4. Worker event normalization
 
 Router consumes worker outbox `codex_rpc` messages and emits normalized events.
@@ -268,4 +326,3 @@ Example:
 
 - clients must ignore unknown fields and events
 - protocol string changes for breaking revisions
-
