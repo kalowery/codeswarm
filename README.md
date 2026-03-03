@@ -7,6 +7,18 @@ Codeswarm is a provider-agnostic execution system for orchestrating multi-node C
 
 It provides a router control plane, a backend API/WebSocket bridge, and a Next.js frontend.
 
+## Install via curl | bash
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
+```
+
+Optional installer overrides:
+
+- `CODESWARM_REPO_URL`
+- `CODESWARM_BRANCH`
+- `CODESWARM_INSTALL_DIR` (default: `~/.codeswarm`)
+
 ## Quick Start (Local)
 
 1. Clone
