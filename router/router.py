@@ -835,6 +835,21 @@ def run_daemon(config, provider):
                                 }
                         return "accept" if approved_flag else "cancel"
 
+                    def _normalize_decision_for_available(d, approved_flag, available):
+                        """
+                        Normalize UI decision into one of the runtime-supported dialects:
+                        - accept/cancel (+ acceptWithExecpolicyAmendment)
+                        - approved/abort (+ approved_execpolicy_amendment)
+                        """
+                        has_accept_local = any(
+                            (isinstance(x, str) and x in ("accept", "cancel")) or
+                            (isinstance(x, dict) and "acceptWithExecpolicyAmendment" in x)
+                            for x in (available or [])
+                        )
+                        if has_accept_local:
+                            return _normalize_accept_decision(d, approved_flag)
+                        return _normalize_approved_decision(d, approved_flag)
+
                     has_accept = any(
                         (isinstance(d, str) and d in ("accept", "cancel")) or
                         (isinstance(d, dict) and "acceptWithExecpolicyAmendment" in d)
@@ -844,23 +859,29 @@ def run_daemon(config, provider):
                     if rpc_id is not None:
                         # JSON-RPC request-style approval (must send response with same id)
                         if has_accept:
-                            result_payload = _normalize_accept_decision(decision, bool(approved))
+                            normalized_decision = _normalize_accept_decision(decision, bool(approved))
                         else:
                             normalized = _normalize_approved_decision(decision, bool(approved))
                             # Request-style API expects accept/cancel naming.
                             if normalized == "approved":
-                                result_payload = "accept"
+                                normalized_decision = "accept"
                             elif normalized == "abort":
-                                result_payload = "cancel"
+                                normalized_decision = "cancel"
                             elif isinstance(normalized, dict):
                                 amendment = _extract_amendment_from_decision(normalized)
-                                result_payload = {
+                                normalized_decision = {
                                     "acceptWithExecpolicyAmendment": {
                                         "execpolicy_amendment": amendment or []
                                     }
                                 }
                             else:
-                                result_payload = "accept" if bool(approved) else "cancel"
+                                normalized_decision = "accept" if bool(approved) else "cancel"
+
+                        # Newer app-server expects an object with explicit `decision`.
+                        result_payload = {
+                            "decision": normalized_decision,
+                            "approved": bool(approved),
+                        }
 
                         control_payload = {
                             "type": "rpc_response",
@@ -869,18 +890,33 @@ def run_daemon(config, provider):
                         }
                     else:
                         # Notification-style approval
-                        normalized = _normalize_approved_decision(decision, bool(approved))
+                        normalized = _normalize_decision_for_available(
+                            decision,
+                            bool(approved),
+                            available_decisions,
+                        )
                         params_payload = {
                             "call_id": call_id,
+                            "callId": call_id,
                             "approved": bool(approved),
                         }
+                        # Always include explicit decision token/object for compatibility.
                         if normalized == "approved":
                             params_payload["approved"] = True
+                            params_payload["decision"] = "approved"
                         elif normalized == "abort":
                             params_payload["approved"] = False
+                            params_payload["decision"] = "abort"
+                        elif normalized == "accept":
+                            params_payload["approved"] = True
+                            params_payload["decision"] = "accept"
+                        elif normalized == "cancel":
+                            params_payload["approved"] = False
+                            params_payload["decision"] = "cancel"
                         elif isinstance(normalized, dict):
                             params_payload.update(normalized)
                             params_payload["approved"] = True
+                            params_payload["decision"] = normalized
 
                         control_payload = {
                             "method": "exec/approvalResponse",

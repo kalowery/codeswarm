@@ -233,6 +233,11 @@ def main():
                             result = msg["result"]
                             if isinstance(result.get("thread"), dict) and "id" in result["thread"]:
                                 thread_id = result["thread"]["id"]
+                        # Fallback: some app-server flows emit thread status before/without thread/start response.
+                        if not thread_id and msg.get("method") == "thread/status/changed":
+                            params = msg.get("params")
+                            if isinstance(params, dict) and isinstance(params.get("threadId"), str):
+                                thread_id = params["threadId"]
 
                     except Exception as e:
                         write_event(outbox, {
