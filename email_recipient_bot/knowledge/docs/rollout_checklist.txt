@@ -1,7 +1,0 @@
-Rollout Checklist
-
-- Confirm API rate limits with vendor.
-- Validate SMS sender registration before launch.
-- Verify on-call escalation contacts are current.
-
-This checklist is relevant to deployment-readiness and launch coordination emails.
