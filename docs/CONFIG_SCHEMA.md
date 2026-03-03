@@ -1,118 +1,101 @@
 # Codeswarm Configuration Schema
 
-This document defines the configuration structure currently expected by the router and Slurm provider implementation.
+This document reflects the configuration keys currently used by router and providers.
 
----
-
-# 1. Top-Level Structure
+## Top-level structure
 
 ```json
 {
-  "ssh": { ... },
   "cluster": { ... },
+  "ssh": { ... },
   "router": { ... }
 }
 ```
 
----
+`ssh` is required for `slurm` backend and optional for `local` backend.
 
-# 2. SSH Section
+## `cluster`
 
-```json
-{
-  "ssh": {
-    "login_alias": "hpcfund"
-  }
-}
-```
+### Required
 
-## Fields
+- `cluster.backend`: `"local"` or `"slurm"`
 
-### login_alias
+### Local backend (`cluster.backend = "local"`)
 
-Required.
+- `cluster.workspace_root` (optional, default: `runs`)
+- `cluster.archive_root` (optional)
 
-SSH host alias used for:
-- Slurm job submission
-- squeue queries
-- scancel
-- Remote outbox follower
-
-This must correspond to a valid SSH configuration entry (e.g., in `~/.ssh/config`).
-
----
-
-# 3. Cluster Section
+Example:
 
 ```json
 {
   "cluster": {
-    "workspace_root": "/path/on/cluster",
-    "cluster_subdir": "codeswarm",
+    "backend": "local",
+    "workspace_root": "runs",
+    "archive_root": "/tmp/archives"
+  }
+}
+```
 
+### Slurm backend (`cluster.backend = "slurm"`)
+
+Required:
+
+- `cluster.workspace_root`
+- `cluster.cluster_subdir`
+- `cluster.slurm.partition`
+- `cluster.slurm.time_limit`
+- `ssh.login_alias`
+
+Optional:
+
+- `cluster.slurm.account`
+- `cluster.slurm.qos`
+
+Example:
+
+```json
+{
+  "cluster": {
+    "backend": "slurm",
+    "workspace_root": "/path/to/workspace",
+    "cluster_subdir": "codeswarm",
     "slurm": {
       "partition": "compute",
       "time_limit": "00:20:00",
       "account": null,
       "qos": null
     }
+  },
+  "ssh": {
+    "login_alias": "my-cluster"
   }
 }
 ```
 
-## Fields
+## `ssh`
 
-### workspace_root
+### `ssh.login_alias`
 
-Base directory on the shared cluster filesystem.
+Required for slurm backend. Used for:
 
-### cluster_subdir
+- `squeue` state checks
+- `scancel` termination
+- remote inbox writes
+- remote outbox follower launch
 
-Subdirectory under `workspace_root` containing Codeswarm runtime files.
+Other `ssh.*` keys may exist (for operator use), but current router/provider code only consumes `login_alias`.
 
-### slurm.partition
+## `router`
 
-Required. Slurm partition used for job allocation.
+`router` section is currently optional and not enforced by the active router code path.
 
-### slurm.time_limit
+`router.*` values may exist in configs for future use and are ignored unless consumed by newer code.
 
-Required. Slurm time limit (HH:MM:SS).
+## Validation behavior
 
-### slurm.account
+Validation is performed by `common/config.py`:
 
-Optional. Slurm account string.
+- missing required fields for selected backend raise runtime errors
+- unsupported `cluster.backend` raises runtime error
 
-### slurm.qos
-
-Optional. Slurm QoS string.
-
----
-
-# 4. Router Section
-
-```json
-{
-  "router": {
-    "inject_timeout_seconds": 60
-  }
-}
-```
-
-## Fields
-
-### inject_timeout_seconds
-
-Maximum time the router waits for an injection to complete before emitting an `inject_failed` event.
-
----
-
-# 5. Invariants
-
-- SSH configuration must allow passwordless login.
-- Login node and compute nodes must share a filesystem.
-- Router state is persisted to `router_state.json`.
-- Slurm job discovery during router startup uses `squeue` over SSH.
-
----
-
-End of Configuration Schema Document.

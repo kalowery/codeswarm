@@ -1,408 +1,271 @@
 # Codeswarm Router Protocol Specification
 
-Version: `codeswarm.router.v1`  
-Date: 2026‑02‑25
+Version: `codeswarm.router.v1`
 
----
+## 1. Transport and framing
 
-# 1. Overview
+- Router listens on `127.0.0.1:8765`
+- UTF-8 JSON Lines over TCP
+- one JSON object per `\n`
 
-`codeswarm.router.v1` defines the JSON-line control protocol between:
+## 2. Message envelopes
 
-- Client (CLI, Web UI, OpenClaw adapter)
-- Router (Python daemon)
-
-Transport:
-
-- TCP
-- Bound to `127.0.0.1:8765`
-- JSON Lines (one JSON object per line, newline-delimited)
-
-The router is the authoritative control-plane boundary.
-
----
-
-# 2. Transport Layer
-
-## 2.1 Connection
-
-- Client initiates TCP connection.
-- Router accepts multiple concurrent clients.
-- Each connection is independent.
-- Router broadcasts events to all connected clients.
-
-## 2.2 Framing
-
-- UTF‑8 encoded
-- One JSON object per line
-- Delimited by `\n`
-- No multi-line JSON
-- Partial frames must be buffered by client
-
-Example:
-
-```
-{"protocol":"codeswarm.router.v1",...}\n
-{"protocol":"codeswarm.router.v1",...}\n
-```
-
----
-
-# 3. Envelope Structure
-
-All protocol messages must contain:
+### Command (client -> router)
 
 ```json
 {
   "protocol": "codeswarm.router.v1",
-  ...
-}
-```
-
-Invalid or missing protocol fields are ignored.
-
----
-
-# 4. Command Messages (Client → Router)
-
-Structure:
-
-```json
-{
-  "protocol": "codeswarm.router.v1",
+  "type": "command",
   "command": "<string>",
-  "request_id": "<uuid>",
+  "request_id": "<string>",
   "payload": { ... }
 }
 ```
 
-## 4.1 Fields
-
-| Field        | Type   | Required | Description |
-|-------------|--------|----------|------------|
-| protocol    | string | yes      | Must equal `codeswarm.router.v1` |
-| command     | string | yes      | Command name |
-| request_id  | string | yes      | Client-generated UUID |
-| payload     | object | yes      | Command-specific data |
-
----
-
-# 5. Event Messages (Router → Client)
-
-Structure:
+### Event (router -> client)
 
 ```json
 {
   "protocol": "codeswarm.router.v1",
   "type": "event",
-  "timestamp": "<ISO8601>",
-  "event": "<event_name>",
+  "timestamp": "<ISO8601 UTC>",
+  "event": "<string>",
   "data": { ... }
 }
 ```
 
-## 5.1 Fields
+## 3. Command set
 
-| Field     | Type   | Description |
-|----------|--------|------------|
-| protocol | string | Version |
-| type     | string | Always `"event"` |
-| timestamp| string | ISO8601 UTC |
-| event    | string | Event name |
-| data     | object | Event payload |
+### 3.1 `swarm_launch`
 
----
-
-# 6. Commands
-
----
-
-## 6.1 swarm_launch
-
-### Request
+Payload:
 
 ```json
 {
-  "protocol": "codeswarm.router.v1",
-  "command": "swarm_launch",
-  "request_id": "uuid",
-  "payload": {
-    "nodes": 4,
-    "partition": "mi2508x",
-    "time": "00:10:00",
-    "account": "optional",
-    "qos": "optional",
-    "system_prompt": "..."
-  }
+  "nodes": 4,
+  "system_prompt": "..."
 }
 ```
 
-### Response Event
+Result event:
+
+- `swarm_launched`
+
+Data fields:
+
+- `request_id`
+- `swarm_id`
+- `job_id`
+- `node_count`
+
+Notes:
+
+- provider-specific launch parameters come from config, not command payload.
+- router immediately injects `system_prompt` to each node.
+
+### 3.2 `inject`
+
+Payload:
 
 ```json
 {
-  "event": "swarm_launched",
-  "data": {
-    "request_id": "...",
-    "swarm_id": "...",
-    "job_id": "...",
-    "node_count": 4,
-    "partition": "mi2508x",
-    "time": "00:10:00"
-  }
+  "swarm_id": "...",
+  "nodes": "all" | 0 | [0,1],
+  "content": "..."
 }
 ```
 
-### Errors
-
-```json
-{
-  "event": "command_rejected",
-  "data": {
-    "request_id": "...",
-    "reason": "partition is required"
-  }
-}
-```
-
----
-
-## 6.2 inject
-
-### Request
-
-```json
-{
-  "protocol": "codeswarm.router.v1",
-  "command": "inject",
-  "request_id": "uuid",
-  "payload": {
-    "swarm_id": "...",
-    "nodes": "all",
-    "content": "..."
-  }
-}
-```
-
-`nodes` may be:
-
-- `"all"`
-- integer
-- list of integers
-
-### Event Sequence
+Lifecycle events per target node:
 
 1. `inject_ack`
-2. `inject_delivered` OR `inject_failed`
+2. `inject_delivered` or `inject_failed`
 
-Example:
+### 3.3 `swarm_list`
+
+Payload:
+
+```json
+{}
+```
+
+Result event: `swarm_list`
+
+Data:
 
 ```json
 {
-  "event": "inject_ack",
-  "data": {
-    "request_id": "...",
-    "swarm_id": "...",
-    "injection_id": "...",
-    "node_id": 0
+  "request_id": "...",
+  "swarms": {
+    "<swarm_id>": {
+      "job_id": "...",
+      "node_count": 1,
+      "system_prompt": "...",
+      "status": "running|terminated",
+      "backend": "local|slurm",
+      "terminated_at": 0
+    }
   }
 }
 ```
 
----
+### 3.4 `swarm_status`
 
-## 6.3 swarm_list
+Payload:
 
-### Request
+```json
+{ "swarm_id": "..." }
+```
+
+Result event: `swarm_status`
+
+Data (success):
+
+- `request_id`
+- `swarm_id`
+- `job_id`
+- `node_count`
+- `status` (`running` or `terminated`)
+
+Data (error path):
+
+- `request_id`
+- `swarm_id`
+- `error`
+
+### 3.5 `approve_execution`
+
+Payload:
 
 ```json
 {
-  "command": "swarm_list",
-  ...
+  "job_id": "...",
+  "call_id": "...",
+  "approved": true,
+  "decision": "approved|abort|accept|cancel|..."
 }
 ```
 
-### Response
+`decision` may also be an object carrying execution-policy amendment, e.g.:
 
 ```json
 {
-  "event": "swarm_list",
-  "data": {
-    "request_id": "...",
-    "swarms": { ... }
+  "approved_execpolicy_amendment": {
+    "proposed_execpolicy_amendment": ["..."]
   }
 }
 ```
 
----
-
-## 6.4 swarm_status
-
-### Request
+or
 
 ```json
 {
-  "command": "swarm_status",
-  "payload": {
-    "swarm_id": "..."
+  "acceptWithExecpolicyAmendment": {
+    "execpolicy_amendment": ["..."]
   }
 }
 ```
 
-### Response
+Result event:
+
+- `exec_approval_resolved`
+
+Data:
+
+- `request_id`
+- `job_id`
+- `call_id`
+- `approved`
+- `decision`
+
+If `(job_id, call_id)` is unknown, router emits `command_rejected`.
+
+### 3.6 `swarm_terminate`
+
+Payload:
 
 ```json
-{
-  "event": "swarm_status",
-  "data": {
-    "request_id": "...",
-    "swarm_id": "...",
-    "job_id": "...",
-    "node_count": 4,
-    "status": "running",
-    "slurm_state": "RUNNING"
-  }
-}
+{ "swarm_id": "..." }
 ```
 
----
+Result event: `swarm_terminated`
 
-## 6.5 swarm_terminate
+Data:
 
-### Request
+- `request_id`
+- `swarm_id`
 
-```json
-{
-  "command": "swarm_terminate",
-  "payload": {
-    "swarm_id": "..."
-  }
-}
-```
+## 4. Worker event normalization
 
-### Response
+Router consumes worker outbox `codex_rpc` messages and emits normalized events.
 
-```json
-{
-  "event": "swarm_terminated",
-  "data": {
-    "request_id": "...",
-    "swarm_id": "..."
-  }
-}
-```
+### 4.1 Conversation events
 
----
+- `turn/started` -> `turn_started`
+- `codex/event/agent_message_content_delta` -> `assistant_delta`
+- `codex/event/agent_message` -> `assistant`
+- `turn/completed` -> `turn_complete`
+- token usage updates -> `usage`
 
-# 7. Streaming Runtime Events
+### 4.2 Reasoning and task events
 
-These events originate from worker nodes.
+- `codex/event/agent_reasoning_delta` -> `reasoning_delta`
+- `codex/event/agent_reasoning` -> `reasoning`
+- `codex/event/task_started` -> `task_started`
+- `codex/event/task_complete` -> `task_complete`
 
-All include:
+### 4.3 Command execution and approval
+
+- `codex/event/exec_approval_request`
+- `item/commandExecution/requestApproval`
+
+both normalize to `exec_approval_required` with fields such as:
+
+- `call_id`
+- `command`
+- `reason`
+- `cwd`
+- `proposed_execpolicy_amendment`
+- `available_decisions`
+
+Router also caches approval metadata to route later `approve_execution` control messages.
+
+Other execution events:
+
+- `codex/event/exec_command_begin` -> `command_started`
+- `codex/event/exec_command_end` -> `command_completed`
+
+### 4.4 Error events
+
+- `codex/event/error` -> `agent_error`
+- `error` -> `agent_error`
+
+## 5. Common data fields in runtime events
+
+Most translated runtime events include:
 
 - `swarm_id`
 - `job_id`
 - `node_id`
 - `injection_id`
 
----
+## 6. Error handling
 
-## 7.1 turn_started
+Router emits `command_rejected` for invalid command targets or processing errors.
 
-```json
-{
-  "event": "turn_started",
-  "data": { ... }
-}
-```
-
----
-
-## 7.2 assistant_delta
-
-Streaming partial token output:
+Example:
 
 ```json
 {
-  "event": "assistant_delta",
+  "event": "command_rejected",
   "data": {
-    "content": "partial text"
+    "request_id": "...",
+    "reason": "unknown swarm_id"
   }
 }
 ```
 
----
+## 7. Compatibility guidance
 
-## 7.3 assistant
+- clients must ignore unknown fields and events
+- protocol string changes for breaking revisions
 
-Final message:
-
-```json
-{
-  "event": "assistant",
-  "data": {
-    "content": "full message"
-  }
-}
-```
-
----
-
-## 7.4 turn_complete
-
-Signals completion of a turn.
-
----
-
-## 7.5 usage
-
-Token accounting:
-
-```json
-{
-  "event": "usage",
-  "data": {
-    "total_tokens": 1234
-  }
-}
-```
-
----
-
-# 8. Concurrency Guarantees
-
-- Router never blocks main loop.
-- Slurm calls run in background threads.
-- Injection runs asynchronously.
-- Follower streaming is non-blocking.
-- TCP clients may connect/disconnect at any time.
-
----
-
-# 9. Error Handling
-
-- Invalid JSON → ignored.
-- Invalid protocol → ignored.
-- Unknown swarm → `command_rejected`.
-- SSH failure → `inject_failed`.
-- Slurm query timeout → timeout-based response.
-
----
-
-# 10. Stability Guarantees
-
-- Router restart safe via `router_state.json`.
-- Slurm reconciliation on startup.
-- No reliance on stdio.
-- Deterministic TCP framing.
-- Versioned protocol boundary.
-
----
-
-# 11. Future Compatibility
-
-Future versions must:
-
-- Change `protocol` string.
-- Maintain backward compatibility layer if needed.
-- Avoid breaking envelope structure.

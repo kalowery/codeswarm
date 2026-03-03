@@ -1,172 +1,109 @@
 # Provider Interface
 
-Codeswarm uses a provider abstraction to isolate cluster-specific behavior from the Router control plane.
+Codeswarm router is provider-agnostic and delegates backend-specific behavior to `ClusterProvider` implementations.
 
-The Router interacts only with the Provider interface and must not contain any SSH or Slurm-specific logic.
+Current implementations:
 
----
+- `router/providers/local_provider.py` (`LocalProvider`)
+- `router/cluster/slurm.py` (`SlurmProvider`)
 
-# 1. Provider Contract
+## 1. Core provider contract
 
-A provider must implement the following methods:
+`ClusterProvider` (`router/cluster/base.py`) defines:
 
 ```python
-class Provider:
-    def launch(self, swarm_id, node_count, system_prompt):
-        pass
-
-    def inject(self, job_id, node_id, injection_id, content):
-        pass
-
-    def terminate(self, job_id):
-        pass
-
-    def get_job_state(self, job_id):
-        pass
-
-    def archive(self, job_id, swarm_id):
-        pass
+class ClusterProvider(ABC):
+    def launch(self, nodes: int) -> str: ...
+    def terminate(self, job_id: str) -> None: ...
+    def get_job_state(self, job_id: str) -> Optional[str]: ...
+    def list_active_jobs(self) -> Dict[str, str]: ...
+    def start_follower(self) -> subprocess.Popen | None: ...
+    def inject(self, job_id: str, node_id: int, content: str, injection_id: str) -> None: ...
 ```
 
----
+In addition, current router behavior expects providers to expose:
 
-# 2. Responsibilities
+- `send_control(job_id, node_id, message)` for approval/control payload delivery
+- `archive(job_id, swarm_id)` for best-effort post-termination archival
 
-## 2.1 launch()
+Both local and slurm providers currently implement these methods.
 
-- Allocate execution resources
-- Start worker processes
-- Ensure CODESWARM_* environment variables are exported
-- Initialize mailbox directories
+## 2. Responsibilities
 
-Return value must include:
+### `launch(nodes)`
 
-- job_id
-- node_count
+- allocate/start workers
+- return backend `job_id`
 
----
+### `inject(job_id, node_id, content, injection_id)`
 
-## 2.2 inject()
-
-- Write JSONL entry to worker inbox
-
-Inbox format:
+Append user message to per-node inbox as JSON line:
 
 ```json
 {
-  "injection_id": "uuid",
-  "content": "prompt text"
+  "type": "user",
+  "content": "prompt text",
+  "injection_id": "uuid"
 }
 ```
 
-Provider must write to:
+### `send_control(job_id, node_id, message)`
 
-```
-mailbox/inbox/<job_id>_<node>.jsonl
-```
+Append control message to per-node inbox:
 
----
-
-## 2.3 terminate()
-
-Terminate the job associated with job_id.
-
-Local provider:
-- Kill subprocesses
-
-Slurm provider:
-- `scancel` via SSH
-
-The Router does not implement termination logic.
-
----
-
-## 2.4 get_job_state()
-
-Return current job state.
-
-Return:
-- Truthy value if running
-- Falsy if terminated or unknown
-
-Router uses this to reconcile swarm status.
-
----
-
-## 2.5 archive()
-
-Optional best-effort archival hook.
-
-Used to:
-- Clean up resources
-- Persist logs
-- Perform provider-specific post-processing
-
----
-
-# 3. Worker Environment Contract
-
-Providers must export:
-
-```
-CODESWARM_JOB_ID
-CODESWARM_NODE_ID
-CODESWARM_BASE_DIR
-CODESWARM_CODEX_BIN (optional)
+```json
+{
+  "type": "control",
+  "payload": { ... }
+}
 ```
 
-Workers must not rely on:
+Used for execution approval responses and other control-plane actions.
 
-- SLURM_*
-- SSH configuration
-- cluster-specific variables
+### `start_follower()`
 
----
+Return process that streams worker outbox events on stdout as JSON lines.
 
-# 4. Local Provider
+### `get_job_state(job_id)` and `list_active_jobs()`
 
-Execution model:
+Used for swarm status and startup reconciliation.
 
-- Spawn subprocess per node
-- Launch `codex_worker.py`
-- Codex must be globally installed
+### `terminate(job_id)`
 
-Mailbox root:
+Terminate backend job/processes.
 
-```
-runs/mailbox/
-```
+### `archive(job_id, swarm_id)`
 
----
+Best-effort cleanup/archive hook after termination.
 
-# 5. Slurm Provider
+## 3. Mailbox conventions
 
-Execution model:
+### Local backend
 
-- SSH to login node
-- Submit SBATCH script
-- Use `srun` to launch workers
-- Export CODESWARM_* variables
+Mailbox under `<workspace_root>/mailbox` (default `runs/mailbox`):
 
-Mailbox root:
+- `inbox/<job_id>_<node>.jsonl`
+- `outbox/...`
 
-```
-<workspace>/<cluster_subdir>/mailbox/
-```
+### Slurm backend
 
----
+Mailbox under `<workspace_root>/<cluster_subdir>/mailbox`:
 
-# 6. Abstraction Guarantees
+- `inbox/<job_id>_<node>.jsonl`
+- `outbox/...`
 
-Router:
+## 4. Worker environment contract
 
-- Does not know about SSH
-- Does not know about Slurm
-- Delegates all backend-specific behavior
+Providers should set:
 
-Providers:
+- `CODESWARM_JOB_ID`
+- `CODESWARM_NODE_ID`
+- `CODESWARM_BASE_DIR`
+- `CODESWARM_CODEX_BIN` (optional)
 
-- Encapsulate all cluster semantics
-- Implement job lifecycle
+Workers should not depend on Slurm-specific env vars for control-plane behavior.
 
-This separation enables future providers (e.g., Kubernetes) without router modification.
+## 5. Design guarantees
+
+Router remains free of backend-specific mechanics (SSH/Slurm details live in providers), enabling additional providers without router command-protocol changes.
+

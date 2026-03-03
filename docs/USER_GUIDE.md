@@ -1,183 +1,133 @@
 # Codeswarm User Guide
 
-This guide explains how to run and use Codeswarm in both Local and Slurm modes.
+This guide describes day-to-day usage of the current router + backend + frontend stack.
 
----
+## 1. Start the system
 
-# 1. Running Codeswarm
-
-## 1.1 Local Mode (Single Machine)
-
-Local mode runs workers as subprocesses on your machine.
-
-### Requirements
-
-- `codex` installed globally
-- Authenticated Codex session
-
-Authenticate:
+### Option A: One command (recommended)
 
 ```bash
-printenv OPENAI_API_KEY | codex login --with-api-key
+codeswarm web --config configs/local.json
 ```
 
-Start router:
+or for Slurm:
 
 ```bash
-python -m router.router --config configs/local.json --daemon
+codeswarm web --config configs/hpcfund.json
 ```
 
-Then start backend + frontend.
+### Option B: Run services manually
 
-Mailbox directory:
-
-```
-runs/mailbox/
-```
-
----
-
-## 1.2 Slurm Mode (HPC Cluster)
-
-Slurm mode runs workers on a cluster via SBATCH.
-
-### Requirements
-
-- SSH login alias configured
-- Slurm cluster access
-
-Start router:
+Router:
 
 ```bash
-python -m router.router --config configs/hpcfund.json --daemon
+python3 -u -m router.router --config configs/local.json --daemon
 ```
 
-Mailbox directory:
-
-```
-<workspace>/<cluster_subdir>/mailbox/
-```
-
----
-
-# 2. Swarms
-
-A swarm consists of:
-
-- 1–N nodes
-- Independent Codex workers
-- Shared swarm identity
-
-Each node runs in isolation.
-
----
-
-# 3. Injecting Prompts
-
-Use the input box at the bottom of the UI.
-
-## Default
-
-Sends prompt to active node.
-
-## Target All Nodes
-
-```
-/all your prompt here
-```
-
-## Target Specific Node
-
-```
-/node[3] your prompt here
-```
-
----
-
-# 4. Node Navigation (HPC Scale)
-
-The node selector supports:
-
-- Fixed-size node tabs
-- Horizontal scrolling
-- Left/right navigation arrows
-- No shrinking below readable width
-
-Works for 1–128+ nodes.
-
----
-
-# 5. Attention Indicators
-
-Codeswarm derives attention state automatically.
-
-A node shows a pulsing amber dot when:
-
-- Its last turn has completed
-- It is not the currently active node
-
-A swarm shows a pulsing indicator when:
-
-- Any node within it requires attention
-
-Indicators disappear automatically when you view the node.
-
----
-
-# 6. Streaming Output
-
-Each turn shows:
-
-- User prompt
-- Live reasoning (expandable)
-- Command executions
-- Assistant output
-- Token usage
-
-Streaming cursor indicates active generation.
-
----
-
-# 7. Terminating a Swarm
-
-Click "Terminate" in the swarm header.
-
-Local mode:
-- Kills subprocesses
-
-Slurm mode:
-- Issues `scancel` via provider
-
-Router handles termination uniformly across providers.
-
----
-
-# 8. Troubleshooting
-
-## Local: 401 Unauthorized
-
-Ensure Codex is authenticated:
+Backend:
 
 ```bash
-printenv OPENAI_API_KEY | codex login --with-api-key
+npm --prefix web/backend run dev
 ```
 
-## Slurm: Injection Fails
+Frontend:
 
-Ensure SSH login alias works and cluster access is valid.
+```bash
+npm --prefix web/frontend run dev
+```
 
----
+## 2. Modes
 
-# 9. Best Practices
+### Local mode
 
-- Use Local mode for development.
-- Use Slurm for large-scale swarms.
-- Keep node counts manageable for cognitive clarity.
-- Monitor attention indicators for human-in-the-loop tasks.
+- backend: `cluster.backend = "local"`
+- workers run as local subprocesses
+- mailbox under `runs/mailbox` by default
 
----
+### Slurm mode
 
-For architecture details, see:
+- backend: `cluster.backend = "slurm"`
+- requires `ssh.login_alias` and `cluster.slurm.*`
+- mailbox under `<workspace_root>/<cluster_subdir>/mailbox`
 
-- `ARCHITECTURE.md`
-- `PROVIDER_INTERFACE.md`
+## 3. Launch a swarm
+
+In UI:
+
+- provide alias
+- set node count
+- set system prompt
+- launch
+
+Router emits `swarm_launched`, then injects the system prompt to all nodes.
+
+## 4. Inject prompts
+
+UI supports:
+
+- active node injection (default)
+- all nodes: `/all your prompt`
+- specific node: `/node[3] your prompt`
+- multiple nodes/ranges: `/node[0,2-4] your prompt`
+
+Backend maps alias -> swarm_id and sends `inject` command to router.
+
+## 5. Approval flow for tool execution
+
+When Codex requests command approval, UI receives `exec_approval_required` and shows approval controls.
+
+Available actions depend on `available_decisions` from worker/runtime. UI can send:
+
+- allow / deny
+- allow with policy amendment when proposed amendments are present
+
+Backend forwards to router `/approval`, and router sends normalized control message to worker inbox.
+
+## 6. Runtime events visible in UI
+
+- turn lifecycle: `turn_started`, `turn_complete`
+- streaming text: `assistant_delta`, `assistant`
+- reasoning: `reasoning_delta`, `reasoning`
+- command execution: `command_started`, `command_completed`
+- approvals: `exec_approval_required`, `exec_approval_resolved`
+- token usage: `usage`
+- errors: `agent_error`, `command_rejected`
+
+## 7. Terminate a swarm
+
+Use the Terminate action in UI.
+
+Router sends `swarm_terminate`, provider terminates backend resources, and UI receives `swarm_removed`.
+
+## 8. Attention and navigation
+
+- node-level and swarm-level attention indicators pulse when unseen activity completes
+- node tabs are horizontally scrollable for large node counts
+
+## 9. Status and persistence notes
+
+- Router persists swarm registry in `router_state.json`.
+- Backend persists UI-facing swarm metadata in `web/backend/state.json`.
+- Router marks terminated swarms, then prunes them by TTL/cap (`swarm_removed`).
+
+## 10. Troubleshooting
+
+### Codex authentication
+
+```bash
+codex login
+```
+
+### Codex write failures / repeated approval prompts
+
+Set Codex to workspace-write and disable internal approval prompts so Codeswarm approval flow remains authoritative.
+
+### Router connectivity
+
+Ensure router is running on `127.0.0.1:8765` and backend can connect.
+
+### Frontend build sanity check
+
+```bash
+npm --workspace=web/frontend run build
+```

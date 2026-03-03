@@ -1,57 +1,32 @@
 # Codeswarm
 
-Codeswarm is a distributed, provider-agnostic execution system for running coordinated Codex workers across either:
+Codeswarm is a provider-agnostic execution system for orchestrating multi-node Codex workers on:
 
-- **Local processes** (single machine development mode)
-- **Slurm clusters** (HPC production mode)
+- Local processes (single machine)
+- Slurm clusters (HPC)
 
-It provides a real-time, event-driven web UI for orchestrating multi-node AI swarms with durable state, streaming output, and clean backend abstraction.
+It provides a router control plane, a backend API/WebSocket bridge, and a Next.js frontend.
 
----
+## Quick Start (Local)
 
-# 🚀 Quick Start (Local Mode)
-
-Codeswarm supports a one-command bootstrap setup.
-
-## 1. Clone
+1. Clone
 
 ```bash
 git clone https://github.com/kalowery/codeswarm.git
 cd codeswarm
 ```
 
-## 2. Bootstrap
+2. Bootstrap dependencies
 
 ```bash
 ./bootstrap.sh
 ```
 
-Bootstrap will:
+Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, and verifies Codex CLI login.
 
-- Install `nvm` if missing
-- Install Node.js 24.13.0
-- Install all dependencies (root, backend, frontend)
-- Build the frontend
-- Verify Codex CLI is installed
-- Verify Codex CLI is authenticated
+3. Use local config
 
-If Codex is not installed:
-
-```bash
-npm install -g @openai/codex
-```
-
-If Codex is not logged in:
-
-```bash
-codex login
-```
-
----
-
-## 3. Create a Local Config
-
-Create a file named `local.json` in the repo root:
+`configs/local.json` already exists and uses local backend:
 
 ```json
 {
@@ -63,519 +38,124 @@ Create a file named `local.json` in the repo root:
 }
 ```
 
----
-
-## 4. Launch the Web UI
+4. Start the full web stack
 
 ```bash
-npx codeswarm web --config local.json
+codeswarm web --config configs/local.json
 ```
 
----
+This starts:
 
-# 🛠 Troubleshooting
+- Router on `127.0.0.1:8765`
+- Backend on `http://localhost:4000`
+- Frontend on `http://localhost:3000`
 
-## ❌ Codex CLI not installed
+You can also run components manually:
+
+```bash
+python3 -u -m router.router --config configs/local.json --daemon
+npm --prefix web/backend run dev
+npm --prefix web/frontend run dev
+```
+
+## Codex Sandbox and Approval
+
+Codeswarm handles execution approval in its own UI/router flow (`exec_approval_required` -> `/approval` -> router `approve_execution`).
+
+To avoid conflicting prompts and write failures, configure Codex for workspace writes and no internal approval gate:
+
+```toml
+sandbox = "workspace-write"
+approvalPolicy = "never"
+```
+
+Equivalent CLI flags:
+
+```bash
+codex --sandbox workspace-write --ask-for-approval never
+```
+
+If Codex is left in read-only or on-request modes, commands may execute inconsistently or fail to write files.
+
+## Architecture
+
+```mermaid
+flowchart TD
+    UI[Frontend Next.js] -->|WebSocket| BE[Backend Express]
+    BE -->|TCP codeswarm.router.v1| RT[Router]
+    RT --> PR[Provider Interface]
+    PR -->|local| LP[LocalProvider]
+    PR -->|slurm| SP[SlurmProvider]
+    LP --> WK[Workers]
+    SP --> WK
+    WK --> MB[Mailbox JSONL]
+    MB --> RT
+```
+
+Core principles:
+
+- Provider abstraction: router is backend-neutral.
+- Event-sourced UI: frontend state derives from streamed events.
+- Mailbox contract: worker inbox/outbox JSONL files.
+- Durable control state: `router_state.json` and backend `state.json`.
+
+## Providers
+
+### Local
+
+- Spawns worker subprocesses.
+- Uses mailbox under `<workspace_root>/mailbox` (default `runs/mailbox`).
+- Optional archive move on terminate via `cluster.archive_root`.
+
+### Slurm
+
+- Submits jobs through `slurm/allocate_and_prepare.py`.
+- Uses SSH (`ssh.login_alias`) for `squeue`, `scancel`, inbox writes, and outbox follower.
+- Mailbox under `<workspace_root>/<cluster_subdir>/mailbox`.
+
+## Control Commands
+
+Router command set (protocol `codeswarm.router.v1`):
+
+- `swarm_launch`
+- `inject`
+- `swarm_list`
+- `swarm_status`
+- `approve_execution`
+- `swarm_terminate`
+
+## Troubleshooting
+
+### Codex not installed
 
 ```bash
 npm install -g @openai/codex
 ```
 
-## ❌ Codex CLI not logged in
+### Codex not logged in
 
 ```bash
 codex login
 ```
 
-## ❌ Node version mismatch
+### Router not reachable
 
-Codeswarm requires Node 24.13.0.
-
-```bash
-nvm install 24.13.0
-nvm use 24.13.0
-```
-
-## ❌ Long-running sessions slow down browser
-
-Codeswarm caps turn history at 300 turns per node to prevent unbounded DOM growth.
-Modify `web/frontend/src/lib/store.ts` to adjust.
-
-
-
-# Core Design Principles
-
-- **Provider abstraction** — Router never depends on SSH or Slurm semantics.
-- **Event-sourced UI** — Frontend derives state entirely from streamed events.
-- **Mailbox contract** — Workers communicate via JSONL inbox/outbox files.
-- **Stateless router** — JSONL logs are the source of truth.
-- **Provider-neutral worker runtime** — No SLURM_* leakage into worker.
-
----
-
-# High-Level Architecture
-
-```mermaid
-flowchart TD
-    UI["Frontend (Next.js)"] -->|WebSocket| BE["Backend (Express)"]
-    BE -->|TCP codeswarm.router.v1| RT["Router (Control Plane)"]
-    RT --> PR["Provider Interface"]
-    PR -->|Local| LP["Local Provider"]
-    PR -->|Slurm| SP["Slurm Provider"]
-    LP --> WK["Worker Nodes"]
-    SP --> WK
-    WK --> CX["Codex App Server"]
-    CX --> MB["Mailbox (JSONL)"]
-    MB --> RT
-```
-
----
-
-# Providers
-
-Codeswarm currently supports two providers.
-
-## ✅ Local Provider
-
-Runs workers as subprocesses on the local machine.
-
-Requirements:
-- `codex` must be installed globally and authenticated.
-
-Execution model:
-
-```mermaid
-flowchart TD
-    Router -->|spawn subprocess| Worker
-    Worker -->|CODESWARM_* env| Codex
-    Codex -->|writes| Outbox
-    Router -->|reads| Outbox
-```
-
-Mailbox layout:
-
-```
-runs/mailbox/
-  inbox/
-  outbox/
-```
-
-No SSH. No Slurm. Pure local execution.
-
----
-
-## ✅ Slurm Provider
-
-Runs workers via SBATCH on an HPC cluster.
-
-Execution model:
-
-```mermaid
-flowchart TD
-    Router -->|ssh login node| SBATCH
-    SBATCH -->|allocate job| SlurmCluster
-    SlurmCluster -->|srun| Worker
-    Worker --> Codex
-    Codex --> Mailbox
-    Router -->|follow outbox| Events
-```
-
-Mailbox layout:
-
-```
-<workspace>/<cluster_subdir>/mailbox/
-  inbox/
-  outbox/
-```
-
-Router does **not** know about SSH — that logic lives entirely inside the Slurm provider.
-
----
-
-# Worker Contract
-
-Workers depend only on these environment variables:
-
-```
-CODESWARM_JOB_ID
-CODESWARM_NODE_ID
-CODESWARM_BASE_DIR
-CODESWARM_CODEX_BIN (optional)
-```
-
-Workers must NOT depend on:
-
-- SLURM_*
-- WORKSPACE_ROOT
-- CLUSTER_SUBDIR
-
-This guarantees provider neutrality.
-
----
-
-# Launch → Inject → Stream Lifecycle
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant UI
-    participant Backend
-    participant Router
-    participant Provider
-    participant Worker
-    participant Codex
-
-    User->>UI: Inject prompt
-    UI->>Backend: HTTP POST /inject
-    Backend->>Router: inject command
-    Router->>Provider: write inbox
-    Worker->>Codex: forward prompt
-    Codex->>Worker: stream response
-    Worker->>Outbox: append JSONL
-    Router->>Backend: stream events
-    Backend->>UI: WebSocket updates
-```
-
----
-
-# Termination Model
-
-Router delegates termination to provider:
-
-```
-provider.terminate(job_id)
-```
-
-- Local → kill subprocesses
-- Slurm → `scancel` via SSH
-
-Router never references SSH directly.
-
----
-
-# UI Model
-
-- Multiple swarms
-- Each swarm has 1–N nodes
-- Nodes render independent turn streams
-- Attention indicators derive from completed turns
-- HPC-safe horizontal node navigation with overflow controls
-
----
-
-# Running Codeswarm
-
-## ⚠️ Codex Sandbox & Approval Configuration (Important)
-
-Codeswarm manages its own execution approval lifecycle at the router + UI layer.
-
-For full functionality (including file writes from tools like `skill-creator`),
-your local Codex configuration must allow workspace writes and disable
-internal approval prompts.
-
-Recommended `~/.codex/config.toml` settings:
-
-```toml
-sandbox = "workspace-write"
-approvalPolicy = "never"
-```
-
-Alternatively, you may configure equivalent behavior via CLI flags when running
-Codex manually:
+Ensure router daemon is running on port `8765`:
 
 ```bash
-codex --sandbox workspace-write --ask-for-approval never
+python3 -u -m router.router --config configs/local.json --daemon
 ```
 
-If Codex is left in `read-only` or `on-request` mode, you may observe:
-
-- Repeated escalation prompts
-- "Sandbox rejected write" messages
-- Commands executing but files not being written
-
-Codeswarm assumes sandbox + approval are configured to allow execution after
-UI approval.
-
----
-
-## Local Mode
+### Frontend/Backend build check
 
 ```bash
-python -m router.router --config configs/local.json --daemon
+npm --workspace=web/frontend run build
 ```
 
-Ensure:
-
-```bash
-printenv OPENAI_API_KEY | codex login --with-api-key
-```
-
-Then start frontend + backend.
-
----
-
-## Slurm Mode
-
-```bash
-python -m router.router --config configs/hpcfund.json --daemon
-```
-
-Requires:
-- SSH login alias configured
-- Slurm cluster access
-
----
-
-# Current Status
-
-- ✅ Local provider stable
-- ✅ Slurm provider stable
-- ✅ Provider abstraction complete
-- ✅ Multi-node UI stable
-- ✅ Termination unified across providers
-
----
-
-For deeper details, see:
-
-- `docs/ARCHITECTURE.md`
-- `docs/PROVIDER_INTERFACE.md`
-- `docs/USER_GUIDE.md`
-# Core Design Principles
-
-- **Provider abstraction** — Router never depends on SSH or Slurm semantics.
-- **Event-sourced UI** — Frontend derives state entirely from streamed events.
-- **Mailbox contract** — Workers communicate via JSONL inbox/outbox files.
-- **Stateless router** — JSONL logs are the source of truth.
-- **Provider-neutral worker runtime** — No SLURM_* leakage into worker.
-
----
-
-# High-Level Architecture
-
-```mermaid
-flowchart TD
-    UI["Frontend (Next.js)"] -->|WebSocket| BE["Backend (Express)"]
-    BE -->|TCP codeswarm.router.v1| RT["Router (Control Plane)"]
-    RT --> PR["Provider Interface"]
-    PR -->|Local| LP["Local Provider"]
-    PR -->|Slurm| SP["Slurm Provider"]
-    LP --> WK["Worker Nodes"]
-    SP --> WK
-    WK --> CX["Codex App Server"]
-    CX --> MB["Mailbox (JSONL)"]
-    MB --> RT
-```
-
----
-
-# Providers
-
-Codeswarm currently supports two providers.
-
-## ✅ Local Provider
-
-Runs workers as subprocesses on the local machine.
-
-Requirements:
-- `codex` must be installed globally and authenticated.
-
-Execution model:
-
-```mermaid
-flowchart TD
-    Router -->|spawn subprocess| Worker
-    Worker -->|CODESWARM_* env| Codex
-    Codex -->|writes| Outbox
-    Router -->|reads| Outbox
-```
-
-Mailbox layout:
-
-```
-runs/mailbox/
-  inbox/
-  outbox/
-```
-
-No SSH. No Slurm. Pure local execution.
-
----
-
-## ✅ Slurm Provider
-
-Runs workers via SBATCH on an HPC cluster.
-
-Execution model:
-
-```mermaid
-flowchart TD
-    Router -->|ssh login node| SBATCH
-    SBATCH -->|allocate job| SlurmCluster
-    SlurmCluster -->|srun| Worker
-    Worker --> Codex
-    Codex --> Mailbox
-    Router -->|follow outbox| Events
-```
-
-Mailbox layout:
-
-```
-<workspace>/<cluster_subdir>/mailbox/
-  inbox/
-  outbox/
-```
-
-Router does **not** know about SSH — that logic lives entirely inside the Slurm provider.
-
----
-
-# Worker Contract
-
-Workers depend only on these environment variables:
-
-```
-CODESWARM_JOB_ID
-CODESWARM_NODE_ID
-CODESWARM_BASE_DIR
-CODESWARM_CODEX_BIN (optional)
-```
-
-Workers must NOT depend on:
-
-- SLURM_*
-- WORKSPACE_ROOT
-- CLUSTER_SUBDIR
-
-This guarantees provider neutrality.
-
----
-
-# Launch → Inject → Stream Lifecycle
-
-```mermaid
-sequenceDiagram
-    participant User
-    participant UI
-    participant Backend
-    participant Router
-    participant Provider
-    participant Worker
-    participant Codex
-
-    User->>UI: Inject prompt
-    UI->>Backend: HTTP POST /inject
-    Backend->>Router: inject command
-    Router->>Provider: write inbox
-    Worker->>Codex: forward prompt
-    Codex->>Worker: stream response
-    Worker->>Outbox: append JSONL
-    Router->>Backend: stream events
-    Backend->>UI: WebSocket updates
-```
-
----
-
-# Termination Model
-
-Router delegates termination to provider:
-
-```
-provider.terminate(job_id)
-```
-
-- Local → kill subprocesses
-- Slurm → `scancel` via SSH
-
-Router never references SSH directly.
-
----
-
-# UI Model
-
-- Multiple swarms
-- Each swarm has 1–N nodes
-- Nodes render independent turn streams
-- Attention indicators derive from completed turns
-- HPC-safe horizontal node navigation with overflow controls
-
----
-
-# Running Codeswarm
-
-## ⚠️ Codex Sandbox & Approval Configuration (Important)
-
-Codeswarm manages its own execution approval lifecycle at the router + UI layer.
-
-For full functionality (including file writes from tools like `skill-creator`),
-your local Codex configuration must allow workspace writes and disable
-internal approval prompts.
-
-Recommended `~/.codex/config.toml` settings:
-
-```toml
-sandbox = "workspace-write"
-approvalPolicy = "never"
-```
-
-Alternatively, you may configure equivalent behavior via CLI flags when running
-Codex manually:
-
-```bash
-codex --sandbox workspace-write --ask-for-approval never
-```
-
-If Codex is left in `read-only` or `on-request` mode, you may observe:
-
-- Repeated escalation prompts
-- "Sandbox rejected write" messages
-- Commands executing but files not being written
-
-Codeswarm assumes sandbox + approval are configured to allow execution after
-UI approval.
-
----
-
-## Local Mode
-
-```bash
-python -m router.router --config configs/local.json --daemon
-```
-
-Ensure:
-
-```bash
-printenv OPENAI_API_KEY | codex login --with-api-key
-```
-
-Then start frontend + backend.
-
----
-
-## Slurm Mode
-
-```bash
-python -m router.router --config configs/hpcfund.json --daemon
-```
-
-Requires:
-- SSH login alias configured
-- Slurm cluster access
-
----
-
-# Current Status
-
-- ✅ Local provider stable
-- ✅ Slurm provider stable
-- ✅ Provider abstraction complete
-- ✅ Multi-node UI stable
-- ✅ Termination unified across providers
-
----
-
-For deeper details, see:
-
-- `docs/ARCHITECTURE.md`
+## Additional Docs
+
+- `docs/CONFIG_SCHEMA.md`
+- `docs/PROTOCOL.md`
+- `docs/PROTOCOL_SPEC.md`
 - `docs/PROVIDER_INTERFACE.md`
 - `docs/USER_GUIDE.md`
