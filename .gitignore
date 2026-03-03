@@ -15,6 +15,7 @@ web/backend/state.json
 # Python cache
 **/__pycache__/
 *.pyc
+*.sqlite3
 
 # Local personal configs
 configs/hpcfund.json

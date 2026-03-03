@@ -1,0 +1,17 @@
+[
+  {
+    "url": "https://example.com/vendor-api-rate-limits",
+    "title": "Vendor API Rate Limits",
+    "content": "Documents minute and daily request limits, burst controls, and guidance for production launch planning."
+  },
+  {
+    "url": "https://example.com/security-data-handling",
+    "title": "Security Data Handling",
+    "content": "Covers PII handling policy, encryption requirements, and retention controls for customer communication workflows."
+  },
+  {
+    "url": "https://example.com/sms-delivery-best-practices",
+    "title": "SMS Delivery Best Practices",
+    "content": "Explains carrier filtering, sender registration, and message composition patterns that improve delivery rates."
+  }
+]

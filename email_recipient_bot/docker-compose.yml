@@ -1,0 +1,43 @@
+services:
+  bot-api:
+    build:
+      context: ..
+      dockerfile: email_recipient_bot/Dockerfile
+    ports:
+      - "8090:8090"
+    environment:
+      BOT_EMAIL: bot@example.com
+      BOT_DOCS_ROOT: /app/email_recipient_bot/knowledge/docs
+      BOT_URL_CATALOG: /app/email_recipient_bot/knowledge/urls.json
+      BOT_SQLITE_PATH: /data/bot_state.sqlite3
+      BOT_TOP_K: "5"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+    volumes:
+      - bot_data:/data
+
+  bot-worker:
+    build:
+      context: ..
+      dockerfile: email_recipient_bot/Dockerfile
+    command: ["python", "-m", "email_recipient_bot.worker"]
+    environment:
+      BOT_EMAIL: bot@example.com
+      BOT_DOCS_ROOT: /app/email_recipient_bot/knowledge/docs
+      BOT_URL_CATALOG: /app/email_recipient_bot/knowledge/urls.json
+      BOT_SQLITE_PATH: /data/bot_state.sqlite3
+      BOT_TOP_K: "5"
+      BOT_WORKER_POLL_SECONDS: "1.5"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+    volumes:
+      - bot_data:/data
+
+volumes:
+  bot_data:
