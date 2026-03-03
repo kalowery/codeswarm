@@ -69,10 +69,30 @@ UI supports:
 - all nodes: `/all your prompt`
 - specific node: `/node[3] your prompt`
 - multiple nodes/ranges: `/node[0,2-4] your prompt`
+- cross-swarm idle queue: `/swarm[target-alias]/idle your prompt`
+- cross-swarm first idle alias: `/swarm[target-alias]/first-idle your prompt`
+- cross-swarm all nodes: `/swarm[target-alias]/all your prompt`
+- cross-swarm specific nodes: `/swarm[target-alias]/node[0,2-4] your prompt`
 
-Backend maps alias -> swarm_id and sends `inject` command to router.
+Backend maps aliases -> swarm IDs and sends either:
 
-## 5. Approval flow for tool execution
+- `inject` (immediate delivery), or
+- `enqueue_inject` (queued first-idle delivery for cross-swarm idle mode).
+
+For routed prompts, target node turns display the injected prompt text in the turn bubble once `turn_started` arrives.
+
+## 5. Inter-swarm queue visibility
+
+Frontend sidebar shows queued cross-swarm work:
+
+- source swarm -> target swarm
+- selector (`idle`)
+- queue age
+- queued prompt content
+
+Router events `queue_list` and `queue_updated` keep this panel synchronized.
+
+## 6. Approval flow for tool execution
 
 When Codex requests command approval, UI receives `exec_approval_required` and shows approval controls.
 
@@ -83,34 +103,47 @@ Available actions depend on `available_decisions` from worker/runtime. UI can se
 
 Backend forwards to router `/approval`, and router sends normalized control message to worker inbox.
 
-## 6. Runtime events visible in UI
+## 7. Runtime events visible in UI
 
 - turn lifecycle: `turn_started`, `turn_complete`
 - streaming text: `assistant_delta`, `assistant`
 - reasoning: `reasoning_delta`, `reasoning`
+- inter-swarm queue/routing: `queue_updated`, `inter_swarm_enqueued`, `inter_swarm_dispatched`, `inter_swarm_blocked`, `inter_swarm_dropped`
+- auto-routing outcomes: `auto_route_submitted`, `auto_route_ignored`
 - command execution: `command_started`, `command_completed`
 - approvals: `exec_approval_required`, `exec_approval_resolved`
 - token usage: `usage`
 - errors: `agent_error`, `command_rejected`
 
-## 7. Terminate a swarm
+## 8. Auto-routing from task completion
+
+When a node finishes a task, backend inspects final assistant output (`task_complete`) for line-level directives:
+
+- `/swarm[alias]/idle ...`
+- `/swarm[alias]/first-idle ...`
+- `/swarm[alias]/all ...`
+- `/swarm[alias]/node[...] ...`
+
+Matching lines are auto-submitted as new routes, enabling chained multi-swarm execution.
+
+## 9. Terminate a swarm
 
 Use the Terminate action in UI.
 
 Router sends `swarm_terminate`, provider terminates backend resources, and UI receives `swarm_removed`.
 
-## 8. Attention and navigation
+## 10. Attention and navigation
 
 - node-level and swarm-level attention indicators pulse when unseen activity completes
 - node tabs are horizontally scrollable for large node counts
 
-## 9. Status and persistence notes
+## 11. Status and persistence notes
 
 - Router persists swarm registry in `router_state.json`.
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
 - Router marks terminated swarms, then prunes them by TTL/cap (`swarm_removed`).
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 ### Codex authentication
 

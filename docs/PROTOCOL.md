@@ -39,6 +39,8 @@ Router requires `protocol` and `command`; `type` is expected by current clients.
 
 - `swarm_launch`
 - `inject`
+- `enqueue_inject`
+- `queue_list`
 - `swarm_list`
 - `swarm_status`
 - `approve_execution`
@@ -55,6 +57,12 @@ Router requires `protocol` and `command`; `type` is expected by current clients.
 - `assistant`
 - `turn_complete`
 - `usage`
+- `queue_list`
+- `queue_updated`
+- `inter_swarm_enqueued`
+- `inter_swarm_dispatched`
+- `inter_swarm_blocked`
+- `inter_swarm_dropped`
 - `swarm_status`
 - `swarm_terminated`
 - `swarm_removed`
@@ -72,7 +80,13 @@ Router requires `protocol` and `command`; `type` is expected by current clients.
 - `task_started`
 - `task_complete`
 
+## Backend-emitted orchestration events
+
+These events are emitted by backend orchestration logic (not direct router normalization):
+
+- `auto_route_submitted`
+- `auto_route_ignored`
+
 Forward compatibility rule:
 
 - clients should ignore unknown events/fields.
-

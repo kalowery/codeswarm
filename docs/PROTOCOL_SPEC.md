@@ -232,6 +232,7 @@ Payload:
 Result event:
 
 - `queue_list`
+- `queue_updated` (broadcast snapshot update)
 
 Data:
 
@@ -252,6 +253,8 @@ Data:
 }
 ```
 
+`queue_updated` carries the same `items` shape and is emitted whenever queue state changes.
+
 ## 4. Worker event normalization
 
 Router consumes worker outbox `codex_rpc` messages and emits normalized events.
@@ -263,6 +266,7 @@ Router consumes worker outbox `codex_rpc` messages and emits normalized events.
 - `codex/event/agent_message` -> `assistant`
 - `turn/completed` -> `turn_complete`
 - token usage updates -> `usage`
+- `thread/status/changed` -> `thread_status`
 
 ### 4.2 Reasoning and task events
 
@@ -306,6 +310,10 @@ Most translated runtime events include:
 - `node_id`
 - `injection_id`
 
+`turn_started` may also include:
+
+- `prompt` (backend-correlated injected prompt text)
+
 ## 6. Error handling
 
 Router emits `command_rejected` for invalid command targets or processing errors.
@@ -326,3 +334,22 @@ Example:
 
 - clients must ignore unknown fields and events
 - protocol string changes for breaking revisions
+
+## 8. Backend Auto-Routing From Task Completion
+
+Backend now inspects `task_complete` final assistant output and auto-submits any
+line-level directives matching:
+
+- `/swarm[alias]/idle ...`
+- `/swarm[alias]/first-idle ...`
+- `/swarm[alias]/all ...`
+- `/swarm[alias]/node[0,2-4] ...`
+
+Behavior:
+
+- each directive line becomes a new router command (`enqueue_inject` for idle, `inject` for all/nodes)
+- processing is deduplicated per `injection_id` to avoid duplicate dispatch on repeated events
+- unknown target aliases are ignored and emitted to clients as `auto_route_ignored`
+- successful submissions are emitted as `auto_route_submitted`
+
+These are backend-emitted UI events, not router-native protocol events.

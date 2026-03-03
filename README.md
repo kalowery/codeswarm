@@ -131,10 +131,37 @@ Router command set (protocol `codeswarm.router.v1`):
 
 - `swarm_launch`
 - `inject`
+- `enqueue_inject`
+- `queue_list`
 - `swarm_list`
 - `swarm_status`
 - `approve_execution`
 - `swarm_terminate`
+
+## Prompt Routing
+
+UI prompt syntax supports both intra-swarm and cross-swarm targeting:
+
+- `/all ...`
+- `/node[0,2-4] ...`
+- `/swarm[alias]/idle ...`
+- `/swarm[alias]/first-idle ...`
+- `/swarm[alias]/all ...`
+- `/swarm[alias]/node[0,2-4] ...`
+
+Cross-swarm `idle` routes use the router queue and dispatch to the first target node with no outstanding work.
+The frontend sidebar also shows queued cross-swarm items (source/target/selector/age/content).
+
+## Auto-Routing From Task Completion
+
+Backend inspects `task_complete` final assistant output and auto-submits any line that matches cross-swarm syntax:
+
+- `/swarm[alias]/idle ...`
+- `/swarm[alias]/first-idle ...`
+- `/swarm[alias]/all ...`
+- `/swarm[alias]/node[...] ...`
+
+This enables self-sustaining multi-swarm workflows where one swarm emits follow-on work for another.
 
 ## Troubleshooting
 
