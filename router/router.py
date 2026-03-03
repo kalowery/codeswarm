@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import threading
 import re
 import time
+import subprocess
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
@@ -28,6 +29,8 @@ SWARMS = {}
 JOB_TO_SWARM = {}
 LAST_USAGE = {}
 PENDING_APPROVALS = {}
+PENDING_APPROVAL_DECISIONS = {}
+ACTIVE_PROVIDER = None
 
 # Retention policy
 TERMINATED_TTL_SECONDS = 900  # 15 minutes
@@ -163,6 +166,75 @@ def emit_event(event_name, data):
 def debug_event(message):
     if DEBUG:
         emit_event("debug", {"source": "router", "message": message})
+
+
+def execute_synthetic_approved_command(meta, job_id, call_id):
+    """
+    Execute approved synthetic command requests that originate from
+    function_call bridging (no native rpc_id to resume inside app-server).
+    """
+    command = meta.get("command")
+    cwd = meta.get("cwd")
+
+    if not isinstance(command, str) or not command.strip():
+        emit_event("command_completed", {
+            "swarm_id": meta.get("swarm_id"),
+            "job_id": str(job_id),
+            "node_id": meta.get("node_id"),
+            "injection_id": meta.get("injection_id"),
+            "call_id": call_id,
+            "command": command,
+            "cwd": cwd,
+            "stdout": "",
+            "stderr": "Synthetic approval command missing executable text",
+            "exit_code": 1,
+            "duration": {"secs": 0, "nanos": 0},
+        })
+        return
+
+    start = time.time()
+    emit_event("command_started", {
+        "swarm_id": meta.get("swarm_id"),
+        "job_id": str(job_id),
+        "node_id": meta.get("node_id"),
+        "injection_id": meta.get("injection_id"),
+        "call_id": call_id,
+        "command": ["/bin/bash", "-lc", command],
+        "cwd": cwd,
+    })
+
+    try:
+        completed = subprocess.run(
+            ["/bin/bash", "-lc", command],
+            cwd=cwd if isinstance(cwd, str) and cwd else None,
+            capture_output=True,
+            text=True,
+        )
+        exit_code = int(completed.returncode)
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except Exception as e:
+        exit_code = 1
+        stdout = ""
+        stderr = str(e)
+
+    elapsed = time.time() - start
+    secs = int(elapsed)
+    nanos = int((elapsed - secs) * 1_000_000_000)
+
+    emit_event("command_completed", {
+        "swarm_id": meta.get("swarm_id"),
+        "job_id": str(job_id),
+        "node_id": meta.get("node_id"),
+        "injection_id": meta.get("injection_id"),
+        "call_id": call_id,
+        "command": ["/bin/bash", "-lc", command],
+        "cwd": cwd,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code,
+        "duration": {"secs": secs, "nanos": nanos},
+    })
 
 
 # ================================
@@ -343,6 +415,10 @@ def translate_event(event):
         LAST_USAGE[injection_id] = total
         return ("usage", {**base, "total_tokens": total})
 
+    if method == "thread/status/changed":
+        status = payload.get("params", {}).get("status", {})
+        return ("thread_status", {**base, "status": status})
+
     # --- Task lifecycle normalization ---
     if method == "codex/event/task_started":
         return (
@@ -414,16 +490,97 @@ def translate_event(event):
         rpc_id = payload.get("id")
 
         if call_id:
-            PENDING_APPROVALS[(job_id, call_id)] = {
+            key = (job_id, call_id)
+            existing = PENDING_APPROVALS.get(key, {})
+
+            # Keep the strongest request shape when both legacy and request-style
+            # approval events are emitted for the same call_id.
+            existing_rpc_id = existing.get("rpc_id")
+            merged_rpc_id = rpc_id if rpc_id is not None else existing_rpc_id
+
+            existing_available = existing.get("available_decisions") or []
+            new_available = available_decisions or []
+
+            def _has_accept_decisions(decisions):
+                return any(
+                    (isinstance(d, str) and d in ("accept", "cancel")) or
+                    (isinstance(d, dict) and "acceptWithExecpolicyAmendment" in d)
+                    for d in (decisions or [])
+                )
+
+            merged_available = (
+                new_available
+                if _has_accept_decisions(new_available) or not existing_available
+                else existing_available
+            )
+
+            PENDING_APPROVALS[key] = {
                 "swarm_id": swarm_id,
                 "node_id": node_id,
                 "injection_id": injection_id,
-                "rpc_id": rpc_id,
+                "rpc_id": merged_rpc_id,
                 "approval_method": method,
+                "command": command,
+                "cwd": cwd,
                 "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
-                "available_decisions": available_decisions,
+                "available_decisions": merged_available,
             }
             pass  # debug removed
+
+            # If user already approved via legacy notification path, immediately
+            # satisfy the later request-style approval without requiring a 2nd click.
+            pending_decision = PENDING_APPROVAL_DECISIONS.get(key)
+            if (
+                pending_decision
+                and ACTIVE_PROVIDER is not None
+                and merged_rpc_id is not None
+            ):
+                approved_flag = bool(pending_decision.get("approved"))
+                raw_decision = pending_decision.get("decision")
+
+                if isinstance(raw_decision, str):
+                    if raw_decision in ("accept", "cancel"):
+                        rpc_decision = raw_decision
+                    elif raw_decision == "approved":
+                        rpc_decision = "accept"
+                    elif raw_decision == "abort":
+                        rpc_decision = "cancel"
+                    else:
+                        rpc_decision = "accept" if approved_flag else "cancel"
+                elif (
+                    isinstance(raw_decision, dict)
+                    and isinstance(raw_decision.get("acceptWithExecpolicyAmendment"), dict)
+                ):
+                    rpc_decision = raw_decision
+                elif (
+                    isinstance(raw_decision, dict)
+                    and isinstance(raw_decision.get("approved_execpolicy_amendment"), dict)
+                ):
+                    amendment = raw_decision["approved_execpolicy_amendment"].get(
+                        "proposed_execpolicy_amendment"
+                    )
+                    rpc_decision = {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": amendment if isinstance(amendment, list) else []
+                        }
+                    }
+                else:
+                    rpc_decision = "accept" if approved_flag else "cancel"
+
+                ACTIVE_PROVIDER.send_control(
+                    job_id,
+                    node_id,
+                    {
+                        "type": "rpc_response",
+                        "rpc_id": merged_rpc_id,
+                        "result": {
+                            "decision": rpc_decision,
+                            "approved": approved_flag,
+                        },
+                    },
+                )
+                PENDING_APPROVAL_DECISIONS.pop(key, None)
+                PENDING_APPROVALS.pop(key, None)
 
         return (
             "exec_approval_required",
@@ -511,6 +668,8 @@ COMMAND_QUEUE = queue.Queue()
 TCP_CLIENTS = []
 
 def run_daemon(config, provider):
+    global ACTIVE_PROVIDER
+    ACTIVE_PROVIDER = provider
 
     stdout_buffer = b""
 
@@ -923,11 +1082,36 @@ def run_daemon(config, provider):
                             "params": params_payload,
                         }
 
-                    provider.send_control(
-                        job_id,
-                        meta["node_id"],
-                        control_payload,
+                    is_synthetic_request = (
+                        meta.get("approval_method") == "item/commandExecution/requestApproval"
+                        and rpc_id is None
                     )
+
+                    if is_synthetic_request:
+                        # Synthetic approvals are emitted by worker-side bridging when
+                        # app-server produced a function_call without native approval RPC.
+                        # Execute command directly once approved so the action is visible.
+                        if bool(approved):
+                            threading.Thread(
+                                target=execute_synthetic_approved_command,
+                                args=(dict(meta), str(job_id), call_id),
+                                daemon=True,
+                            ).start()
+                    else:
+                        provider.send_control(
+                            job_id,
+                            meta["node_id"],
+                            control_payload,
+                        )
+
+                    if rpc_id is None:
+                        PENDING_APPROVAL_DECISIONS[key] = {
+                            "approved": bool(approved),
+                            "decision": decision,
+                            "timestamp": time.time(),
+                        }
+                    else:
+                        PENDING_APPROVAL_DECISIONS.pop(key, None)
                 except Exception as e:
                     emit_event("command_rejected", {
                         "request_id": request_id,

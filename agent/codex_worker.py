@@ -83,11 +83,14 @@ def main():
 
     rpc_id = 0
     thread_id = None
+    session_path = None
     shutdown_requested = False
     last_injection_id = None
     turn_to_injection = {}
     request_to_injection = {}
     pending_injections = deque()
+    session_offset = 0
+    emitted_escalation_calls = set()
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -123,6 +126,9 @@ def main():
     def _extract_turn_id(payload):
         params = payload.get("params", {}) if isinstance(payload, dict) else {}
         if isinstance(params, dict):
+            # Many codex/event/* messages encode turn id in params.id.
+            if isinstance(params.get("id"), str):
+                return params.get("id")
             if isinstance(params.get("turnId"), str):
                 return params.get("turnId")
             turn = params.get("turn")
@@ -151,6 +157,35 @@ def main():
             return turn_to_injection[turn_id]
 
         return last_injection_id
+
+    def emit_escalation_request_from_function_call(call_id, args, injection_id):
+        if not call_id or call_id in emitted_escalation_calls:
+            return
+
+        emitted_escalation_calls.add(call_id)
+
+        command = args.get("cmd")
+        reason = args.get("justification")
+        cwd = args.get("workdir") or os.getcwd()
+
+        synthetic_payload = {
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "itemId": call_id,
+                "command": command,
+                "reason": reason,
+                "cwd": cwd,
+                "availableDecisions": ["accept", "cancel"],
+            },
+        }
+
+        write_event(outbox, {
+            "type": "codex_rpc",
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+            "payload": synthetic_payload,
+        })
 
     with open(outbox_path, "a", buffering=1) as outbox:
 
@@ -228,11 +263,16 @@ def main():
                             send_request("thread/start", {})
                             continue
 
-                        # Capture thread id from thread/start response
+                        # Capture thread id/session path from thread/start response
                         if msg.get("result") and isinstance(msg.get("result"), dict):
                             result = msg["result"]
                             if isinstance(result.get("thread"), dict) and "id" in result["thread"]:
                                 thread_id = result["thread"]["id"]
+                            if isinstance(result.get("thread"), dict) and "path" in result["thread"]:
+                                thread_path = result["thread"]["path"]
+                                if isinstance(thread_path, str) and thread_path:
+                                    session_path = Path(thread_path)
+                                    session_offset = 0
                         # Fallback: some app-server flows emit thread status before/without thread/start response.
                         if not thread_id and msg.get("method") == "thread/status/changed":
                             params = msg.get("params")
@@ -303,6 +343,56 @@ def main():
                         break
 
                 inbox_offset += len(new_lines)
+
+            # --- Session file tailing for function-call escalation requests ---
+            if session_path and session_path.exists():
+                try:
+                    session_lines = session_path.read_text().splitlines()
+                    new_session_lines = session_lines[session_offset:]
+                    session_offset += len(new_session_lines)
+
+                    for line in new_session_lines:
+                        try:
+                            entry = json.loads(line)
+                        except Exception:
+                            continue
+
+                        if entry.get("type") != "response_item":
+                            continue
+
+                        payload = entry.get("payload", {})
+                        if payload.get("type") != "function_call":
+                            continue
+
+                        if payload.get("name") != "exec_command":
+                            continue
+
+                        call_id = payload.get("call_id")
+                        arguments_raw = payload.get("arguments")
+                        if not isinstance(arguments_raw, str):
+                            continue
+
+                        try:
+                            arguments = json.loads(arguments_raw)
+                        except Exception:
+                            continue
+
+                        if not isinstance(arguments, dict):
+                            continue
+
+                        if arguments.get("sandbox_permissions") != "require_escalated":
+                            continue
+
+                        emit_escalation_request_from_function_call(
+                            call_id,
+                            arguments,
+                            last_injection_id,
+                        )
+                except Exception as e:
+                    write_event(outbox, {
+                        "type": "worker_error",
+                        "error": f"session_tail_error: {str(e)}"
+                    })
 
             if proc.poll() is not None:
                 running = False
