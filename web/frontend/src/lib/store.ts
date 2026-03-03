@@ -84,8 +84,9 @@ interface SwarmStore {
 export const useSwarmStore = create<SwarmStore>((set, get) => {
   // Track completions that arrive before turn_started
   const pendingComplete: Record<string, boolean> = {} // deprecated
-  const pendingDeltas: Record<string, string[]> = {}
-  const pendingAssistant: Record<string, string> = {}
+  const pendingReasoningDeltas: Record<string, string[]> = {}
+  const pendingReasoning: Record<string, string> = {}
+  const pendingTaskComplete: Record<string, { content?: string }> = {}
 
   return {
     swarms: {},
@@ -262,18 +263,26 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           phase: 'streaming'
         }
 
-        if (pendingDeltas[payload.injection_id]) {
-          newTurn.deltas = [...pendingDeltas[payload.injection_id]]
-          delete pendingDeltas[payload.injection_id]
-        }
-
-        if (pendingAssistant[payload.injection_id] && newTurn.deltas.length === 0) {
-          newTurn.deltas = [pendingAssistant[payload.injection_id]]
-          delete pendingAssistant[payload.injection_id]
-        }
-
         if (pendingComplete[payload.injection_id]) {
           delete pendingComplete[payload.injection_id]
+        }
+
+        if (pendingReasoning[payload.injection_id]) {
+          newTurn.reasoning = pendingReasoning[payload.injection_id]
+          delete pendingReasoning[payload.injection_id]
+        } else if (pendingReasoningDeltas[payload.injection_id]) {
+          newTurn.reasoning = pendingReasoningDeltas[payload.injection_id].join('')
+          delete pendingReasoningDeltas[payload.injection_id]
+        }
+
+        if (Object.prototype.hasOwnProperty.call(pendingTaskComplete, payload.injection_id)) {
+          const completed = pendingTaskComplete[payload.injection_id]
+          const completedContent = completed?.content
+          newTurn.phase = 'completed'
+          if (completedContent && newTurn.deltas.length === 0) {
+            newTurn.deltas = [completedContent]
+          }
+          delete pendingTaskComplete[payload.injection_id]
         }
 
         if (
@@ -318,10 +327,8 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         )
 
         if (!turn) {
-          if (!pendingDeltas[payload.injection_id]) {
-            pendingDeltas[payload.injection_id] = []
-          }
-          pendingDeltas[payload.injection_id].push(payload.content)
+          // Ignore assistant deltas until turn_started establishes the
+          // authoritative injection_id mapping for this bubble.
           return
         }
 
@@ -353,7 +360,8 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         )
 
         if (!turn) {
-          pendingAssistant[payload.injection_id] = payload.content
+          // Ignore assistant snapshots until turn_started establishes the
+          // authoritative injection_id mapping for this bubble.
           return
         }
 
@@ -416,42 +424,48 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const turnIndex = turns.findIndex(
           (t) => t.injection_id === payload.injection_id
         )
-        const content =
+        const rawContent =
           typeof payload.last_agent_message === 'string'
             ? payload.last_agent_message
             : typeof payload.content === 'string'
             ? payload.content
             : undefined
 
+        const previousTurn = [...turns]
+          .reverse()
+          .find((t) => t.injection_id !== payload.injection_id && t.phase === 'completed')
+
+        const previousRaw = previousTurn?.deltas?.join('').trim() ?? ''
+
+        // Some runtimes emit cumulative final text that includes the prior turn.
+        // If the final content starts with previous completed output, strip it.
+        const content =
+          rawContent &&
+          previousRaw &&
+          rawContent.trim().startsWith(previousRaw)
+            ? rawContent.trim().slice(previousRaw.length).trimStart()
+            : rawContent
+
         if (turnIndex >= 0) {
           const existing = turns[turnIndex]
           turns[turnIndex] = ({
             ...existing,
             phase: 'completed',
-            deltas: content ? [content] : existing.deltas
+            // Keep streamed content as source of truth. task_complete payload can
+            // be cumulative and may include prior turn text.
+            deltas:
+              existing.deltas.length > 0
+                ? existing.deltas
+                : content
+                ? [content]
+                : existing.deltas
           } as NodeTurn)
         } else {
-          const provisionalIndex = turns.findIndex(
-            (t) =>
-              t.injection_id.startsWith('temp-') && t.phase !== 'completed'
-          )
-          const provisionalPrompt =
-            provisionalIndex >= 0 ? turns[provisionalIndex].prompt : ''
-          const provisionalReasoning =
-            provisionalIndex >= 0 ? turns[provisionalIndex].reasoning : ''
-          const completedTurn: NodeTurn = {
-            injection_id: payload.injection_id,
-            prompt: provisionalPrompt,
-            deltas: content ? [content] : [],
-            reasoning: provisionalReasoning,
-            phase: 'completed'
-          }
-
-          if (provisionalIndex >= 0) {
-            turns[provisionalIndex] = completedTurn
-          } else {
-            turns.push(completedTurn)
-          }
+          // Do not overwrite provisional temp turns with mismatched injection IDs.
+          // Late task_complete from a prior turn can otherwise pollute the current
+          // working bubble. Cache until the matching turn_started arrives.
+          pendingTaskComplete[payload.injection_id] = { content }
+          return
         }
 
         get().addOrUpdateSwarm({
@@ -478,6 +492,16 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!node) return
 
         const delta = payload.content ?? payload.msg?.delta
+        const turnExists = node.turns.some((t) => t.injection_id === payload.injection_id)
+
+        if (!turnExists) {
+          if (!pendingReasoningDeltas[payload.injection_id]) {
+            pendingReasoningDeltas[payload.injection_id] = []
+          }
+          pendingReasoningDeltas[payload.injection_id].push(delta ?? '')
+          return
+        }
+
         const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
             ? { ...t, reasoning: (t.reasoning ?? '') + (delta ?? '') }
@@ -501,6 +525,13 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (!node) return
 
         const text = payload.content ?? payload.msg?.text
+        const turnExists = node.turns.some((t) => t.injection_id === payload.injection_id)
+
+        if (!turnExists) {
+          pendingReasoning[payload.injection_id] = text ?? ''
+          return
+        }
+
         const updatedTurns = node.turns.map((t) =>
           t.injection_id === payload.injection_id
             ? { ...t, reasoning: text ?? '' }

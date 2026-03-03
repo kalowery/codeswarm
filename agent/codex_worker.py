@@ -5,6 +5,7 @@ import subprocess
 import time
 import select
 import signal
+from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -83,7 +84,10 @@ def main():
     rpc_id = 0
     thread_id = None
     shutdown_requested = False
-    current_injection_id = None
+    last_injection_id = None
+    turn_to_injection = {}
+    request_to_injection = {}
+    pending_injections = deque()
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -94,10 +98,12 @@ def main():
 
     def send_request(method, params=None):
         nonlocal rpc_id
-        msg = jsonrpc_request(rpc_id, method, params)
+        request_id = rpc_id
+        msg = jsonrpc_request(request_id, method, params)
         proc.stdin.write(msg + "\n")
         proc.stdin.flush()
         rpc_id += 1
+        return request_id
 
     def send_notification(method, params=None):
         msg = jsonrpc_notification(method, params)
@@ -113,6 +119,38 @@ def main():
             msg["result"] = result
         proc.stdin.write(json.dumps(msg) + "\n")
         proc.stdin.flush()
+
+    def _extract_turn_id(payload):
+        params = payload.get("params", {}) if isinstance(payload, dict) else {}
+        if isinstance(params, dict):
+            if isinstance(params.get("turnId"), str):
+                return params.get("turnId")
+            turn = params.get("turn")
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                return turn.get("id")
+            msg = params.get("msg")
+            if isinstance(msg, dict):
+                if isinstance(msg.get("turn_id"), str):
+                    return msg.get("turn_id")
+                if isinstance(msg.get("turnId"), str):
+                    return msg.get("turnId")
+        result = payload.get("result", {}) if isinstance(payload, dict) else {}
+        if isinstance(result, dict):
+            turn = result.get("turn")
+            if isinstance(turn, dict) and isinstance(turn.get("id"), str):
+                return turn.get("id")
+        return None
+
+    def _resolve_injection_id(payload):
+        msg_id = payload.get("id")
+        if isinstance(msg_id, int) and msg_id in request_to_injection:
+            return request_to_injection[msg_id]
+
+        turn_id = _extract_turn_id(payload)
+        if turn_id and turn_id in turn_to_injection:
+            return turn_to_injection[turn_id]
+
+        return last_injection_id
 
     with open(outbox_path, "a", buffering=1) as outbox:
 
@@ -149,11 +187,37 @@ def main():
                 if line:
                     try:
                         msg = json.loads(line)
+                        turn_id = _extract_turn_id(msg)
+                        msg_id = msg.get("id")
+
+                        # Bind turn_id -> injection_id from turn/start responses.
+                        if (
+                            isinstance(msg_id, int)
+                            and msg_id in request_to_injection
+                            and isinstance(msg.get("result"), dict)
+                            and isinstance(msg["result"].get("turn"), dict)
+                            and isinstance(msg["result"]["turn"].get("id"), str)
+                        ):
+                            resolved_injection = request_to_injection[msg_id]
+                            turn_to_injection[msg["result"]["turn"]["id"]] = resolved_injection
+                            del request_to_injection[msg_id]
+
+                        # Fallback: bind from turn/started notifications if still pending.
+                        if (
+                            turn_id
+                            and turn_id not in turn_to_injection
+                            and pending_injections
+                            and msg.get("method") == "turn/started"
+                        ):
+                            turn_to_injection[turn_id] = pending_injections.popleft()
+
+                        resolved_injection_id = _resolve_injection_id(msg)
+
                         write_event(outbox, {
                             "type": "codex_rpc",
                             "job_id": job_id,
                             "node_id": node_id,
-                            "injection_id": current_injection_id,
+                            "injection_id": resolved_injection_id,
                             "payload": msg
                         })
 
@@ -200,8 +264,9 @@ def main():
                         continue
 
                     if event.get("type") == "user":
-                        current_injection_id = event.get("injection_id")
-                        send_request("turn/start", {
+                        injection_id = event.get("injection_id")
+                        last_injection_id = injection_id
+                        req_id = send_request("turn/start", {
                             "threadId": thread_id,
                             "input": [
                                 {
@@ -210,6 +275,8 @@ def main():
                                 }
                             ]
                         })
+                        request_to_injection[req_id] = injection_id
+                        pending_injections.append(injection_id)
 
                     elif event.get("type") == "control":
                         payload = event.get("payload", {})
