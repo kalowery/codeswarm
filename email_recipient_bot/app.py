@@ -26,6 +26,7 @@ def health() -> dict:
         "url_catalog_path": str(settings.url_catalog_path),
         "sqlite_path": str(settings.sqlite_path),
         "messaging_channel": service.messaging.channel,
+        "digest_email_channel": service.digest_email.channel,
     }
 
 

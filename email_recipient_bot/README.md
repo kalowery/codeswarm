@@ -8,6 +8,7 @@ This is a runnable stub for the architecture discussed:
 - Retrieval from file-system docs and URL catalog
 - Optional OpenAI-assisted intent/query extraction and relevance generation
 - Outbound dispatch via console (default) or Twilio SMS
+- Forwarded-email detection with digest reply-to-sender workflow
 - Persistent run/outbound logs in SQLite
 
 ## Run
@@ -45,9 +46,15 @@ docker compose -f email_recipient_bot/docker-compose.yml up --build
 - `TWILIO_ACCOUNT_SID` (optional)
 - `TWILIO_AUTH_TOKEN` (optional)
 - `TWILIO_FROM_NUMBER` (optional)
+- `SMTP_HOST` (optional)
+- `SMTP_PORT` (default: `587`)
+- `SMTP_USERNAME` (optional)
+- `SMTP_PASSWORD` (optional)
+- `SMTP_FROM_EMAIL` (optional)
 - `BOT_WORKER_POLL_SECONDS` (worker only; default: `1.5`)
 
 If Twilio creds are not set, outbound messages are printed to console.
+If SMTP creds are not set, digest emails are printed to console.
 
 ## API
 
@@ -81,6 +88,8 @@ Response includes:
 - `run_id`
 - recipient list excluding bot mailbox
 - one-line cited summaries (reference + one sentence relevance)
+- per-recipient recommended response lines
+- `forwarded_detected` flag
 
 ### `POST /ingest/email`
 
@@ -102,3 +111,11 @@ Webhook ingress for Microsoft Graph events. Same payload contract as Gmail webho
 - This is intentionally a stub, not production-hardened.
 - Graph/Gmail provider fetch adapters are intentionally left as `NotImplementedError`.
 - Production extensions should add OAuth mailbox fetch, queue durability/locking hardening, ACL enforcement, and structured observability.
+
+## Forwarded email behavior
+
+When forwarded content is detected in an inbound message body (for example `Begin forwarded message` or `Original Message` header blocks), the service:
+
+1. Extracts original subject/body and original `To`/`Cc` recipients.
+2. Produces references plus a one-sentence recommended response for each original recipient.
+3. On `dry_run=false`, sends a single digest email back to the forwarder (`email.sender`) containing per-recipient recommendations and citations.

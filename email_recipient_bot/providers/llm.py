@@ -4,7 +4,7 @@ import json
 import re
 from typing import Protocol
 
-from ..models import InboundEmail, KnowledgeSource, ReferenceLine
+from ..models import InboundEmail, KnowledgeSource, RecipientRecommendation, ReferenceLine
 
 
 SENTENCE_RE = re.compile(r"\s+")
@@ -26,6 +26,14 @@ class LLMProvider(Protocol):
         email: InboundEmail,
         sources: list[KnowledgeSource],
     ) -> list[ReferenceLine]:
+        ...
+
+    def generate_recipient_recommendations(
+        self,
+        email: InboundEmail,
+        recipients: list[str],
+        references: list[ReferenceLine],
+    ) -> list[RecipientRecommendation]:
         ...
 
 
@@ -53,6 +61,21 @@ class HeuristicLLM:
                 )
             )
         return lines
+
+    def generate_recipient_recommendations(
+        self,
+        email: InboundEmail,
+        recipients: list[str],
+        references: list[ReferenceLine],
+    ) -> list[RecipientRecommendation]:
+        primary = references[0].reference if references else "available references"
+        out: list[RecipientRecommendation] = []
+        for rcpt in recipients:
+            msg = _normalize_sentence(
+                f"Send {rcpt} a concise response addressing '{email.subject}', and include {primary} as supporting reference"
+            )
+            out.append(RecipientRecommendation(recipient=rcpt, recommended_response=msg))
+        return out
 
 
 class OpenAILLM:
@@ -139,6 +162,51 @@ class OpenAILLM:
             return out
         except Exception:
             return self.fallback.generate_reference_lines(email, sources)
+
+    def generate_recipient_recommendations(
+        self,
+        email: InboundEmail,
+        recipients: list[str],
+        references: list[ReferenceLine],
+    ) -> list[RecipientRecommendation]:
+        if not recipients:
+            return []
+
+        refs_payload = [r.model_dump() for r in references]
+        system = (
+            "Generate recipient-specific response recommendations for a forwarded email triage bot. "
+            "Return JSON only as a list of objects with keys: recipient, recommended_response. "
+            "The recommended_response must be one sentence."
+        )
+        user = (
+            f"Inbound subject: {email.subject}\n"
+            f"Inbound body: {email.body}\n"
+            f"Recipients: {json.dumps(recipients)}\n"
+            f"References: {json.dumps(refs_payload, ensure_ascii=True)}"
+        )
+
+        try:
+            resp = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
+            )
+            raw = resp.output_text.strip()
+            parsed = json.loads(raw)
+            out: list[RecipientRecommendation] = []
+            for item in parsed:
+                out.append(
+                    RecipientRecommendation(
+                        recipient=item["recipient"],
+                        recommended_response=_normalize_sentence(item["recommended_response"]),
+                    )
+                )
+            return out
+        except Exception:
+            return self.fallback.generate_recipient_recommendations(email, recipients, references)
 
 
 def build_llm(api_key: str | None, model: str) -> LLMProvider:

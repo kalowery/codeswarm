@@ -18,6 +18,11 @@ class ReferenceLine(BaseModel):
     relevance: str
 
 
+class RecipientRecommendation(BaseModel):
+    recipient: str
+    recommended_response: str
+
+
 class ProcessEmailRequest(BaseModel):
     email: InboundEmail
     dry_run: bool = True
@@ -28,6 +33,8 @@ class ProcessEmailResponse(BaseModel):
     recipients: list[str]
     summary_text: str
     references: list[ReferenceLine]
+    recipient_recommendations: list[RecipientRecommendation] = Field(default_factory=list)
+    forwarded_detected: bool = False
 
 
 class EnqueueJobResponse(BaseModel):
