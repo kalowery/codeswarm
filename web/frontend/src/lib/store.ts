@@ -329,7 +329,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         // Replace only the last provisional turn if present
         const newTurn: NodeTurn = {
           injection_id: payload.injection_id,
-          prompt: '',
+          prompt: typeof payload.prompt === 'string' ? payload.prompt : '',
           deltas: [],
           reasoning: '',
           phase: 'streaming'
@@ -364,7 +364,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           const provisional = turns[turns.length - 1]
           turns[turns.length - 1] = {
             ...newTurn,
-            prompt: provisional.prompt,
+            prompt: provisional.prompt || newTurn.prompt,
             reasoning: provisional.reasoning
           } as NodeTurn
         } else {

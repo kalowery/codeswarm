@@ -27,6 +27,176 @@ const pendingAliases: Record<string, string | undefined> = {};
 // Track request_id -> swarm_id for status/inject/terminate
 const requestSwarmMap: Record<string, string> = {};
 let interSwarmQueueItems: any[] = [];
+const requestPromptMap = new Map<string, string>();
+const injectionPromptMap = new Map<string, string>();
+const processedAutoRoutes = new Set<string>();
+
+type AutoRouteDirective =
+  | { targetAlias: string; mode: 'idle'; prompt: string }
+  | { targetAlias: string; mode: 'all'; prompt: string }
+  | { targetAlias: string; mode: 'nodes'; prompt: string; nodes: number[] };
+
+function parseNodeSpec(expr: string): number[] {
+  const resolved = new Set<number>();
+  expr.split(',').forEach((part) => {
+    const chunk = part.trim();
+    if (!chunk) return;
+    if (/^\d+$/.test(chunk)) {
+      resolved.add(Number(chunk));
+      return;
+    }
+    const rangeMatch = chunk.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (!rangeMatch) return;
+    const start = Number(rangeMatch[1]);
+    const end = Number(rangeMatch[2]);
+    if (start > end) return;
+    for (let i = start; i <= end; i += 1) {
+      resolved.add(i);
+    }
+  });
+  return Array.from(resolved);
+}
+
+function extractText(value: any): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map((v) => extractText(v)).join('');
+  if (!value || typeof value !== 'object') return '';
+
+  if (typeof value.text === 'string') return value.text;
+  if (typeof value.message === 'string') return value.message;
+  if (typeof value.output_text === 'string') return value.output_text;
+  if (typeof value.content === 'string') return value.content;
+
+  if (Array.isArray(value.content)) return extractText(value.content);
+  if (Array.isArray(value.parts)) return extractText(value.parts);
+  if (Array.isArray(value.messages)) return extractText(value.messages);
+
+  return '';
+}
+
+function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
+  const directives: AutoRouteDirective[] = [];
+  const lines = text.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line.startsWith('/swarm[')) continue;
+
+    const crossAllMatch = line.match(/^\/swarm\[(.+?)\]\/all\s+([\s\S]+)$/);
+    if (crossAllMatch) {
+      const targetAlias = (crossAllMatch[1] ?? '').trim();
+      const prompt = (crossAllMatch[2] ?? '').trim();
+      if (targetAlias && prompt) {
+        directives.push({ targetAlias, mode: 'all', prompt });
+      }
+      continue;
+    }
+
+    const crossIdleMatch = line.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)\s+([\s\S]+)$/);
+    if (crossIdleMatch) {
+      const targetAlias = (crossIdleMatch[1] ?? '').trim();
+      const prompt = (crossIdleMatch[3] ?? '').trim();
+      if (targetAlias && prompt) {
+        directives.push({ targetAlias, mode: 'idle', prompt });
+      }
+      continue;
+    }
+
+    const crossNodeMatch = line.match(/^\/swarm\[(.+?)\]\/node\[(.+?)\]\s*([\s\S]+)$/);
+    if (crossNodeMatch) {
+      const targetAlias = (crossNodeMatch[1] ?? '').trim();
+      const expr = (crossNodeMatch[2] ?? '').trim();
+      const prompt = (crossNodeMatch[3] ?? '').trim();
+      const nodes = parseNodeSpec(expr);
+      if (targetAlias && prompt && nodes.length > 0) {
+        directives.push({ targetAlias, mode: 'nodes', prompt, nodes });
+      }
+    }
+  }
+
+  return directives;
+}
+
+function handleAutoRoutingFromTaskComplete(data: any) {
+  const injectionId = typeof data?.injection_id === 'string' ? data.injection_id : '';
+  if (!injectionId || processedAutoRoutes.has(injectionId)) return;
+  processedAutoRoutes.add(injectionId);
+
+  const sourceSwarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
+  if (!sourceSwarmId) return;
+
+  const sourceSwarm = state.getById(sourceSwarmId);
+  if (!sourceSwarm) return;
+
+  const finalText = extractText(data?.last_agent_message).trim();
+  if (!finalText) return;
+
+  const directives = parseAutoRouteDirectives(finalText);
+  if (directives.length === 0) return;
+
+  for (const directive of directives) {
+    const targetSwarm = state.getByAlias(directive.targetAlias);
+    if (!targetSwarm) {
+      hub.broadcast({
+        type: 'auto_route_ignored',
+        payload: {
+          source_swarm_id: sourceSwarmId,
+          source_alias: sourceSwarm.alias,
+          target_alias: directive.targetAlias,
+          reason: 'unknown target alias',
+          injection_id: injectionId,
+          mode: directive.mode
+        }
+      });
+      continue;
+    }
+
+    if (directive.mode === 'idle') {
+      const request_id = router.send('enqueue_inject', {
+        source_swarm_id: sourceSwarmId,
+        target_swarm_id: targetSwarm.swarm_id,
+        selector: 'idle',
+        content: directive.prompt
+      });
+      requestSwarmMap[request_id] = targetSwarm.swarm_id;
+      requestPromptMap.set(request_id, directive.prompt);
+      hub.broadcast({
+        type: 'auto_route_submitted',
+        payload: {
+          request_id,
+          source_swarm_id: sourceSwarmId,
+          source_alias: sourceSwarm.alias,
+          target_swarm_id: targetSwarm.swarm_id,
+          target_alias: targetSwarm.alias,
+          selector: 'idle',
+          injection_id: injectionId
+        }
+      });
+      continue;
+    }
+
+    const request_id = router.send('inject', {
+      swarm_id: targetSwarm.swarm_id,
+      nodes: directive.mode === 'all' ? 'all' : directive.nodes,
+      content: directive.prompt
+    });
+    requestSwarmMap[request_id] = targetSwarm.swarm_id;
+    requestPromptMap.set(request_id, directive.prompt);
+    hub.broadcast({
+      type: 'auto_route_submitted',
+      payload: {
+        request_id,
+        source_swarm_id: sourceSwarmId,
+        source_alias: sourceSwarm.alias,
+        target_swarm_id: targetSwarm.swarm_id,
+        target_alias: targetSwarm.alias,
+        selector: directive.mode,
+        nodes: directive.mode === 'nodes' ? directive.nodes : undefined,
+        injection_id: injectionId
+      }
+    });
+  }
+}
 
 // --- Helper: request swarm status ---
 function requestStatus(swarm_id: string) {
@@ -38,6 +208,14 @@ function requestStatus(swarm_id: string) {
 router.on('event', (msg: any) => {
   console.log('Router event received:', msg.event);
   const { event, data } = msg;
+
+  if (event === 'inject_ack') {
+    const prompt = typeof data?.request_id === 'string' ? requestPromptMap.get(data.request_id) : undefined;
+    if (prompt && typeof data?.injection_id === 'string') {
+      data.prompt = prompt;
+      injectionPromptMap.set(data.injection_id, prompt);
+    }
+  }
 
   if (event === 'swarm_launched') {
     const { swarm_id, job_id, node_count, request_id } = data;
@@ -59,6 +237,15 @@ router.on('event', (msg: any) => {
 
   // --- Core conversational events (explicit mapping for backwards compatibility) ---
   if (event === 'turn_started') {
+    if (
+      (!data?.prompt || typeof data.prompt !== 'string') &&
+      typeof data?.injection_id === 'string'
+    ) {
+      const prompt = injectionPromptMap.get(data.injection_id);
+      if (prompt) {
+        data.prompt = prompt;
+      }
+    }
     hub.broadcast({ type: 'turn_started', payload: data });
     return;
   }
@@ -74,8 +261,18 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'turn_complete') {
+    if (typeof data?.injection_id === 'string') {
+      injectionPromptMap.delete(data.injection_id);
+    }
     hub.broadcast({ type: 'turn_complete', payload: data });
     return;
+  }
+
+  if (event === 'task_complete') {
+    if (typeof data?.injection_id === 'string') {
+      injectionPromptMap.delete(data.injection_id);
+    }
+    handleAutoRoutingFromTaskComplete(data);
   }
 
   // Handle router rejections
@@ -212,6 +409,7 @@ app.post('/inject/:alias', (req, res) => {
         content: prompt
       });
       requestSwarmMap[request_id] = targetSwarm.swarm_id;
+      requestPromptMap.set(request_id, prompt);
       return res.json({ request_id });
     }
 
@@ -230,6 +428,7 @@ app.post('/inject/:alias', (req, res) => {
       content: prompt
     });
     requestSwarmMap[request_id] = targetSwarm.swarm_id;
+    requestPromptMap.set(request_id, prompt);
     return res.json({ request_id });
   }
 
@@ -249,6 +448,7 @@ app.post('/inject/:alias', (req, res) => {
   });
 
   requestSwarmMap[request_id] = swarm.swarm_id;
+  requestPromptMap.set(request_id, prompt);
 
   res.json({ request_id });
 });
