@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 
 const MAX_TURNS_PER_NODE = 300
+const STREAM_IDLE_COMPLETE_MS = 1500
 
 export type TurnPhase =
   | 'idle'
@@ -100,6 +101,51 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
   const pendingReasoningDeltas: Record<string, string[]> = {}
   const pendingReasoning: Record<string, string> = {}
   const pendingTaskComplete: Record<string, { content?: string }> = {}
+  const idleCompletionTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+
+  const timerKey = (swarmId: string, nodeId: number, injectionId: string) =>
+    `${swarmId}:${nodeId}:${injectionId}`
+
+  const clearIdleCompletionTimer = (swarmId: string, nodeId: number, injectionId: string) => {
+    const key = timerKey(String(swarmId), Number(nodeId), String(injectionId))
+    const timer = idleCompletionTimers[key]
+    if (timer) {
+      clearTimeout(timer)
+      delete idleCompletionTimers[key]
+    }
+  }
+
+  const scheduleIdleCompletion = (swarmId: string, nodeId: number, injectionId: string) => {
+    clearIdleCompletionTimer(swarmId, nodeId, injectionId)
+    const key = timerKey(String(swarmId), Number(nodeId), String(injectionId))
+    idleCompletionTimers[key] = setTimeout(() => {
+      const swarm = get().swarms[String(swarmId)]
+      if (!swarm) return
+      const node = swarm.nodes[Number(nodeId)]
+      if (!node) return
+
+      let changed = false
+      const updatedTurns: NodeTurn[] = node.turns.map((t) => {
+        if (t.injection_id !== injectionId) return t
+        if (t.phase === 'streaming') {
+          changed = true
+          return ({ ...t, phase: 'completed' } as NodeTurn)
+        }
+        return t
+      })
+
+      delete idleCompletionTimers[key]
+
+      if (!changed) return
+      get().addOrUpdateSwarm({
+        ...swarm,
+        nodes: {
+          ...swarm.nodes,
+          [Number(nodeId)]: { ...node, turns: capTurns(updatedTurns) }
+        }
+      })
+    }, STREAM_IDLE_COMPLETE_MS)
+  }
   const extractExecPolicyAmendment = (decision: unknown): string[] | undefined => {
     if (!decision || typeof decision !== 'object') return undefined
     const d = decision as Record<string, any>
@@ -280,30 +326,10 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
       }
 
       if (type === 'thread_status') {
-        const swarm = get().swarms[payload.swarm_id]
-        if (!swarm) return
-
-        // Fallback for missing turn_complete/task_complete events: when a thread
-        // is idle, ensure no node stays in a perpetual working state.
-        if (payload.status?.type !== 'idle') return
-
-        const nodeId = Number(payload.node_id)
-        const node = swarm.nodes[nodeId]
-        if (!node) return
-
-        const updatedTurns = node.turns.map((t) =>
-          t.phase === 'streaming' || t.phase === 'executing'
-            ? ({ ...t, phase: 'completed' } as NodeTurn)
-            : t
-        )
-
-        get().addOrUpdateSwarm({
-          ...swarm,
-          nodes: {
-            ...swarm.nodes,
-            [nodeId]: { ...node, turns: capTurns(updatedTurns) }
-          }
-        })
+        // Do not force-complete on generic thread idle: some runtimes emit
+        // transient idle statuses that can race with active streaming turns.
+        // Completion is handled by explicit terminal events and delta-idle timers.
+        return
       }
 
       if (type === 'turn_started') {
@@ -405,6 +431,11 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
 
         turn.deltas = [...turn.deltas, payload.content]
+        // If stream resumes after an idle auto-complete, reopen as streaming.
+        if (turn.phase === 'completed') {
+          turn.phase = 'streaming'
+        }
+        scheduleIdleCompletion(payload.swarm_id, nodeId, payload.injection_id)
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -440,6 +471,10 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         if (turn.deltas.length === 0) {
           turn.deltas = [payload.content]
         }
+        // In current router streams, many turns finalize with assistant but
+        // never emit turn_complete/task_complete. Treat assistant as terminal.
+        turn.phase = 'completed'
+        clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -471,6 +506,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
 
         turn.phase = 'completed'
+        clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -532,6 +568,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
                 ? [content]
                 : existing.deltas
           } as NodeTurn)
+          clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
         } else {
           // Do not overwrite provisional temp turns with mismatched injection IDs.
           // Late task_complete from a prior turn can otherwise pollute the current
@@ -650,6 +687,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             [nodeId]: { ...node, turns: capTurns(updatedTurns) }
           }
         })
+        clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
       }
 
       if (type === 'exec_approval_resolved') {
@@ -724,6 +762,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             [nodeId]: { ...node, turns: updatedTurns }
           }
         })
+        clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
       }
 
       if (type === 'command_completed') {
@@ -780,6 +819,7 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             [nodeId]: { ...node, turns: updatedTurns }
           }
         })
+        clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
       }
 
       if (type === 'usage') {

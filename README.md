@@ -198,3 +198,4 @@ npm --workspace=web/frontend run build
 - `docs/PROTOCOL_SPEC.md`
 - `docs/PROVIDER_INTERFACE.md`
 - `docs/USER_GUIDE.md`
+- `docs/QA_TEST_PLAN.md`

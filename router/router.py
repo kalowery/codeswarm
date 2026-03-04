@@ -536,6 +536,18 @@ def translate_event(event):
         msg = payload["params"]["msg"].get("message")
         return ("assistant", {**base, "content": msg})
 
+    if method in ("codex/event/item_completed", "item/completed"):
+        params = payload.get("params", {})
+        item = params.get("item")
+        if item is None:
+            item = params.get("msg", {}).get("item")
+
+        if isinstance(item, dict):
+            item_type_raw = item.get("type")
+            item_type = re.sub(r"[^a-z]", "", str(item_type_raw).lower())
+            if item_type == "agentmessage":
+                return ("turn_complete", base)
+
     if method == "codex/event/token_count":
         info = payload["params"]["msg"].get("info")
         if info:
