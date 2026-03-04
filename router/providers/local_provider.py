@@ -28,7 +28,7 @@ class LocalProvider(ClusterProvider):
         # Archive root (optional)
         self.archive_root = self.config.get("archive_root")
 
-    def launch(self, nodes: int) -> str:
+    def launch(self, nodes: int, agents_md_content: str | None = None) -> str:
         job_id = f"local_{uuid.uuid4().hex[:8]}"
         procs: List[subprocess.Popen] = []
 
@@ -36,6 +36,8 @@ class LocalProvider(ClusterProvider):
             node_index = f"{i:02d}"
             node_dir = self.workspace_root / job_id / f"node_{node_index}"
             node_dir.mkdir(parents=True, exist_ok=True)
+            if agents_md_content is not None:
+                (node_dir / "AGENTS.md").write_text(agents_md_content, encoding="utf-8")
 
             # Locate worker relative to repository root
             worker_path = (

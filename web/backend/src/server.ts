@@ -12,7 +12,7 @@ app.use(cors({
   origin: true,
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -370,11 +370,16 @@ router.on('event', (msg: any) => {
 
 // --- REST Endpoints ---
 app.post('/launch', (req, res) => {
-  const { nodes, prompt, alias } = req.body;
+  const { nodes, prompt, alias, agents_md_content } = req.body;
+  const agentsContent =
+    typeof agents_md_content === 'string' && agents_md_content.trim().length > 0
+      ? agents_md_content
+      : undefined;
 
   const request_id = router.send('swarm_launch', {
     nodes,
-    system_prompt: prompt
+    system_prompt: prompt,
+    agents_md_content: agentsContent
   });
 
   // Store alias temporarily until swarm_launched event arrives

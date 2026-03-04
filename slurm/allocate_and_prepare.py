@@ -3,6 +3,8 @@ import sys
 import argparse
 import subprocess
 import time
+import base64
+import shlex
 from pathlib import Path
 
 # Make project root importable
@@ -277,6 +279,7 @@ if __name__ == "__main__":
     parser.add_argument("--partition")
     parser.add_argument("--account")
     parser.add_argument("--qos")
+    parser.add_argument("--agents-md-b64")
     parser.add_argument("--launch-codex-test", action="store_true")
     parser.add_argument("--launch-codex-run", action="store_true")
 
@@ -326,6 +329,12 @@ if __name__ == "__main__":
     if args.launch_codex_run:
         run_base = f"{hpc_base}/runs/{job_id}"
         ssh_login(login_alias, f"mkdir -p {run_base}")
+        agents_md_content = None
+        if args.agents_md_b64:
+            try:
+                agents_md_content = base64.b64decode(args.agents_md_b64).decode("utf-8")
+            except Exception as e:
+                raise RuntimeError(f"Invalid --agents-md-b64 payload: {e}") from e
 
         for i in range(args.nodes):
             node_dir = f"{run_base}/node_{i:02d}"
@@ -334,6 +343,12 @@ if __name__ == "__main__":
                 login_alias,
                 f'echo "Node {i}: Say hello in one short sentence." > {node_dir}/PROMPT.txt'
             )
+            if agents_md_content is not None:
+                ssh_login(
+                    login_alias,
+                    f"cat > {shlex.quote(node_dir + '/AGENTS.md')}",
+                    input_text=agents_md_content,
+                )
 
     print("Waiting for RUNNING state...")
     wait_running(job_id, config)

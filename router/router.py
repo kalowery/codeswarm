@@ -960,9 +960,12 @@ def run_daemon(config, provider):
             if command == "swarm_launch":
                 nodes = payload.get("nodes", 1)
                 system_prompt = payload.get("system_prompt", "")
+                agents_md_content = payload.get("agents_md_content")
+                if not isinstance(agents_md_content, str) or not agents_md_content.strip():
+                    agents_md_content = None
 
                 try:
-                    job_id = provider.launch(nodes)
+                    job_id = provider.launch(nodes, agents_md_content=agents_md_content)
                 except Exception as e:
                     emit_event("command_rejected", {
                         "request_id": request_id,

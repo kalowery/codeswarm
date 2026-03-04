@@ -2,6 +2,7 @@ import subprocess
 import re
 import json
 import shlex
+import base64
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -15,7 +16,7 @@ class SlurmProvider(ClusterProvider):
         self.cluster_cfg = config.get("cluster", {})
         self.slurm_cfg = self.cluster_cfg.get("slurm", {})
 
-    def launch(self, nodes: int) -> str:
+    def launch(self, nodes: int, agents_md_content: str | None = None) -> str:
         config_path = self.config.get("_config_path")
         if not config_path:
             raise RuntimeError("Router config path not available for swarm launch")
@@ -53,6 +54,11 @@ class SlurmProvider(ClusterProvider):
 
         if qos:
             cmd += ["--qos", str(qos)]
+        if agents_md_content is not None and agents_md_content.strip():
+            agents_md_b64 = base64.b64encode(
+                agents_md_content.encode("utf-8")
+            ).decode("ascii")
+            cmd += ["--agents-md-b64", agents_md_b64]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 

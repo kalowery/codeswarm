@@ -6,7 +6,7 @@ import subprocess
 class ClusterProvider(ABC):
 
     @abstractmethod
-    def launch(self, nodes: int) -> str:
+    def launch(self, nodes: int, agents_md_content: str | None = None) -> str:
         """Launch swarm and return backend job_id."""
         pass
 

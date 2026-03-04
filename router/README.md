@@ -80,6 +80,7 @@ Payload:
 - `account` (optional)
 - `qos` (optional)
 - `system_prompt`
+- `agents_md_content` (optional, copied to each node as `AGENTS.md`)
 
 Behavior:
 1. Calls `allocate_and_prepare.py` locally.

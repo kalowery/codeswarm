@@ -10,6 +10,8 @@ export default function LaunchModal({ onClose }: Props) {
   const [alias, setAlias] = useState('')
   const [nodes, setNodes] = useState('1')
   const [prompt, setPrompt] = useState('')
+  const [agentsMdName, setAgentsMdName] = useState('')
+  const [agentsMdContent, setAgentsMdContent] = useState('')
   const [loading, setLoading] = useState(false)
 
   async function handleLaunch() {
@@ -26,7 +28,12 @@ export default function LaunchModal({ onClose }: Props) {
       const res = await fetch(`${apiBase}/launch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nodes: nodeCount, prompt, alias })
+        body: JSON.stringify({
+          nodes: nodeCount,
+          prompt,
+          alias,
+          agents_md_content: agentsMdContent || undefined
+        })
       })
 
       const data = await res.json()
@@ -77,6 +84,31 @@ export default function LaunchModal({ onClose }: Props) {
               className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-24"
               placeholder="You are a skilled GPU programmer..."
             />
+          </div>
+
+          <div>
+            <label className="block text-sm text-slate-400 mb-1">AGENTS.md (optional)</label>
+            <input
+              type="file"
+              accept=".md,text/markdown,text/plain"
+              onChange={async (e) => {
+                const file = e.target.files?.[0]
+                if (!file) {
+                  setAgentsMdName('')
+                  setAgentsMdContent('')
+                  return
+                }
+                const text = await file.text()
+                setAgentsMdName(file.name)
+                setAgentsMdContent(text)
+              }}
+              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 file:mr-3 file:rounded file:border-0 file:bg-slate-700 file:px-3 file:py-1 file:text-slate-100"
+            />
+            {agentsMdName ? (
+              <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
+            ) : (
+              <p className="mt-1 text-xs text-slate-500">If selected, this file is copied into each node as AGENTS.md.</p>
+            )}
           </div>
         </div>
 
