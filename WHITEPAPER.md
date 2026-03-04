@@ -1,325 +1,224 @@
-# Codeswarm
-### Toward Distributed Execution Fabrics for Multi‑Agent Systems
+# Codeswarm Whitepaper
+## Orchestrating Parallel Agent Teams as an Execution Organization
 
 ---
 
 ## Abstract
 
-Most large language model systems today live inside chat boxes.
+Most agent usage still happens in a single-threaded interaction model: one user, one agent, one task stream.
+Codeswarm explores a different model: many agents in parallel, supervised by a human operator, coordinated through explicit routing, queueing, and lifecycle control.
 
-Codeswarm asks a different question:
+This paper argues that Codeswarm is not just a convenience layer for running multiple agents. It is a control architecture that can amplify the practical impact of agent systems by:
 
-> What happens when we stop treating LLMs as conversational partners and start treating them as distributed execution actors?
+1. Multiplying parallel execution under human direction.
+2. Converting prompts into routable work items across teams.
+3. Enabling queue-driven handoffs that make sustained multi-agent collaboration possible.
 
-Codeswarm is an open-source experiment in orchestrating AI agents across multiple nodes using Slurm-managed infrastructure. It provides lifecycle authority, event normalization, execution semantics, and a control plane designed for parallel agent execution.
-
-This paper describes the architecture, design philosophy, failure semantics, and lessons learned while building a distributed execution fabric for multi-agent systems.
-
-It is not a product pitch.
-It is a systems experiment.
+With these properties, multi-agent operation can evolve from ad hoc prompting into an organizational structure: distributed teams with roles, delegation paths, and operational continuity.
 
 ---
 
-## 1. The Chat Interface Is a Trap
+## 1. Problem Statement: Single-Agent Workflows Cap Out Quickly
 
-The modern AI ecosystem is obsessed with chat.
+In a typical workflow, an agent is powerful but sequential.
+A human continuously context-switches between:
 
-Everything is a conversation.
-Everything is a prompt box.
+- Planning what to ask next.
+- Waiting for completion.
+- Manually handing outputs to another agent or task.
 
-But real work is not a conversation.
+This creates a throughput ceiling.
+Even if the underlying model is capable, execution is bottlenecked by one active interaction loop.
 
-Real work involves:
-
-- Parallel tasks
-- Tool execution
-- File system mutations
-- Failure recovery
-- Lifecycle control
-- Resource scheduling
-- Termination authority
-
-Chat interfaces collapse all of this into a single stream of tokens.
-
-That works for demos.
-It does not work for orchestration.
-
-Codeswarm starts from a different premise:
-
-> Agents are execution units, not chat transcripts.
+The issue is not model intelligence. The issue is orchestration.
 
 ---
 
-## 2. What Codeswarm Actually Is
+## 2. Codeswarm Thesis
 
-Codeswarm is a distributed execution fabric for launching and managing AI agents across multiple nodes.
+Codeswarm treats agents as distributed execution units rather than conversational endpoints.
 
-At its core:
+Core idea:
 
-- A **Swarm** is a distributed unit of execution.
-- A **Node** is an isolated agent worker.
-- An **Injection** is a deterministic stimulus.
-- A **Turn** is a bounded execution cycle.
+- Human operators should be able to manage many concurrent agent turns.
+- Work should be routable between agent groups.
+- Handoffs should be formalized in control-plane semantics, not improvised in copy/paste workflows.
 
-Each node operates independently within a swarm.
-Each injection can target one, some, or all nodes.
-
-The system is built to explore parallelism — not simulate a conversation.
+In practical terms, Codeswarm supplies a control plane where swarms and nodes can be launched, targeted, observed, and coordinated through structured events and command workflows.
 
 ---
 
-## 3. Architectural Overview
+## 3. System Model
 
-```
-Slurm Worker Nodes
-        ↓
-   Router (Python)
-        ↓
-   Backend (Node/WebSocket)
-        ↓
-   Frontend (Next.js)
-```
+Codeswarm exposes a layered architecture:
 
-### Router (Authoritative Control Plane)
+- Router (authoritative control plane)
+- Backend bridge (REST + WebSocket + transport translation)
+- Frontend (event-sourced operational UI)
+- Providers (local and Slurm-backed execution)
+- Workers (node-level Codex app-server wrappers)
 
-The router is the single source of truth.
+Key abstractions:
 
-Responsibilities:
+- `Swarm`: a team-level execution unit.
+- `Node`: an individual worker in that swarm.
+- `Injection`: a routed task stimulus.
+- `Turn`: one bounded execution cycle on a node.
 
-- Swarm lifecycle management
-- Slurm job submission
-- Event normalization
-- Execution event emission
-- TTL-based swarm retention
-- Identity binding (swarm_id ↔ job_id)
-
-The router converts raw worker RPC into normalized events:
-
-```
-codex_rpc → translate_event() → codeswarm.router.v1
-```
-
-Only execution-semantic events are surfaced:
-
-- turn_started
-- reasoning_delta
-- assistant_delta
-- command_started
-- command_completed
-- usage
-- turn_complete
-- swarm_removed
-
-Raw payloads are preserved for forward compatibility.
+This model is deliberately operational: identity, status, and message routing are explicit and machine-tractable.
 
 ---
 
-### Backend (Reconciliation Mirror)
+## 4. Human-Orchestrated Parallelism as a Force Multiplier
 
-The backend is not authoritative.
+Codeswarm multiplies user impact by enabling concurrent agent activity across nodes and swarms.
 
-It mirrors router state and:
+A single operator can:
 
-- Bridges TCP → WebSocket
-- Tracks request_id ↔ swarm_id
-- Performs authoritative reconciliation on `swarm_list`
-- Removes stale swarms
-- Forwards normalized events
+- Launch many workers at once.
+- Split one objective into independent parallel subtasks.
+- Route follow-up prompts to specific teams or idle targets.
+- Observe execution and intervene only where needed.
 
-If the router says a swarm is gone, it is gone.
+This changes the operator role from "continuous typist" to "distributed coordinator."
 
-This rule was learned the hard way.
-
----
-
-### Frontend (Event-Sourced Execution View)
-
-The frontend is execution-aware.
-
-It renders:
-
-- Per-node turns
-- Reasoning streams
-- Command execution blocks
-- Token usage
-- Lifecycle transitions
-
-It performs optimistic UI updates — but reconciles on authoritative rejection.
-
-Launch failure? Ghost removed.
-Swarm removed? UI drops it.
-No infinite “Launching…” illusions.
-
-Execution > illusion.
+The power effect is not linear.
+Once orchestration overhead drops, marginal agent capacity becomes significantly easier to exploit.
+The operator can spend more time on decomposition, prioritization, and quality control rather than transport mechanics.
 
 ---
 
-## 4. Authority and Reconciliation
+## 5. Queueing as a Coordination Primitive
 
-Distributed systems fail in subtle ways.
+The most important design choice in Codeswarm is not just parallel execution.
+It is queue-aware routing.
 
-Codeswarm learned early:
+Codeswarm supports cross-swarm enqueue + dispatch semantics (for example, route to first idle target).
+This means a prompt can be posted into a coordination queue and delivered when the target capacity is available.
 
-- SSH timeout ≠ termination
-- Slurm `NOT_FOUND` ≠ authoritative deletion
-- A single failed probe is not a lifecycle signal
+Why this matters:
 
-Router authority is singular.
-Backend reconciliation is symmetric.
-Frontend optimism is temporary.
+- It decouples work production from immediate worker availability.
+- It allows non-blocking delegation between teams.
+- It creates durable handoff behavior instead of fragile synchronous chains.
 
-This layering prevents:
-
-- Zombie swarms
-- Lifecycle flapping
-- Identity mismatches
-- Phantom terminations
+In organizational terms, queueing is equivalent to an internal task-routing system.
+It turns agents into participants in a workflow network rather than isolated responders.
 
 ---
 
-## 5. Slurm Is Not a Source of Truth
+## 6. From Multi-Agent Activity to Self-Sustaining Flows
 
-Slurm is a scheduling authority, not a lifecycle oracle.
+Codeswarm also supports auto-routing patterns from completed output.
+When configured, completion content can emit directives that create downstream work in other swarms.
 
-Cluster signals are eventually consistent.
+This enables feedback loops such as:
 
-Early versions treated transient SSH failure as job death.
+1. Discovery swarm identifies issues.
+2. Delegation rules enqueue work to implementation swarm.
+3. Implementation swarm emits verification tasks to QA swarm.
+4. QA swarm routes unresolved defects back to implementation.
 
-That was wrong.
+Once these loops are stable, the system begins to resemble an operating organization rather than a collection of isolated model calls.
 
-The current model:
+The key shift:
 
-- Disable aggressive 5s polling
-- Avoid treating single probe failures as termination
-- Preserve swarm state
-- Use TTL-based cleanup (default 15 minutes)
-
-Swarm removal is deliberate — not accidental.
-
----
-
-## 6. Multi-Node Execution
-
-Each swarm can span multiple nodes (subject to cluster policy).
-
-Workers are launched via SBATCH:
-
-```
-#SBATCH --nodes=N
-#SBATCH --ntasks=N
-```
-
-Each node receives an isolated workspace:
-
-```
-runs/<job_id>/node_XX/
-```
-
-Parallel injection is supported.
-
-Nodes operate independently.
-
-This is not simulated concurrency.
-It is real distributed execution.
+- Manual relay becomes structured delegation.
+- Sequential conversation becomes distributed workflow.
 
 ---
 
-## 7. Failure Handling Is a Feature
+## 7. Organizational Interpretation
 
-When a 2-node launch fails due to Slurm policy:
+An architecture like Codeswarm can represent an internal "agent org chart" in software:
 
-- Router emits `command_rejected`
-- Backend forwards failure
-- Frontend removes launch ghost
-- Error is displayed
-- No inconsistent state remains
+- Swarms as functional teams (e.g., triage, implementation, validation, documentation).
+- Nodes as parallel contributors inside a team.
+- Queue selectors as dispatch policy (idle-first, all, targeted nodes).
+- Routing directives as inter-team communication contracts.
 
-Failure is first-class.
+Under this pattern, "prompting" becomes analogous to issuing work orders in an organization:
 
-Not swallowed.
-Not hidden.
-Not retried blindly.
+- Assign to team.
+- Apply dispatch policy.
+- Track lifecycle and completion.
+- Re-queue or escalate.
 
----
-
-## 8. Lessons Learned
-
-### 1. Lifecycle authority must be singular.
-Mirrors must mirror. Not merge.
-
-### 2. Polling is weak signal.
-Timeouts are not facts.
-
-### 3. Optimistic UI must reconcile.
-Illusions are temporary.
-
-### 4. Identity must be immutable.
-A swarm_id ↔ job_id mapping must never drift.
-
-### 5. Execution semantics matter more than chat semantics.
-Tool calls and reasoning are first-class citizens.
+The significance is structural.
+It is not merely faster prompting.
+It is the emergence of controllable, persistent, distributed labor semantics for agents.
 
 ---
 
-## 9. Why This Matters
+## 8. Reliability and Control Boundaries
 
-As models improve, scaling up a single agent will plateau.
+Organizational behavior requires predictable control.
+Codeswarm addresses this with explicit boundaries:
 
-The interesting frontier is:
+- Router as lifecycle authority.
+- Event normalization for consistent frontend/backend semantics.
+- Provider abstraction for backend-neutral execution.
+- Persisted state and cleanup policies.
+- Approval pathways for execution-risk mediation.
 
-- Many agents
-- Coordinated in parallel
-- Operating with isolation
-- Sharing context strategically
-- Running across real infrastructure
-
-Codeswarm is not claiming to solve that future.
-
-It is a testbed.
-
-A control plane.
-
-A sandbox for distributed cognition experiments.
+These boundaries are essential.
+Without them, multi-agent systems degrade into noisy concurrent chats with ambiguous ownership and weak recovery behavior.
 
 ---
 
-## 10. What Codeswarm Is Not
+## 9. Practical Design Principles
 
-It is not:
+Based on current implementation and operational behavior, several principles stand out:
 
-- A chatbot wrapper
-- A generic workflow engine
-- A production orchestration framework (yet)
-- A replacement for Kubernetes
+1. Concurrency requires explicit state semantics.
+2. Routing must be first-class, not encoded in informal text conventions alone.
+3. Queue visibility is mandatory for operator trust and debuggability.
+4. Human override paths must remain simple and fast.
+5. Completion signals must be robust to heterogeneous runtime event patterns.
 
-It is an experimental execution fabric for multi-agent exploration.
-
----
-
-## 11. Future Directions
-
-- Worker heartbeat liveness model
-- Event-sourced backend persistence
-- Injection targeting UI
-- Multi-cluster routing
-- Swarm composition primitives
-- Coordinated agent messaging
-- Resource-aware scheduling heuristics
+These principles are not cosmetic.
+They determine whether a multi-agent environment is manageable at scale.
 
 ---
 
-## Closing Thought
+## 10. Limits and Risks
 
-The industry built chat interfaces because they were easy.
+This architecture introduces real system-level concerns:
 
-Distributed agent execution is harder.
+- Coordination complexity can exceed operator cognition if visibility is weak.
+- Poor routing policies can create feedback storms or queue starvation.
+- Missing terminal events can distort perceived node status without resilient state logic.
+- Over-automation can obscure accountability if delegation provenance is not preserved.
 
-But the interesting systems problems live there.
+Codeswarm should be viewed as execution infrastructure that requires governance, not autonomous magic.
 
-Codeswarm exists to explore that terrain.
+---
 
-Sometimes it crashes into Slurm policy limits.
-Sometimes it discovers lifecycle edge cases.
-Sometimes it behaves beautifully.
+## 11. Future Direction
 
-That’s the point.
+The next frontier is policy and structure:
+
+- Formal swarm roles and capability metadata.
+- Programmable routing policies and guardrails.
+- Queue QoS and priority lanes.
+- Supervisory metrics for throughput, bottlenecks, and failure recovery.
+- Organizational playbooks for predictable multi-agent operations.
+
+At that point, the architecture can support persistent agent organizations with stable operating procedures, not just session-based experimentation.
+
+---
+
+## Conclusion
+
+Codeswarm demonstrates that the value of agent systems can be substantially increased by improving orchestration, not just model quality.
+
+Its practical contribution is a control-plane approach to parallel agent execution with queue-driven inter-team delegation.
+That combination creates the foundation for self-sustaining multi-agent workflows and, potentially, fully structured agent organizations.
+
+In short:
+
+- Parallelism multiplies output.
+- Routing and queueing multiply coordination.
+- Together, they multiply organizational capability.
+
+Codeswarm is an early but concrete step toward that model.
