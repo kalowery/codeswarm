@@ -81,6 +81,8 @@ export default function Home() {
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
   const selected = useSwarmStore((s) => s.selectedSwarm)
   const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
+  const activeNodeBySwarm = useSwarmStore((s) => s.activeNodeBySwarm)
+  const setActiveNode = useSwarmStore((s) => s.setActiveNode)
   const interSwarmQueue = useSwarmStore((s) => s.interSwarmQueue)
   const setInterSwarmQueue = useSwarmStore((s) => s.setInterSwarmQueue)
   const launchError = useSwarmStore((s) => s.launchError)
@@ -164,6 +166,7 @@ export default function Home() {
   const [canScrollLeft, setCanScrollLeft] = useState(false)
   const [canScrollRight, setCanScrollRight] = useState(false)
   const [gridLayout, setGridLayout] = useState<GridLayout>({ cols: 1, scale: 1 })
+  const activeViewMode: SwarmViewMode = active ? (viewModeBySwarm[active.swarm_id] ?? 'tabs') : 'tabs'
 
   function updateScrollButtons() {
     const el = nodeScrollRef.current
@@ -191,10 +194,72 @@ export default function Home() {
     return () => window.removeEventListener('resize', handleResize)
   }, [active, selected, viewModeBySwarm])
 
+  useEffect(() => {
+    if (!active || activeViewMode !== 'grid') return
+
+    const orderedNodeIds = Object.keys(active.nodes)
+      .map((id) => Number(id))
+      .sort((a, b) => a - b)
+    if (orderedNodeIds.length === 0) return
+
+    const isEditableTarget = (target: EventTarget | null) => {
+      const el = target as HTMLElement | null
+      if (!el) return false
+      const tag = el.tagName
+      return (
+        el.isContentEditable ||
+        tag === 'INPUT' ||
+        tag === 'TEXTAREA' ||
+        tag === 'SELECT'
+      )
+    }
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || isEditableTarget(e.target)) return
+
+      const currentNodeId = activeNodeBySwarm[active.swarm_id] ?? orderedNodeIds[0]
+      let currentIdx = orderedNodeIds.indexOf(currentNodeId)
+      if (currentIdx < 0) currentIdx = 0
+
+      let nextIdx = currentIdx
+      let handled = false
+      const cols = Math.max(1, gridLayout.cols)
+
+      if (e.key === 'ArrowRight') {
+        nextIdx = Math.min(orderedNodeIds.length - 1, currentIdx + 1)
+        handled = true
+      } else if (e.key === 'ArrowLeft') {
+        nextIdx = Math.max(0, currentIdx - 1)
+        handled = true
+      } else if (e.key === 'ArrowDown') {
+        nextIdx = Math.min(orderedNodeIds.length - 1, currentIdx + cols)
+        handled = true
+      } else if (e.key === 'ArrowUp') {
+        nextIdx = Math.max(0, currentIdx - cols)
+        handled = true
+      } else if (e.key === 'Tab') {
+        nextIdx = e.shiftKey
+          ? (currentIdx - 1 + orderedNodeIds.length) % orderedNodeIds.length
+          : (currentIdx + 1) % orderedNodeIds.length
+        handled = true
+      }
+
+      if (!handled) return
+      e.preventDefault()
+
+      const nextNodeId = orderedNodeIds[nextIdx]
+      if (nextNodeId !== currentNodeId) {
+        setActiveNode(active.swarm_id, nextNodeId)
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [active, activeViewMode, activeNodeBySwarm, gridLayout.cols, setActiveNode])
+
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
   const [dotCount, setDotCount] = useState(0)
-  const activeViewMode: SwarmViewMode = active ? (viewModeBySwarm[active.swarm_id] ?? 'tabs') : 'tabs'
 
   function computeBestGridLayout(
     width: number,
@@ -760,8 +825,6 @@ export default function Home() {
             </div>
 
             {(() => {
-              const activeNodeBySwarm = useSwarmStore.getState().activeNodeBySwarm
-              const setActiveNode = useSwarmStore.getState().setActiveNode
               const activeNodeId = activeNodeBySwarm[active.swarm_id] ?? 0
               const activeNode = active.nodes[activeNodeId]
               const orderedNodeIds = Object.keys(active.nodes).map((id) => Number(id)).sort((a, b) => a - b)
@@ -801,6 +864,7 @@ export default function Home() {
                             <button
                               key={id}
                               onClick={() => setActiveNode(active.swarm_id, id)}
+                              onFocus={() => setActiveNode(active.swarm_id, id)}
                               className={`relative min-w-[72px] shrink-0 px-3 py-2 text-xs rounded-t-md transition border-b-2 ${
                                 isActive
                                   ? 'bg-slate-800 text-white border-indigo-500'
