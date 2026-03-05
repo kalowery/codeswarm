@@ -139,7 +139,7 @@ In-memory structures:
 ```
 SWARMS: { swarm_id → { job_id, node_count, status, ... } }
 JOB_TO_SWARM: { job_id → swarm_id }
-LAST_USAGE: { injection_id → token_count }
+LAST_USAGE: { job_id:node_id:injection_id → total_tokens }
 ```
 
 Persistent state stored in:
@@ -213,6 +213,20 @@ All events include:
 - `job_id`
 - `node_id`
 - `injection_id`
+
+`usage` additionally includes a normalized token breakdown:
+- `total_tokens`
+- `input_tokens`
+- `cached_input_tokens`
+- `output_tokens`
+- `reasoning_output_tokens`
+- `last_total_tokens`
+- `last_input_tokens`
+- `last_cached_input_tokens`
+- `last_output_tokens`
+- `last_reasoning_output_tokens`
+- `model_context_window`
+- `usage_source` (`codex/event/token_count` or `thread/tokenUsage/updated`)
 
 ---
 

@@ -96,6 +96,55 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _to_int(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _normalize_usage_payload(base, total_usage, last_usage, model_context_window, source_method):
+    total_tokens = _to_int((total_usage or {}).get("total_tokens"))
+    input_tokens = _to_int((total_usage or {}).get("input_tokens"))
+    cached_input_tokens = _to_int((total_usage or {}).get("cached_input_tokens"))
+    output_tokens = _to_int((total_usage or {}).get("output_tokens"))
+    reasoning_output_tokens = _to_int((total_usage or {}).get("reasoning_output_tokens"))
+
+    last_total_tokens = _to_int((last_usage or {}).get("total_tokens"))
+    last_input_tokens = _to_int((last_usage or {}).get("input_tokens"))
+    last_cached_input_tokens = _to_int((last_usage or {}).get("cached_input_tokens"))
+    last_output_tokens = _to_int((last_usage or {}).get("output_tokens"))
+    last_reasoning_output_tokens = _to_int((last_usage or {}).get("reasoning_output_tokens"))
+
+    if total_tokens is None:
+        return None
+
+    return {
+        **base,
+        # Backward-compatible top-level total used by existing UI.
+        "total_tokens": total_tokens,
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "last_total_tokens": last_total_tokens,
+        "last_input_tokens": last_input_tokens,
+        "last_cached_input_tokens": last_cached_input_tokens,
+        "last_output_tokens": last_output_tokens,
+        "last_reasoning_output_tokens": last_reasoning_output_tokens,
+        "model_context_window": _to_int(model_context_window),
+        "usage_source": source_method,
+    }
+
+
 def cleanup_terminated():
     now = time.time()
 
@@ -625,22 +674,53 @@ def translate_event(event):
                 return ("turn_complete", base)
 
     if method == "codex/event/token_count":
-        info = payload["params"]["msg"].get("info")
-        if info:
-            total = info["total_token_usage"]["total_tokens"]
-            last = LAST_USAGE.get(injection_id)
-            if last == total:
-                return None
-            LAST_USAGE[injection_id] = total
-            return ("usage", {**base, "total_tokens": total})
+        info = payload.get("params", {}).get("msg", {}).get("info")
+        if isinstance(info, dict):
+            usage_payload = _normalize_usage_payload(
+                base,
+                info.get("total_token_usage"),
+                info.get("last_token_usage"),
+                info.get("model_context_window"),
+                method,
+            )
+            if usage_payload:
+                usage_key = f"{job_id}:{node_id}:{injection_id}"
+                last = LAST_USAGE.get(usage_key)
+                if last == usage_payload["total_tokens"]:
+                    return None
+                LAST_USAGE[usage_key] = usage_payload["total_tokens"]
+                return ("usage", usage_payload)
 
     if method == "thread/tokenUsage/updated":
-        total = payload["params"]["tokenUsage"]["total"]["totalTokens"]
-        last = LAST_USAGE.get(injection_id)
-        if last == total:
-            return None
-        LAST_USAGE[injection_id] = total
-        return ("usage", {**base, "total_tokens": total})
+        usage = payload.get("params", {}).get("tokenUsage", {})
+        total_usage = usage.get("total", {})
+        last_usage = usage.get("last", {})
+        usage_payload = _normalize_usage_payload(
+            base,
+            {
+                "total_tokens": total_usage.get("totalTokens"),
+                "input_tokens": total_usage.get("inputTokens"),
+                "cached_input_tokens": total_usage.get("cachedInputTokens"),
+                "output_tokens": total_usage.get("outputTokens"),
+                "reasoning_output_tokens": total_usage.get("reasoningOutputTokens"),
+            },
+            {
+                "total_tokens": last_usage.get("totalTokens"),
+                "input_tokens": last_usage.get("inputTokens"),
+                "cached_input_tokens": last_usage.get("cachedInputTokens"),
+                "output_tokens": last_usage.get("outputTokens"),
+                "reasoning_output_tokens": last_usage.get("reasoningOutputTokens"),
+            },
+            usage.get("modelContextWindow"),
+            method,
+        )
+        if usage_payload:
+            usage_key = f"{job_id}:{node_id}:{injection_id}"
+            last = LAST_USAGE.get(usage_key)
+            if last == usage_payload["total_tokens"]:
+                return None
+            LAST_USAGE[usage_key] = usage_payload["total_tokens"]
+            return ("usage", usage_payload)
 
     if method == "thread/status/changed":
         status = payload.get("params", {}).get("status", {})

@@ -6,7 +6,7 @@ import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
 import Image from 'next/image'
 import ReactMarkdown from 'react-markdown'
-import type { NodeTurn } from '@/lib/store'
+import type { NodeTurn, TokenUsage } from '@/lib/store'
 import remarkGfm from 'remark-gfm'
 
 type SwarmViewMode = 'tabs' | 'grid'
@@ -15,6 +15,11 @@ interface GridLayout {
   cols: number
   scale: number
 }
+
+const USD_PER_M_INPUT = Number(process.env.NEXT_PUBLIC_INPUT_TOKENS_USD_PER_1M ?? '1.75')
+const USD_PER_M_CACHED_INPUT = Number(process.env.NEXT_PUBLIC_CACHED_INPUT_TOKENS_USD_PER_1M ?? '0.175')
+const USD_PER_M_OUTPUT = Number(process.env.NEXT_PUBLIC_OUTPUT_TOKENS_USD_PER_1M ?? '14')
+const USD_PER_M_REASONING_OUTPUT = Number(process.env.NEXT_PUBLIC_REASONING_OUTPUT_TOKENS_USD_PER_1M ?? '0')
 
 function normalizeMarkdown(content: string, phase: string) {
   if (phase !== 'completed') return content
@@ -27,6 +32,47 @@ function normalizeMarkdown(content: string, phase: string) {
   if (!match) return content
 
   return match[2].trim()
+}
+
+function estimateUsageUsd(usage: TokenUsage | undefined) {
+  if (!usage) return 0
+
+  const inputTokens = Math.max(0, usage.input_tokens ?? 0)
+  const cachedInputTokens = Math.max(0, usage.cached_input_tokens ?? 0)
+  const nonCachedInputTokens = Math.max(0, inputTokens - cachedInputTokens)
+  const outputTokens = Math.max(0, usage.output_tokens ?? 0)
+  const reasoningOutputTokens = Math.max(0, usage.reasoning_output_tokens ?? 0)
+
+  return (
+    (nonCachedInputTokens / 1_000_000) * USD_PER_M_INPUT +
+    (cachedInputTokens / 1_000_000) * USD_PER_M_CACHED_INPUT +
+    (outputTokens / 1_000_000) * USD_PER_M_OUTPUT +
+    (reasoningOutputTokens / 1_000_000) * USD_PER_M_REASONING_OUTPUT
+  )
+}
+
+function latestSessionUsage(turns: NodeTurn[]): TokenUsage | undefined {
+  let best: TokenUsage | undefined
+  for (const turn of turns) {
+    if (!turn.usage) continue
+    if (!best) {
+      best = turn.usage
+      continue
+    }
+    if ((turn.usage.total_tokens ?? 0) >= (best.total_tokens ?? 0)) {
+      best = turn.usage
+    }
+  }
+  return best
+}
+
+function formatUsd(value: number) {
+  return value.toLocaleString(undefined, {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 4
+  })
 }
 
 export default function Home() {
@@ -505,7 +551,11 @@ export default function Home() {
 
                 {turn.usage && (
                   <div className="text-[10px] text-slate-500">
-                    Tokens: {turn.usage}
+                    Tokens: {turn.usage.total_tokens}
+                    {typeof turn.usage.input_tokens === 'number' && typeof turn.usage.output_tokens === 'number'
+                      ? ` (in ${turn.usage.input_tokens}, out ${turn.usage.output_tokens})`
+                      : ''}
+                    {` · Est: ${formatUsd(estimateUsageUsd(turn.usage))}`}
                   </div>
                 )}
               </div>
@@ -567,29 +617,40 @@ export default function Home() {
           ))}
 
           {swarmList.map((swarm) => (
-            <div
-              key={swarm.swarm_id}
-              onClick={() => selectSwarm(swarm.swarm_id)}
-              className={`p-3 rounded cursor-pointer border transition relative ${
-                selected === swarm.swarm_id
-                  ? 'bg-slate-800 border-indigo-500'
-                  : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
-              }`}
-            >
-              {swarmNeedsAttention(swarm.swarm_id) && (
-                <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-              )}
-              {!swarmNeedsAttention(swarm.swarm_id) && swarmHasWorking(swarm.swarm_id) && (
-                <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
-              )}
-              {!swarmNeedsAttention(swarm.swarm_id) && !swarmHasWorking(swarm.swarm_id) && swarmIsReady(swarm.swarm_id) && (
-                <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-400" />
-              )}
-              <div className="font-medium">{swarm.alias}</div>
-              <div className="text-sm text-slate-400">
-                {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
-              </div>
-            </div>
+            (() => {
+              const swarmSessionCost = Object.values(swarm.nodes).reduce((sum, node) => {
+                return sum + estimateUsageUsd(latestSessionUsage(node.turns))
+              }, 0)
+
+              return (
+                <div
+                  key={swarm.swarm_id}
+                  onClick={() => selectSwarm(swarm.swarm_id)}
+                  className={`p-3 rounded cursor-pointer border transition relative ${
+                    selected === swarm.swarm_id
+                      ? 'bg-slate-800 border-indigo-500'
+                      : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
+                  }`}
+                >
+                  {swarmNeedsAttention(swarm.swarm_id) && (
+                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                  )}
+                  {!swarmNeedsAttention(swarm.swarm_id) && swarmHasWorking(swarm.swarm_id) && (
+                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
+                  )}
+                  {!swarmNeedsAttention(swarm.swarm_id) && !swarmHasWorking(swarm.swarm_id) && swarmIsReady(swarm.swarm_id) && (
+                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-400" />
+                  )}
+                  <div className="font-medium">{swarm.alias}</div>
+                  <div className="text-sm text-slate-400">
+                    {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
+                  </div>
+                  <div className="text-xs text-slate-500 mt-1">
+                    Est. spend: {formatUsd(swarmSessionCost)}
+                  </div>
+                </div>
+              )
+            })()
           ))}
           {swarmList.length === 0 && (
             <div className="text-slate-500 text-sm">No active swarms</div>
@@ -638,6 +699,16 @@ export default function Home() {
 
         {active && (
           <div>
+            {(() => {
+              const agentSessionCost = Object.values(active.nodes).reduce((sum, node) => {
+                return sum + estimateUsageUsd(latestSessionUsage(node.turns))
+              }, 0)
+              return (
+                <div className="mb-2 text-xs text-slate-400">
+                  Estimated spend (swarm session): {formatUsd(agentSessionCost)}
+                </div>
+              )
+            })()}
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h1 className="text-xl font-semibold">{active.alias}</h1>
@@ -723,6 +794,8 @@ export default function Home() {
                           const needsAttention = nodeNeedsAttention(active.swarm_id, id)
                           const isWorking = nodeIsWorking(active.swarm_id, id)
                           const isReady = nodeIsReady(active.swarm_id, id)
+                          const nodeSessionUsage = latestSessionUsage(active.nodes[id]?.turns ?? [])
+                          const nodeSessionCost = estimateUsageUsd(nodeSessionUsage)
 
                           return (
                             <button
@@ -743,7 +816,10 @@ export default function Home() {
                               {isWorking && !isActive && (
                                 <span className="absolute bottom-1 left-1 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
                               )}
-                              Agent {id}
+                              <div>Agent {id}</div>
+                              <div className="text-[10px] text-slate-500">
+                                {formatUsd(nodeSessionCost)}
+                              </div>
                             </button>
                           )
                         })}
@@ -780,6 +856,8 @@ export default function Home() {
                       const node = active.nodes[id]
                       const isWorking = nodeIsWorking(active.swarm_id, id)
                       const isReady = nodeIsReady(active.swarm_id, id)
+                      const nodeSessionUsage = latestSessionUsage(node.turns)
+                      const nodeSessionCost = estimateUsageUsd(nodeSessionUsage)
 
                       return (
                         <div
@@ -823,6 +901,7 @@ export default function Home() {
                           >
                             <div className="text-[11px] text-slate-300 border-b border-slate-800 pb-1 mb-2 w-full text-left">
                               Agent {id}
+                              <span className="ml-2 text-[10px] text-slate-500">{formatUsd(nodeSessionCost)}</span>
                             </div>
                             <div className="h-[240px] overflow-y-auto pr-1">
                               {renderTurns(node.turns, active.job_id, active.known_exec_policies)}

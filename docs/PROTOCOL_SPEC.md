@@ -268,6 +268,21 @@ Router consumes worker outbox `codex_rpc` messages and emits normalized events.
 - token usage updates -> `usage`
 - `thread/status/changed` -> `thread_status`
 
+`usage` payload includes normalized token metrics:
+
+- `total_tokens`
+- `input_tokens`
+- `cached_input_tokens`
+- `output_tokens`
+- `reasoning_output_tokens`
+- `last_total_tokens`
+- `last_input_tokens`
+- `last_cached_input_tokens`
+- `last_output_tokens`
+- `last_reasoning_output_tokens`
+- `model_context_window`
+- `usage_source`
+
 ### 4.2 Reasoning and task events
 
 - `codex/event/agent_reasoning_delta` -> `reasoning_delta`

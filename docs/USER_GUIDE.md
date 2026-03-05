@@ -142,6 +142,13 @@ Router sends `swarm_terminate`, provider terminates backend resources, and UI re
 - Router persists swarm registry in `router_state.json`.
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
 - Router marks terminated swarms, then prunes them by TTL/cap (`swarm_removed`).
+- UI shows per-agent and per-swarm estimated spend from cumulative token usage.
+- Optional frontend pricing env vars (USD per 1M tokens):
+  - `NEXT_PUBLIC_INPUT_TOKENS_USD_PER_1M`
+  - `NEXT_PUBLIC_CACHED_INPUT_TOKENS_USD_PER_1M`
+  - `NEXT_PUBLIC_OUTPUT_TOKENS_USD_PER_1M`
+  - `NEXT_PUBLIC_REASONING_OUTPUT_TOKENS_USD_PER_1M`
+- Current defaults are set for `gpt-5.3-codex`: input `1.75`, cached input `0.175`, output `14`, reasoning output `0` (reasoning billed via output unless overridden).
 
 ## 12. Troubleshooting
 

@@ -23,6 +23,21 @@ export interface ExecutionState {
   status: 'running' | 'completed'
 }
 
+export interface TokenUsage {
+  total_tokens: number
+  input_tokens?: number
+  cached_input_tokens?: number
+  output_tokens?: number
+  reasoning_output_tokens?: number
+  last_total_tokens?: number
+  last_input_tokens?: number
+  last_cached_input_tokens?: number
+  last_output_tokens?: number
+  last_reasoning_output_tokens?: number
+  model_context_window?: number
+  usage_source?: string
+}
+
 export interface NodeTurn {
   injection_id: string
   prompt: string
@@ -39,7 +54,7 @@ export interface NodeTurn {
     available_decisions?: Array<string | Record<string, any>>
   }
   error?: string
-  usage?: number
+  usage?: TokenUsage
 }
 
 export interface NodeState {
@@ -835,9 +850,30 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
+        const usage: TokenUsage = {
+          total_tokens: Number(payload.total_tokens ?? 0),
+          input_tokens: typeof payload.input_tokens === 'number' ? payload.input_tokens : undefined,
+          cached_input_tokens: typeof payload.cached_input_tokens === 'number' ? payload.cached_input_tokens : undefined,
+          output_tokens: typeof payload.output_tokens === 'number' ? payload.output_tokens : undefined,
+          reasoning_output_tokens:
+            typeof payload.reasoning_output_tokens === 'number' ? payload.reasoning_output_tokens : undefined,
+          last_total_tokens: typeof payload.last_total_tokens === 'number' ? payload.last_total_tokens : undefined,
+          last_input_tokens: typeof payload.last_input_tokens === 'number' ? payload.last_input_tokens : undefined,
+          last_cached_input_tokens:
+            typeof payload.last_cached_input_tokens === 'number' ? payload.last_cached_input_tokens : undefined,
+          last_output_tokens: typeof payload.last_output_tokens === 'number' ? payload.last_output_tokens : undefined,
+          last_reasoning_output_tokens:
+            typeof payload.last_reasoning_output_tokens === 'number'
+              ? payload.last_reasoning_output_tokens
+              : undefined,
+          model_context_window:
+            typeof payload.model_context_window === 'number' ? payload.model_context_window : undefined,
+          usage_source: typeof payload.usage_source === 'string' ? payload.usage_source : undefined
+        }
+
         const updatedTurns: NodeTurn[] = node.turns.map((t) =>
           t.injection_id === payload.injection_id
-            ? ({ ...t, usage: payload.total_tokens } as NodeTurn)
+            ? ({ ...t, usage } as NodeTurn)
             : t
         )
 
