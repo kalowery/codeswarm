@@ -32,9 +32,9 @@ const injectionPromptMap = new Map<string, string>();
 const processedAutoRoutes = new Set<string>();
 
 type AutoRouteDirective =
-  | { targetAlias: string; mode: 'idle'; prompt: string }
-  | { targetAlias: string; mode: 'all'; prompt: string }
-  | { targetAlias: string; mode: 'nodes'; prompt: string; nodes: number[] };
+  | { targetAlias?: string; mode: 'idle'; prompt: string }
+  | { targetAlias?: string; mode: 'all'; prompt: string }
+  | { targetAlias?: string; mode: 'nodes'; prompt: string; nodes: number[] };
 
 function parseNodeSpec(expr: string): number[] {
   const resolved = new Set<number>();
@@ -76,41 +76,68 @@ function extractText(value: any): string {
 
 function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
   const directives: AutoRouteDirective[] = [];
-  const lines = text.split(/\r?\n/);
-  const prefix = '(?:[-*+]\\s+|\\d+\\.\\s+|>\\s+)?';
+  const startRegex = /^(?:\s*(?:[-*+]|\d+\.)\s+|\s*>\s+)?(\/(?:swarm\[[^\]\r\n]+\]\/(?:all|idle|first-idle|(?:agent|node)\[[^\]\r\n]+\])|all|(?:agent|node)\[[^\]\r\n]+\]))(?:\s+|$)/gm;
+  const commands: Array<{ command: string; lineStart: number; bodyStart: number }> = [];
 
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.includes('/swarm[')) continue;
+  for (const match of text.matchAll(startRegex)) {
+    const raw = match[0] ?? '';
+    const command = (match[1] ?? '').trim();
+    const lineStart = match.index ?? 0;
+    commands.push({
+      command,
+      lineStart,
+      bodyStart: lineStart + raw.length
+    });
+  }
 
-    const crossAllMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/all\\s+([\\s\\S]+)$`));
-    if (crossAllMatch) {
-      const targetAlias = (crossAllMatch[1] ?? '').trim();
-      const prompt = (crossAllMatch[2] ?? '').trim();
-      if (targetAlias && prompt) {
-        directives.push({ targetAlias, mode: 'all', prompt });
+  for (let i = 0; i < commands.length; i += 1) {
+    const current = commands[i];
+    const next = commands[i + 1];
+    const prompt = text
+      .slice(current.bodyStart, next ? next.lineStart : text.length)
+      .trim();
+    if (!prompt) continue;
+
+    const command = current.command;
+
+    if (command.startsWith('/swarm[')) {
+      const crossAllMatch = command.match(/^\/swarm\[(.+?)\]\/all$/);
+      if (crossAllMatch) {
+        const targetAlias = (crossAllMatch[1] ?? '').trim();
+        if (targetAlias) directives.push({ targetAlias, mode: 'all', prompt });
+        continue;
+      }
+
+      const crossIdleMatch = command.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)$/);
+      if (crossIdleMatch) {
+        const targetAlias = (crossIdleMatch[1] ?? '').trim();
+        if (targetAlias) directives.push({ targetAlias, mode: 'idle', prompt });
+        continue;
+      }
+
+      const crossAgentMatch = command.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\]$/);
+      if (crossAgentMatch) {
+        const targetAlias = (crossAgentMatch[1] ?? '').trim();
+        const expr = (crossAgentMatch[2] ?? '').trim();
+        const nodes = parseNodeSpec(expr);
+        if (targetAlias && nodes.length > 0) {
+          directives.push({ targetAlias, mode: 'nodes', prompt, nodes });
+        }
       }
       continue;
     }
 
-    const crossIdleMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/(idle|first-idle)\\s+([\\s\\S]+)$`));
-    if (crossIdleMatch) {
-      const targetAlias = (crossIdleMatch[1] ?? '').trim();
-      const prompt = (crossIdleMatch[3] ?? '').trim();
-      if (targetAlias && prompt) {
-        directives.push({ targetAlias, mode: 'idle', prompt });
-      }
+    if (command === '/all') {
+      directives.push({ mode: 'all', prompt });
       continue;
     }
 
-    const crossAgentMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/(?:agent|node)\\[(.+?)\\]\\s*([\\s\\S]+)$`));
-    if (crossAgentMatch) {
-      const targetAlias = (crossAgentMatch[1] ?? '').trim();
-      const expr = (crossAgentMatch[2] ?? '').trim();
-      const prompt = (crossAgentMatch[3] ?? '').trim();
+    const localAgentMatch = command.match(/^\/(?:agent|node)\[(.+?)\]$/);
+    if (localAgentMatch) {
+      const expr = (localAgentMatch[1] ?? '').trim();
       const nodes = parseNodeSpec(expr);
-      if (targetAlias && prompt && nodes.length > 0) {
-        directives.push({ targetAlias, mode: 'nodes', prompt, nodes });
+      if (nodes.length > 0) {
+        directives.push({ mode: 'nodes', prompt, nodes });
       }
     }
   }
@@ -118,10 +145,9 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
   return directives;
 }
 
-function handleAutoRoutingFromTaskComplete(data: any) {
+function handleAutoRoutingFromFinalText(data: any, finalText: string) {
   const injectionId = typeof data?.injection_id === 'string' ? data.injection_id : '';
   if (!injectionId || processedAutoRoutes.has(injectionId)) return;
-  processedAutoRoutes.add(injectionId);
 
   const sourceSwarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
   if (!sourceSwarmId) return;
@@ -129,21 +155,24 @@ function handleAutoRoutingFromTaskComplete(data: any) {
   const sourceSwarm = state.getById(sourceSwarmId);
   if (!sourceSwarm) return;
 
-  const finalText = extractText(data?.last_agent_message).trim();
-  if (!finalText) return;
+  const normalizedText = finalText.trim();
+  if (!normalizedText) return;
 
-  const directives = parseAutoRouteDirectives(finalText);
+  const directives = parseAutoRouteDirectives(normalizedText);
   if (directives.length === 0) return;
+  processedAutoRoutes.add(injectionId);
 
   for (const directive of directives) {
-    const targetSwarm = state.getByAlias(directive.targetAlias);
+    const targetSwarm = directive.targetAlias
+      ? state.getByAlias(directive.targetAlias)
+      : sourceSwarm;
     if (!targetSwarm) {
       hub.broadcast({
         type: 'auto_route_ignored',
         payload: {
           source_swarm_id: sourceSwarmId,
           source_alias: sourceSwarm.alias,
-          target_alias: directive.targetAlias,
+          target_alias: directive.targetAlias ?? sourceSwarm.alias,
           reason: 'unknown target alias',
           injection_id: injectionId,
           mode: directive.mode
@@ -175,6 +204,11 @@ function handleAutoRoutingFromTaskComplete(data: any) {
       }
     });
   }
+}
+
+function handleAutoRoutingFromTaskComplete(data: any) {
+  const finalText = extractText(data?.last_agent_message);
+  handleAutoRoutingFromFinalText(data, finalText);
 }
 
 // --- Helper: request swarm status ---
@@ -235,6 +269,10 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'assistant') {
+    // Some runtimes emit final assistant text without a task_complete payload.
+    // Parse assistant snapshots as a fallback for /-prefixed auto-routing.
+    const assistantText = extractText(data?.content);
+    handleAutoRoutingFromFinalText(data, assistantText);
     hub.broadcast({ type: 'assistant', payload: data });
     return;
   }
