@@ -11,6 +11,7 @@ router_state.json
 # Local provider runtime artifacts
 runs/
 web/backend/state.json
+log.txt
 
 # Python cache
 **/__pycache__/
