@@ -63,16 +63,17 @@ def build_sbatch_script(args, config):
     if args.launch_codex_run:
         lines.extend([
             "",
-            "# Per-node working directory isolation (use existing runs/<job_id>/node_XX layout)",
+            "# Per-agent working directory isolation (runs/<job_id>/agent_XX layout)",
             f"srun bash -c '\n"
             f"export CODESWARM_JOB_ID=$SLURM_JOB_ID\n"
             f"export CODESWARM_NODE_ID=$SLURM_PROCID\n"
             f"export CODESWARM_BASE_DIR={hpc_base}\n"
             f"export CODESWARM_CODEX_BIN={hpc_base}/tools/npm-global/bin/codex\n"
-            f"NODE_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
-            f"NODE_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/node_${{NODE_INDEX}}\"\n"
-            f"mkdir -p \"$NODE_WORKDIR\"\n"
-            f"cd \"$NODE_WORKDIR\"\n"
+            f"export PATH={hpc_base}/tools/npm-global/bin:$PATH\n"
+            f"AGENT_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
+            f"AGENT_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/agent_${{AGENT_INDEX}}\"\n"
+            f"mkdir -p \"$AGENT_WORKDIR\"\n"
+            f"cd \"$AGENT_WORKDIR\"\n"
             f"python3 {hpc_base}/agent/codex_worker.py\n"
             f"'",
         ])
@@ -82,6 +83,7 @@ def build_sbatch_script(args, config):
             f"export WORKSPACE_ROOT={workspace_root}",
             f"export CLUSTER_SUBDIR={cluster_subdir}",
             f"export NPM_CONFIG_PREFIX={hpc_base}/tools/npm-global",
+            f"export PATH={hpc_base}/tools/npm-global/bin:$PATH",
             f"srun --ntasks-per-node=1 {hpc_base}/tools/npm-global/bin/codex --ask-for-approval never exec --skip-git-repo-check \"Say hello in one short sentence.\"",
         ])
 
@@ -105,6 +107,7 @@ def ensure_codex_ready(config):
     npm_bin = f"{node_bin}/npm"
     npm_prefix = f"{tools_dir}/npm-global"
     codex_bin = f"{npm_prefix}/bin/codex"
+    beads_bin = f"{npm_prefix}/bin/beads"
 
     # Ensure Node/npm exist in workspace
     if ssh_login(login_alias, f'test -x "{npm_bin}"').returncode != 0:
@@ -127,11 +130,32 @@ def ensure_codex_ready(config):
             print(result.stderr)
             sys.exit(1)
 
+    # Ensure beads installed in workspace npm-global tools (same install pattern as codex)
+    BEADS_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
+
+    if ssh_login(login_alias, f'test -x "{beads_bin}"').returncode != 0:
+        print("beads not found in workspace. Installing...")
+        install_cmd = (
+            f'NPM_CONFIG_PREFIX="{npm_prefix}" '
+            f'"{npm_bin}" install -g beads@{BEADS_VERSION}'
+        )
+        result = ssh_login(login_alias, install_cmd)
+        if result.returncode != 0:
+            print("beads installation failed:")
+            print(result.stderr)
+            sys.exit(1)
+
     # Verify installed codex version (defensive check)
     version_check = ssh_login(login_alias, f'"{codex_bin}" --version')
     if version_check.returncode != 0:
         print("ERROR: Codex binary exists but failed to execute --version.")
         print(version_check.stderr)
+        sys.exit(1)
+
+    beads_version_check = ssh_login(login_alias, f'"{beads_bin}" --version')
+    if beads_version_check.returncode != 0:
+        print("ERROR: beads binary exists but failed to execute --version.")
+        print(beads_version_check.stderr)
         sys.exit(1)
 
     # Check for existing Codex home configuration
@@ -337,16 +361,16 @@ if __name__ == "__main__":
                 raise RuntimeError(f"Invalid --agents-md-b64 payload: {e}") from e
 
         for i in range(args.nodes):
-            node_dir = f"{run_base}/node_{i:02d}"
-            ssh_login(login_alias, f"mkdir -p {node_dir}")
+            agent_dir = f"{run_base}/agent_{i:02d}"
+            ssh_login(login_alias, f"mkdir -p {agent_dir}")
             ssh_login(
                 login_alias,
-                f'echo "Node {i}: Say hello in one short sentence." > {node_dir}/PROMPT.txt'
+                f'echo "Agent {i}: Say hello in one short sentence." > {agent_dir}/PROMPT.txt'
             )
             if agents_md_content is not None:
                 ssh_login(
                     login_alias,
-                    f"cat > {shlex.quote(node_dir + '/AGENTS.md')}",
+                    f"cat > {shlex.quote(agent_dir + '/AGENTS.md')}",
                     input_text=agents_md_content,
                 )
 

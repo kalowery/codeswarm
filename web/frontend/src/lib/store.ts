@@ -468,8 +468,14 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
           return
         }
 
-        if (turn.deltas.length === 0) {
-          turn.deltas = [payload.content]
+        const snapshot = typeof payload.content === 'string' ? payload.content : ''
+        const streamed = turn.deltas.join('')
+        // Prefer the terminal assistant snapshot when it is more complete than
+        // accumulated deltas (which can occasionally miss chunks under load).
+        if (!streamed) {
+          turn.deltas = snapshot ? [snapshot] : turn.deltas
+        } else if (snapshot && snapshot.length > streamed.length) {
+          turn.deltas = [snapshot]
         }
         // In current router streams, many turns finalize with assistant but
         // never emit turn_complete/task_complete. Treat assistant as terminal.

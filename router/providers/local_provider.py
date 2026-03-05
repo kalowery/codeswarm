@@ -33,11 +33,11 @@ class LocalProvider(ClusterProvider):
         procs: List[subprocess.Popen] = []
 
         for i in range(nodes):
-            node_index = f"{i:02d}"
-            node_dir = self.workspace_root / job_id / f"node_{node_index}"
-            node_dir.mkdir(parents=True, exist_ok=True)
+            agent_index = f"{i:02d}"
+            agent_dir = self.workspace_root / job_id / f"agent_{agent_index}"
+            agent_dir.mkdir(parents=True, exist_ok=True)
             if agents_md_content is not None:
-                (node_dir / "AGENTS.md").write_text(agents_md_content, encoding="utf-8")
+                (agent_dir / "AGENTS.md").write_text(agents_md_content, encoding="utf-8")
 
             # Locate worker relative to repository root
             worker_path = (
@@ -55,7 +55,7 @@ class LocalProvider(ClusterProvider):
 
             p = subprocess.Popen(
                 ["python3", str(worker_path)],
-                cwd=str(node_dir),
+                cwd=str(agent_dir),
                 env=env,
             )
 

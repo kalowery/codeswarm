@@ -18,7 +18,7 @@ export default function LaunchModal({ onClose }: Props) {
     const nodeCount = parseInt(nodes, 10)
 
     if (isNaN(nodeCount) || nodeCount < 1) {
-      alert('Node count must be at least 1')
+      alert('Agent count must be at least 1')
       return
     }
 
@@ -66,7 +66,7 @@ export default function LaunchModal({ onClose }: Props) {
           </div>
 
           <div>
-            <label className="block text-sm text-slate-400 mb-1">Nodes</label>
+            <label className="block text-sm text-slate-400 mb-1">Agents</label>
             <input
               type="number"
               min={1}

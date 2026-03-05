@@ -24,3 +24,14 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+.markdown-content p,
+.markdown-content li {
+  word-break: normal;
+  overflow-wrap: break-word;
+}
+
+.markdown-content pre {
+  overflow-x: auto;
+  white-space: pre;
+}

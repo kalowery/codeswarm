@@ -302,7 +302,7 @@ export default function Home() {
           <div key={idx} className="space-y-2">
             {turn.prompt && (
               <div className="flex justify-end">
-                <div className="max-w-[75%] bg-indigo-600 text-white px-3 py-2 rounded-lg rounded-br-sm break-all overflow-hidden">
+                <div className="max-w-[75%] bg-indigo-600 text-white px-3 py-2 rounded-lg rounded-br-sm break-words overflow-hidden">
                   {turn.prompt}
                 </div>
               </div>
@@ -449,7 +449,7 @@ export default function Home() {
                         : turn.execution.command}
                     </div>
                     {turn.execution.stdout && (
-                      <div className="mt-1 text-emerald-400 whitespace-pre-wrap break-all overflow-x-auto">
+                      <div className="mt-1 text-emerald-400 whitespace-pre-wrap break-words overflow-x-auto">
                         {turn.execution.stdout}
                       </div>
                     )}
@@ -462,11 +462,12 @@ export default function Home() {
                 )}
 
                 {turn.deltas.length > 0 && (() => {
-                  const raw = turn.deltas.join('').trim()
+                  const raw = turn.deltas.join('')
+                  if (!raw.trim()) return null
 
                   if (turn.phase !== 'completed') {
                     return (
-                      <div className="markdown-content break-all overflow-x-auto text-sm leading-relaxed" style={{ overflowWrap: 'anywhere' }}>
+                      <div className="markdown-content break-words overflow-x-auto text-sm leading-relaxed" style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}>
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
                           {raw}
                         </ReactMarkdown>
@@ -478,7 +479,7 @@ export default function Home() {
                   const showRaw = raw !== formatted
 
                   return (
-                    <div className="markdown-content break-all overflow-x-auto text-sm leading-relaxed space-y-2" style={{ overflowWrap: 'anywhere' }}>
+                    <div className="markdown-content break-words overflow-x-auto text-sm leading-relaxed space-y-2" style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}>
                       {showRaw && (
                         <details className="text-xs text-slate-300">
                           <summary className="cursor-pointer select-none text-slate-400">
@@ -586,7 +587,7 @@ export default function Home() {
               )}
               <div className="font-medium">{swarm.alias}</div>
               <div className="text-sm text-slate-400">
-                {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} node
+                {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
               </div>
             </div>
           ))}
@@ -618,7 +619,7 @@ export default function Home() {
                         {sourceAlias} {'->'} {targetAlias}
                       </div>
                       <div className="text-slate-500">
-                        selector={item.selector ?? 'idle'} · age={ageSec}s
+                        selector={(item.selector === 'nodes' ? 'agents' : (item.selector ?? 'idle'))} · age={ageSec}s
                       </div>
                       {item.content && (
                         <div className="text-slate-400 truncate">{item.content}</div>
@@ -669,7 +670,7 @@ export default function Home() {
 
             <div className="mb-3 flex items-center justify-between">
               <div className="text-xs text-slate-500">
-                Nodes ({Object.keys(active.nodes).length})
+                Agents ({Object.keys(active.nodes).length})
               </div>
               <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs">
                 <button
@@ -707,7 +708,7 @@ export default function Home() {
                           <button
                             className="shrink-0 h-7 w-7 rounded border border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
                             onClick={() => scrollNodeTabs('left')}
-                            aria-label="Scroll nodes left"
+                            aria-label="Scroll agents left"
                           >
                             &lt;
                           </button>
@@ -742,7 +743,7 @@ export default function Home() {
                               {isWorking && !isActive && (
                                 <span className="absolute bottom-1 left-1 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
                               )}
-                              Node {id}
+                              Agent {id}
                             </button>
                           )
                         })}
@@ -751,7 +752,7 @@ export default function Home() {
                           <button
                             className="shrink-0 h-7 w-7 rounded border border-slate-700 bg-slate-900 text-slate-300 hover:bg-slate-800"
                             onClick={() => scrollNodeTabs('right')}
-                            aria-label="Scroll nodes right"
+                            aria-label="Scroll agents right"
                           >
                             &gt;
                           </button>
@@ -821,7 +822,7 @@ export default function Home() {
                             className="p-2"
                           >
                             <div className="text-[11px] text-slate-300 border-b border-slate-800 pb-1 mb-2 w-full text-left">
-                              Node {id}
+                              Agent {id}
                             </div>
                             <div className="h-[240px] overflow-y-auto pr-1">
                               {renderTurns(node.turns, active.job_id, active.known_exec_policies)}
@@ -866,7 +867,7 @@ export default function Home() {
 
                       const crossAllMatch = trimmed.match(/^\/swarm\[(.+?)\]\/all\s+([\s\S]+)$/)
                       const crossIdleMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)\s+([\s\S]+)$/)
-                      const crossNodeMatch = trimmed.match(/^\/swarm\[(.+?)\]\/node\[(.+?)\]\s*([\s\S]+)$/)
+                      const crossAgentMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\]\s*([\s\S]+)$/)
 
                       if (crossAllMatch) {
                         targetAlias = crossAllMatch[1].trim()
@@ -879,10 +880,10 @@ export default function Home() {
                         promptText = crossIdleMatch[3].trim()
                         if (!targetAlias || !promptText) return
                         selector = 'idle'
-                      } else if (crossNodeMatch) {
-                        targetAlias = crossNodeMatch[1].trim()
-                        const expr = crossNodeMatch[2].trim()
-                        promptText = crossNodeMatch[3].trim()
+                      } else if (crossAgentMatch) {
+                        targetAlias = crossAgentMatch[1].trim()
+                        const expr = crossAgentMatch[2].trim()
+                        promptText = crossAgentMatch[3].trim()
                         if (!targetAlias || !promptText) return
                         selector = 'nodes'
                         const resolved = new Set<number>()
@@ -912,10 +913,10 @@ export default function Home() {
                           if (!promptText) return
                           targetNodes = 'all'
                         } else {
-                        const nodeMatch = trimmed.match(/^\/node\[(.+?)\]\s*([\s\S]+)$/)
-                        if (nodeMatch) {
-                          const expr = nodeMatch[1].trim()
-                          promptText = nodeMatch[2].trim()
+                        const agentMatch = trimmed.match(/^\/(?:agent|node)\[(.+?)\]\s*([\s\S]+)$/)
+                        if (agentMatch) {
+                          const expr = agentMatch[1].trim()
+                          promptText = agentMatch[2].trim()
                           if (!promptText) return
                           const resolved = new Set<number>()
                           expr.split(',').forEach((part) => {
@@ -1002,7 +1003,7 @@ export default function Home() {
                 }}
               />
               <div className="text-xs text-slate-500 mt-1">
-                Enter to send. Supported prefixes: <code>/all</code>, <code>/node[0,2-4]</code>, <code>/swarm[alias]/idle</code>, <code>/swarm[alias]/all</code>, <code>/swarm[alias]/node[...]</code>.
+                Enter to send. Supported prefixes: <code>/all</code>, <code>/agent[0,2-4]</code>, <code>/swarm[alias]/idle</code>, <code>/swarm[alias]/all</code>, <code>/swarm[alias]/agent[...]</code>.
               </div>
             </div>
           </div>

@@ -183,6 +183,7 @@ def _queue_snapshot():
                     "source_swarm_id": item.get("source_swarm_id"),
                     "target_swarm_id": target_swarm_id,
                     "selector": item.get("selector"),
+                    "nodes": item.get("nodes"),
                     "content": item.get("content"),
                     "created_at": item.get("created_at"),
                 })
@@ -249,6 +250,60 @@ def _dispatch_inter_swarm_queue(config, provider):
                     "source_swarm_id": item.get("source_swarm_id"),
                     "target_swarm_id": target_swarm_id,
                     "reason": "target swarm unavailable",
+                })
+                _emit_queue_updated()
+                continue
+
+            selector = item.get("selector") or "idle"
+            if selector in ("all", "nodes"):
+                job_id = target_swarm.get("job_id")
+                if not job_id:
+                    break
+                node_count = int(target_swarm.get("node_count") or 0)
+                if selector == "all":
+                    targets = list(range(node_count))
+                else:
+                    raw_targets = item.get("nodes")
+                    targets = [
+                        node_id for node_id in (raw_targets if isinstance(raw_targets, list) else [])
+                        if isinstance(node_id, int) and 0 <= node_id < node_count
+                    ]
+
+                if not targets:
+                    with SCHEDULER_LOCK:
+                        INTER_SWARM_QUEUE[target_swarm_id].popleft()
+                        if not INTER_SWARM_QUEUE[target_swarm_id]:
+                            INTER_SWARM_QUEUE.pop(target_swarm_id, None)
+                    emit_event("inter_swarm_dropped", {
+                        "queue_id": item.get("queue_id"),
+                        "source_swarm_id": item.get("source_swarm_id"),
+                        "target_swarm_id": target_swarm_id,
+                        "reason": "no valid target nodes",
+                    })
+                    _emit_queue_updated()
+                    continue
+
+                content = item.get("content")
+                request_id = item.get("request_id")
+                for node_id in targets:
+                    threading.Thread(
+                        target=perform_injection,
+                        args=(config, provider, request_id, str(target_swarm_id), str(job_id), int(node_id), content),
+                        daemon=True
+                    ).start()
+
+                with SCHEDULER_LOCK:
+                    INTER_SWARM_QUEUE[target_swarm_id].popleft()
+                    if not INTER_SWARM_QUEUE[target_swarm_id]:
+                        INTER_SWARM_QUEUE.pop(target_swarm_id, None)
+
+                emit_event("inter_swarm_dispatched", {
+                    "queue_id": item.get("queue_id"),
+                    "request_id": request_id,
+                    "source_swarm_id": item.get("source_swarm_id"),
+                    "target_swarm_id": target_swarm_id,
+                    "selector": selector,
+                    "nodes": targets if selector == "nodes" else None,
                 })
                 _emit_queue_updated()
                 continue
@@ -546,6 +601,27 @@ def translate_event(event):
             item_type_raw = item.get("type")
             item_type = re.sub(r"[^a-z]", "", str(item_type_raw).lower())
             if item_type == "agentmessage":
+                # Some runtimes deliver final assistant text on item_completed
+                # without a separate codex/event/agent_message snapshot.
+                content = None
+                if isinstance(item.get("text"), str):
+                    content = item.get("text")
+                elif isinstance(item.get("message"), str):
+                    content = item.get("message")
+                else:
+                    parts = item.get("content")
+                    if isinstance(parts, list):
+                        chunks = []
+                        for part in parts:
+                            if isinstance(part, dict):
+                                text = part.get("text")
+                                if isinstance(text, str):
+                                    chunks.append(text)
+                        if chunks:
+                            content = "".join(chunks)
+
+                if isinstance(content, str) and content:
+                    return ("assistant", {**base, "content": content})
                 return ("turn_complete", base)
 
     if method == "codex/event/token_count":
@@ -1051,37 +1127,18 @@ def run_daemon(config, provider):
                         "reason": "unknown target_swarm_id"
                     })
                     continue
-
-                if selector in ("all", "nodes"):
-                    job_id = target_swarm["job_id"]
-                    node_count = int(target_swarm.get("node_count") or 0)
-                    if selector == "all":
-                        targets = range(node_count)
-                    else:
-                        targets = nodes if isinstance(nodes, list) else []
-                    for node_id in targets:
-                        if not isinstance(node_id, int) or node_id < 0 or node_id >= node_count:
-                            continue
-                        threading.Thread(
-                            target=perform_injection,
-                            args=(config, provider, request_id, str(target_swarm_id), job_id, node_id, content),
-                            daemon=True
-                        ).start()
-                    emit_event("inter_swarm_dispatched", {
-                        "request_id": request_id,
-                        "source_swarm_id": source_swarm_id,
-                        "target_swarm_id": target_swarm_id,
-                        "selector": selector
-                    })
-                    continue
+                if selector not in ("idle", "all", "nodes"):
+                    selector = "idle"
 
                 queue_id = str(uuid.uuid4())
+                queued_nodes = nodes if selector == "nodes" and isinstance(nodes, list) else None
                 queue_item = {
                     "queue_id": queue_id,
                     "request_id": request_id,
                     "source_swarm_id": source_swarm_id,
                     "target_swarm_id": str(target_swarm_id),
-                    "selector": "idle",
+                    "selector": selector,
+                    "nodes": queued_nodes,
                     "content": content,
                     "created_at": time.time(),
                 }
@@ -1093,7 +1150,8 @@ def run_daemon(config, provider):
                     "queue_id": queue_id,
                     "source_swarm_id": source_swarm_id,
                     "target_swarm_id": target_swarm_id,
-                    "selector": "idle",
+                    "selector": selector,
+                    "nodes": queued_nodes,
                 })
                 _emit_queue_updated()
                 _dispatch_inter_swarm_queue(config, provider)

@@ -77,12 +77,13 @@ function extractText(value: any): string {
 function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
   const directives: AutoRouteDirective[] = [];
   const lines = text.split(/\r?\n/);
+  const prefix = '(?:[-*+]\\s+|\\d+\\.\\s+|>\\s+)?';
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line.startsWith('/swarm[')) continue;
+    if (!line.includes('/swarm[')) continue;
 
-    const crossAllMatch = line.match(/^\/swarm\[(.+?)\]\/all\s+([\s\S]+)$/);
+    const crossAllMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/all\\s+([\\s\\S]+)$`));
     if (crossAllMatch) {
       const targetAlias = (crossAllMatch[1] ?? '').trim();
       const prompt = (crossAllMatch[2] ?? '').trim();
@@ -92,7 +93,7 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
       continue;
     }
 
-    const crossIdleMatch = line.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)\s+([\s\S]+)$/);
+    const crossIdleMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/(idle|first-idle)\\s+([\\s\\S]+)$`));
     if (crossIdleMatch) {
       const targetAlias = (crossIdleMatch[1] ?? '').trim();
       const prompt = (crossIdleMatch[3] ?? '').trim();
@@ -102,11 +103,11 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
       continue;
     }
 
-    const crossNodeMatch = line.match(/^\/swarm\[(.+?)\]\/node\[(.+?)\]\s*([\s\S]+)$/);
-    if (crossNodeMatch) {
-      const targetAlias = (crossNodeMatch[1] ?? '').trim();
-      const expr = (crossNodeMatch[2] ?? '').trim();
-      const prompt = (crossNodeMatch[3] ?? '').trim();
+    const crossAgentMatch = line.match(new RegExp(`^${prefix}\\/swarm\\[(.+?)\\]\\/(?:agent|node)\\[(.+?)\\]\\s*([\\s\\S]+)$`));
+    if (crossAgentMatch) {
+      const targetAlias = (crossAgentMatch[1] ?? '').trim();
+      const expr = (crossAgentMatch[2] ?? '').trim();
+      const prompt = (crossAgentMatch[3] ?? '').trim();
       const nodes = parseNodeSpec(expr);
       if (targetAlias && prompt && nodes.length > 0) {
         directives.push({ targetAlias, mode: 'nodes', prompt, nodes });
@@ -151,33 +152,11 @@ function handleAutoRoutingFromTaskComplete(data: any) {
       continue;
     }
 
-    if (directive.mode === 'idle') {
-      const request_id = router.send('enqueue_inject', {
-        source_swarm_id: sourceSwarmId,
-        target_swarm_id: targetSwarm.swarm_id,
-        selector: 'idle',
-        content: directive.prompt
-      });
-      requestSwarmMap[request_id] = targetSwarm.swarm_id;
-      requestPromptMap.set(request_id, directive.prompt);
-      hub.broadcast({
-        type: 'auto_route_submitted',
-        payload: {
-          request_id,
-          source_swarm_id: sourceSwarmId,
-          source_alias: sourceSwarm.alias,
-          target_swarm_id: targetSwarm.swarm_id,
-          target_alias: targetSwarm.alias,
-          selector: 'idle',
-          injection_id: injectionId
-        }
-      });
-      continue;
-    }
-
-    const request_id = router.send('inject', {
-      swarm_id: targetSwarm.swarm_id,
-      nodes: directive.mode === 'all' ? 'all' : directive.nodes,
+    const request_id = router.send('enqueue_inject', {
+      source_swarm_id: sourceSwarmId,
+      target_swarm_id: targetSwarm.swarm_id,
+      selector: directive.mode,
+      nodes: directive.mode === 'nodes' ? directive.nodes : undefined,
       content: directive.prompt
     });
     requestSwarmMap[request_id] = targetSwarm.swarm_id;
