@@ -25,8 +25,16 @@ class AwsProvider(ClusterProvider):
         self.ssh_user = str(self.aws_cfg.get("ssh_user") or "ubuntu").strip()
         raw_key_path = str(self.aws_cfg.get("ssh_private_key_path") or "").strip()
         self.ssh_private_key_path = str(Path(raw_key_path).expanduser()) if raw_key_path else ""
-        self.workspace_root = str(self.cluster_cfg.get("workspace_root") or "").rstrip("/")
-        self.cluster_subdir = str(self.cluster_cfg.get("cluster_subdir") or "").strip("/")
+        self.workspace_root = str(
+            self.aws_cfg.get("workspace_root")
+            or self.cluster_cfg.get("workspace_root")
+            or ""
+        ).rstrip("/")
+        self.cluster_subdir = str(
+            self.aws_cfg.get("cluster_subdir")
+            or self.cluster_cfg.get("cluster_subdir")
+            or ""
+        ).strip("/")
         self.base_path = f"{self.workspace_root}/{self.cluster_subdir}"
 
         if not self.region:

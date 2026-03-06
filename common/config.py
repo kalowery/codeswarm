@@ -2,6 +2,23 @@ import json
 from pathlib import Path
 
 
+def _cluster_section(data):
+    cluster_cfg = data.get("cluster")
+    return cluster_cfg if isinstance(cluster_cfg, dict) else {}
+
+
+def _backend_section(data, backend):
+    cluster_cfg = _cluster_section(data)
+    section = cluster_cfg.get(backend)
+    return section if isinstance(section, dict) else {}
+
+
+def _has_backend_cluster_key(data, backend, key):
+    cluster_cfg = _cluster_section(data)
+    backend_cfg = _backend_section(data, backend)
+    return key in backend_cfg or key in cluster_cfg
+
+
 def load_config(path):
     path = Path(path)
     if not path.exists():
@@ -31,17 +48,31 @@ def load_config(path):
     required = []
     for backend in backends:
         if backend == "slurm":
-            required.extend([
-                ("ssh", "login_alias"),
-                ("cluster", "workspace_root"),
-                ("cluster", "cluster_subdir"),
-            ])
+            required.extend([("ssh", "login_alias")])
+            if not _has_backend_cluster_key(data, "slurm", "workspace_root"):
+                raise RuntimeError(
+                    "Missing required config field: cluster.workspace_root "
+                    "(or cluster.slurm.workspace_root)"
+                )
+            if not _has_backend_cluster_key(data, "slurm", "cluster_subdir"):
+                raise RuntimeError(
+                    "Missing required config field: cluster.cluster_subdir "
+                    "(or cluster.slurm.cluster_subdir)"
+                )
         elif backend == "local":
             continue
         elif backend == "aws":
+            if not _has_backend_cluster_key(data, "aws", "workspace_root"):
+                raise RuntimeError(
+                    "Missing required config field: cluster.workspace_root "
+                    "(or cluster.aws.workspace_root)"
+                )
+            if not _has_backend_cluster_key(data, "aws", "cluster_subdir"):
+                raise RuntimeError(
+                    "Missing required config field: cluster.cluster_subdir "
+                    "(or cluster.aws.cluster_subdir)"
+                )
             required.extend([
-                ("cluster", "workspace_root"),
-                ("cluster", "cluster_subdir"),
                 ("cluster.aws", "region"),
                 ("cluster.aws", "ami_id"),
                 ("cluster.aws", "subnet_id"),

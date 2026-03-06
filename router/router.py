@@ -682,8 +682,10 @@ def execute_synthetic_approved_command(meta, job_id, call_id):
 
 def start_remote_follower(config):
     login_alias = config["ssh"]["login_alias"]
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
+    cluster_cfg = config.get("cluster", {})
+    slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+    workspace_root = slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root")
+    cluster_subdir = slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir")
 
     outbox_dir = f"{workspace_root}/{cluster_subdir}/mailbox/outbox"
 

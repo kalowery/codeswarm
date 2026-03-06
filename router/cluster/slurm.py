@@ -15,6 +15,14 @@ class SlurmProvider(ClusterProvider):
         self.config = config
         self.cluster_cfg = config.get("cluster", {})
         self.slurm_cfg = self.cluster_cfg.get("slurm", {})
+        self.workspace_root = (
+            self.slurm_cfg.get("workspace_root")
+            or self.cluster_cfg.get("workspace_root")
+        )
+        self.cluster_subdir = (
+            self.slurm_cfg.get("cluster_subdir")
+            or self.cluster_cfg.get("cluster_subdir")
+        )
 
     def launch(
         self,
@@ -179,8 +187,8 @@ class SlurmProvider(ClusterProvider):
 
     def inject(self, job_id, node_id, content, injection_id):
         login_alias = self.config["ssh"]["login_alias"]
-        workspace_root = self.config["cluster"]["workspace_root"]
-        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+        workspace_root = self.workspace_root
+        cluster_subdir = self.cluster_subdir
 
         inbox_path = (
             f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
@@ -211,8 +219,8 @@ class SlurmProvider(ClusterProvider):
         via SSH, mirroring the inject() path.
         """
         login_alias = self.config["ssh"]["login_alias"]
-        workspace_root = self.config["cluster"]["workspace_root"]
-        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+        workspace_root = self.workspace_root
+        cluster_subdir = self.cluster_subdir
 
         inbox_path = (
             f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"

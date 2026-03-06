@@ -41,8 +41,8 @@ Example:
 
 Required:
 
-- `cluster.workspace_root`
-- `cluster.cluster_subdir`
+- `cluster.workspace_root` or `cluster.slurm.workspace_root`
+- `cluster.cluster_subdir` or `cluster.slurm.cluster_subdir`
 - `cluster.slurm.partition`
 - `cluster.slurm.time_limit`
 - `ssh.login_alias`
@@ -64,7 +64,9 @@ Example:
       "partition": "compute",
       "time_limit": "00:20:00",
       "account": null,
-      "qos": null
+      "qos": null,
+      "workspace_root": "/path/to/slurm/workspace",
+      "cluster_subdir": "codeswarm"
     }
   },
   "ssh": {
@@ -72,6 +74,18 @@ Example:
   }
 }
 ```
+
+### AWS backend (`cluster.backend = "aws"` or AWS launch provider)
+
+Required:
+
+- `cluster.workspace_root` or `cluster.aws.workspace_root`
+- `cluster.cluster_subdir` or `cluster.aws.cluster_subdir`
+- `cluster.aws.region`
+- `cluster.aws.ami_id`
+- `cluster.aws.subnet_id`
+- `cluster.aws.key_name`
+- `cluster.aws.ssh_private_key_path`
 
 ## `ssh`
 
@@ -98,4 +112,3 @@ Validation is performed by `common/config.py`:
 
 - missing required fields for selected backend raise runtime errors
 - unsupported `cluster.backend` raises runtime error
-

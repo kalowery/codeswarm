@@ -1,28 +1,34 @@
 {
   "ssh": {
-    "login_alias": "your-login-alias"
+    "login_alias": "your-slurm-login-alias"
   },
   "cluster": {
-    "workspace_root": "/path/to/shared/workspace",
-    "cluster_subdir": "codeswarm",
-    "aws": {
-      "region": "us-east-1",
-      "ami_id": "ami-xxxxxxxx",
-      "subnet_id": "subnet-xxxxxxxx",
-      "security_group_id": "sg-xxxxxxxx",
-      "key_name": "codeswarm-keypair",
-      "ssh_user": "ubuntu",
-      "ssh_private_key_path": "~/.ssh/codeswarm.pem",
-      "instance_type": "c7i.4xlarge",
-      "workers_per_node": 2,
-      "ebs_volume_size_gb": 250,
-      "delete_ebs_on_shutdown": false
+    "local": {
+      "workspace_root": "runs",
+      "archive_root": "/tmp/codeswarm-archives"
     },
     "slurm": {
+      "workspace_root": "/path/to/slurm/shared/workspace",
+      "cluster_subdir": "codeswarm",
       "partition": "compute",
-      "time_limit": "00:20:00",
-      "account": null,
-      "qos": null
+      "time_limit": "00:30:00",
+      "account": "your-slurm-account",
+      "qos": "normal"
+    },
+    "aws": {
+      "workspace_root": "/workspace",
+      "cluster_subdir": "codeswarm",
+      "region": "us-east-1",
+      "ami_id": "ami-0123456789abcdef0",
+      "subnet_id": "subnet-0123456789abcdef0",
+      "security_group_id": "sg-0123456789abcdef0",
+      "key_name": "codeswarm-keypair",
+      "ssh_user": "ubuntu",
+      "ssh_private_key_path": "~/.ssh/codeswarm-keypair.pem",
+      "instance_type": "c7i.4xlarge",
+      "workers_per_node": 2,
+      "ebs_volume_size_gb": 200,
+      "delete_ebs_on_shutdown": false
     }
   },
   "router": {
@@ -30,14 +36,14 @@
   },
   "launch_providers": [
     {
-      "id": "slurm-default",
-      "label": "Slurm Default",
-      "backend": "slurm"
-    },
-    {
-      "id": "local-dev",
+      "id": "local-default",
       "label": "Local Dev",
       "backend": "local"
+    },
+    {
+      "id": "slurm-default",
+      "label": "Slurm Cluster",
+      "backend": "slurm"
     },
     {
       "id": "aws-default",

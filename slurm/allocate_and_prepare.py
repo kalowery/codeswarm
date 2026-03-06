@@ -21,9 +21,16 @@ def ssh_login(login_alias, cmd, input_text=None):
     return run(["ssh", login_alias, cmd], input_text=input_text)
 
 
+def resolve_slurm_paths(config):
+    cluster_cfg = config.get("cluster", {})
+    slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+    workspace_root = slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root")
+    cluster_subdir = slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir")
+    return workspace_root, cluster_subdir
+
+
 def build_sbatch_script(args, config):
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
+    workspace_root, cluster_subdir = resolve_slurm_paths(config)
     hpc_base = f"{workspace_root}/{cluster_subdir}"
 
     lines = [
@@ -99,8 +106,7 @@ def build_sbatch_script(args, config):
 
 def ensure_codex_ready(config):
     login_alias = config["ssh"]["login_alias"]
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
+    workspace_root, cluster_subdir = resolve_slurm_paths(config)
 
     tools_dir = f"{workspace_root}/{cluster_subdir}/tools"
     node_bin = f"{tools_dir}/node/bin"
@@ -130,20 +136,21 @@ def ensure_codex_ready(config):
             print(result.stderr)
             sys.exit(1)
 
-    # Ensure beads installed in workspace npm-global tools (same install pattern as codex)
+    # Optional: beads helper CLI. Launch should not fail if this install is blocked
+    # by host-specific npm/nvm settings.
     BEADS_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
 
     if ssh_login(login_alias, f'test -x "{beads_bin}"').returncode != 0:
-        print("beads not found in workspace. Installing...")
+        print("beads not found in workspace. Installing (optional)...")
         install_cmd = (
             f'NPM_CONFIG_PREFIX="{npm_prefix}" '
             f'"{npm_bin}" install -g beads@{BEADS_VERSION}'
         )
         result = ssh_login(login_alias, install_cmd)
         if result.returncode != 0:
-            print("beads installation failed:")
-            print(result.stderr)
-            sys.exit(1)
+            print("WARNING: beads installation failed; continuing without beads.")
+            if result.stderr:
+                print(result.stderr)
 
     # Verify installed codex version (defensive check)
     version_check = ssh_login(login_alias, f'"{codex_bin}" --version')
@@ -152,11 +159,12 @@ def ensure_codex_ready(config):
         print(version_check.stderr)
         sys.exit(1)
 
-    beads_version_check = ssh_login(login_alias, f'"{beads_bin}" --version')
-    if beads_version_check.returncode != 0:
-        print("ERROR: beads binary exists but failed to execute --version.")
-        print(beads_version_check.stderr)
-        sys.exit(1)
+    if ssh_login(login_alias, f'test -x "{beads_bin}"').returncode == 0:
+        beads_version_check = ssh_login(login_alias, f'"{beads_bin}" --version')
+        if beads_version_check.returncode != 0:
+            print("WARNING: beads binary exists but failed to execute --version; continuing.")
+            if beads_version_check.stderr:
+                print(beads_version_check.stderr)
 
     # Check for existing Codex home configuration
     codex_home_check = ssh_login(
@@ -314,8 +322,7 @@ if __name__ == "__main__":
         slurm_cfg = config.get("cluster", {}).get("slurm", {})
         args.time = slurm_cfg.get("time_limit") or slurm_cfg.get("default_time")
 
-    workspace_root = config["cluster"]["workspace_root"]
-    cluster_subdir = config["cluster"]["cluster_subdir"]
+    workspace_root, cluster_subdir = resolve_slurm_paths(config)
     hpc_base = f"{workspace_root}/{cluster_subdir}"
     login_alias = config["ssh"]["login_alias"]
 
