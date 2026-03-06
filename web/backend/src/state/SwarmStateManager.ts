@@ -5,6 +5,8 @@ export interface SwarmRecord {
   node_count: number;
   status: string;
   slurm_state?: string;
+  provider?: string;
+  provider_id?: string;
   created_at: number;
 }
 
@@ -45,7 +47,13 @@ export class SwarmStateManager {
     }
   }
 
-  createSwarm(swarm_id: string, alias: string, job_id: string, node_count: number) {
+  createSwarm(
+    swarm_id: string,
+    alias: string,
+    job_id: string,
+    node_count: number,
+    options?: { provider?: string; provider_id?: string }
+  ) {
     const normalized = alias.toLowerCase();
     if (this.aliasIndex.has(normalized)) {
       throw new Error('Alias already exists');
@@ -57,6 +65,8 @@ export class SwarmStateManager {
       job_id,
       node_count,
       status: 'running',
+      provider: options?.provider,
+      provider_id: options?.provider_id,
       created_at: Date.now()
     };
 
@@ -101,6 +111,18 @@ export class SwarmStateManager {
       swarm.slurm_state = slurm_state;
     }
 
+    this.saveState();
+  }
+
+  updateProviderMeta(swarm_id: string, provider?: string, provider_id?: string) {
+    const swarm = this.swarms.get(swarm_id);
+    if (!swarm) return;
+    if (typeof provider === 'string' && provider.length > 0) {
+      swarm.provider = provider;
+    }
+    if (typeof provider_id === 'string' && provider_id.length > 0) {
+      swarm.provider_id = provider_id;
+    }
     this.saveState();
   }
 }

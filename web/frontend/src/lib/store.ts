@@ -74,6 +74,8 @@ export interface SwarmRecord {
   node_count: number
   status: string
   slurm_state?: string
+  provider?: string
+  provider_id?: string
   known_exec_policies?: string[][]
   nodes: Record<number, NodeState>
 }
@@ -683,23 +685,50 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         const nodeId = Number(payload.node_id)
         const node = swarm.nodes[nodeId]
         if (!node) return
+        const approvalState = {
+          call_id: payload.call_id,
+          command: payload.command,
+          reason: payload.reason,
+          cwd: payload.cwd,
+          proposed_execpolicy_amendment: payload.proposed_execpolicy_amendment,
+          available_decisions: payload.available_decisions
+        }
 
-        const updatedTurns: NodeTurn[] = node.turns.map((t) =>
-          t.injection_id === payload.injection_id
-            ? ({
-                ...t,
-                phase: 'awaiting_approval',
-                approval: {
-                  call_id: payload.call_id,
-                  command: payload.command,
-                  reason: payload.reason,
-                  cwd: payload.cwd,
-                  proposed_execpolicy_amendment: payload.proposed_execpolicy_amendment,
-                  available_decisions: payload.available_decisions
-                }
-              } as NodeTurn)
-            : t
-        )
+        const targetIdx = node.turns.findIndex((t) => t.injection_id === payload.injection_id)
+        const fallbackIdx =
+          targetIdx >= 0
+            ? targetIdx
+            : node.turns.findIndex((t) => t.approval?.call_id === payload.call_id)
+
+        let updatedTurns: NodeTurn[]
+        if (fallbackIdx >= 0) {
+          updatedTurns = node.turns.map((t, idx) =>
+            idx === fallbackIdx
+              ? ({
+                  ...t,
+                  phase: 'awaiting_approval',
+                  approval: approvalState
+                } as NodeTurn)
+              : t
+          )
+        } else {
+          // If approval arrives before a matching turn is visible, append a
+          // synthetic turn so the dialog is never lost off-state.
+          updatedTurns = [
+            ...node.turns,
+            {
+              injection_id:
+                typeof payload.injection_id === 'string' && payload.injection_id
+                  ? payload.injection_id
+                  : `approval-${payload.call_id}`,
+              prompt: '',
+              deltas: [],
+              reasoning: '',
+              phase: 'awaiting_approval',
+              approval: approvalState
+            } as NodeTurn
+          ]
+        }
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -708,6 +737,8 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
             [nodeId]: { ...node, turns: capTurns(updatedTurns) }
           }
         })
+        // Ensure keyboard prompt routing and tab selection follow approval target.
+        get().setActiveNode(payload.swarm_id, nodeId)
         clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
       }
 

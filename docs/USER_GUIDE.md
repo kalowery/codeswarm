@@ -50,6 +50,12 @@ npm --prefix web/frontend run dev
 - requires `ssh.login_alias` and `cluster.slurm.*`
 - mailbox under `<workspace_root>/<cluster_subdir>/mailbox`
 
+### Multi-provider launch presets
+
+- optional config key: `launch_providers`
+- each entry declares a launch preset: `id`, `label`, `backend`
+- optional `defaults` and `launch_fields` let providers expose custom launch UI inputs
+
 ## 3. Launch a swarm
 
 In UI:
@@ -57,6 +63,8 @@ In UI:
 - provide alias
 - set node count
 - set system prompt
+- choose provider
+- fill provider-specific launch fields (if presented)
 - launch
 
 Router emits `swarm_launched`, then injects the system prompt to all nodes.
@@ -130,7 +138,9 @@ Matching lines are auto-submitted as new routes, enabling chained multi-swarm ex
 
 Use the Terminate action in UI.
 
-Router sends `swarm_terminate`, provider terminates backend resources, and UI receives `swarm_removed`.
+Router sends `swarm_terminate`, marks swarm status as `terminating`, waits for
+agents to go idle (or timeout), then terminates backend resources and emits
+`swarm_removed`.
 
 ## 10. Attention and navigation
 
@@ -140,6 +150,7 @@ Router sends `swarm_terminate`, provider terminates backend resources, and UI re
 ## 11. Status and persistence notes
 
 - Router persists swarm registry in `router_state.json`.
+- Router persists inter-swarm queue state in `router_state.json`.
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
 - Router marks terminated swarms, then prunes them by TTL/cap (`swarm_removed`).
 - UI shows per-agent and per-swarm estimated spend from cumulative token usage.

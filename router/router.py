@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
-from .cluster.factory import build_provider
+from .cluster.factory import build_providers, get_provider_specs
 
 
 # ================================
@@ -31,21 +31,29 @@ LAST_USAGE = {}
 PENDING_APPROVALS = {}
 PENDING_APPROVAL_DECISIONS = {}
 ACTIVE_PROVIDER = None
+PROVIDERS = {}
+PROVIDER_SPECS = []
 NODE_OUTSTANDING = defaultdict(int)
 NODE_THREAD_ACTIVE = defaultdict(bool)
 INTER_SWARM_QUEUE = defaultdict(deque)
 SCHEDULER_LOCK = threading.Lock()
+TERMINATION_IN_PROGRESS = set()
 
 # Retention policy
 TERMINATED_TTL_SECONDS = 900  # 15 minutes
 MAX_TERMINATED = 100
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
+GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
+GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
 
 
 def save_state():
     try:
-        data = {"swarms": SWARMS}
+        data = {
+            "swarms": SWARMS,
+            "inter_swarm_queue": _queue_snapshot(),
+        }
         with open(STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
     except Exception:
@@ -53,27 +61,56 @@ def save_state():
 
 
 def load_state():
-    global SWARMS
+    global SWARMS, INTER_SWARM_QUEUE
     try:
         if STATE_FILE.exists():
             with open(STATE_FILE) as f:
                 data = json.load(f)
                 SWARMS = data.get("swarms", {})
+                restored_queue = defaultdict(deque)
+                for item in data.get("inter_swarm_queue", []):
+                    if not isinstance(item, dict):
+                        continue
+                    target_swarm_id = item.get("target_swarm_id")
+                    if not target_swarm_id:
+                        continue
+                    restored_queue[str(target_swarm_id)].append({
+                        "queue_id": item.get("queue_id"),
+                        "request_id": item.get("request_id"),
+                        "source_swarm_id": item.get("source_swarm_id"),
+                        "target_swarm_id": str(target_swarm_id),
+                        "selector": item.get("selector") or "idle",
+                        "nodes": item.get("nodes"),
+                        "content": item.get("content"),
+                        "created_at": item.get("created_at"),
+                    })
+                INTER_SWARM_QUEUE = restored_queue
     except Exception:
         SWARMS = {}
+        INTER_SWARM_QUEUE = defaultdict(deque)
 
 
-def reconcile(provider):
+def reconcile(providers):
     global JOB_TO_SWARM
-
-    running_jobs = provider.list_active_jobs()
+    running_jobs_by_backend = {}
+    for backend, provider in providers.items():
+        try:
+            running_jobs_by_backend[backend] = provider.list_active_jobs()
+        except Exception:
+            running_jobs_by_backend[backend] = {}
 
     JOB_TO_SWARM.clear()
 
     to_remove = []
 
     for swarm_id, swarm in SWARMS.items():
+        backend = swarm.get("provider") or swarm.get("backend")
+        if not backend and providers:
+            backend = next(iter(providers.keys()))
+            swarm["provider"] = backend
+
         job_id = swarm.get("job_id")
+        running_jobs = running_jobs_by_backend.get(str(backend), {})
         if job_id in running_jobs:
             swarm["status"] = "running"
             JOB_TO_SWARM[job_id] = swarm_id
@@ -249,6 +286,20 @@ def _node_key(swarm_id, node_id):
     return (str(swarm_id), int(node_id))
 
 
+def _provider_for_id(provider_id):
+    if provider_id is None:
+        return None
+    return PROVIDERS.get(str(provider_id))
+
+
+def _provider_for_swarm(swarm_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return None
+    provider_id = swarm.get("provider")
+    return _provider_for_id(provider_id)
+
+
 def _mark_outstanding(swarm_id, node_id, delta):
     key = _node_key(swarm_id, node_id)
     with SCHEDULER_LOCK:
@@ -273,7 +324,132 @@ def _first_idle_node_id(swarm_id):
     return None
 
 
-def _dispatch_inter_swarm_queue(config, provider):
+def _is_node_quiescent(swarm_id, node_id):
+    key = _node_key(swarm_id, node_id)
+    outstanding = int(NODE_OUTSTANDING.get(key, 0))
+    active = bool(NODE_THREAD_ACTIVE.get(key, False))
+    return outstanding == 0 and not active
+
+
+def _is_swarm_quiescent(swarm_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return True
+    node_count = int(swarm.get("node_count") or 0)
+    with SCHEDULER_LOCK:
+        return all(_is_node_quiescent(swarm_id, node_id) for node_id in range(node_count))
+
+
+def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return
+
+    if swarm.get("status") != "terminated":
+        swarm["status"] = "terminated"
+        swarm["terminated_at"] = time.time()
+    swarm.pop("terminating_since", None)
+
+    with SCHEDULER_LOCK:
+        node_count = int(swarm.get("node_count") or 0)
+        for node_id in range(node_count):
+            key = _node_key(swarm_id, node_id)
+            NODE_THREAD_ACTIVE.pop(key, None)
+            NODE_OUTSTANDING.pop(key, None)
+
+    # Provider-specific archival (best-effort)
+    try:
+        provider.archive(job_id, swarm_id)
+    except Exception:
+        pass
+
+    emit_event("swarm_terminated", {
+        "request_id": request_id,
+        "swarm_id": swarm_id
+    })
+
+    with SCHEDULER_LOCK:
+        dropped = list(INTER_SWARM_QUEUE.pop(str(swarm_id), []))
+    for item in dropped:
+        emit_event("inter_swarm_dropped", {
+            "queue_id": item.get("queue_id"),
+            "request_id": item.get("request_id"),
+            "source_swarm_id": item.get("source_swarm_id"),
+            "target_swarm_id": swarm_id,
+            "reason": "target swarm terminated",
+        })
+    _emit_queue_updated()
+    save_state()
+
+
+def _graceful_terminate_swarm(config, provider, request_id, swarm_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        emit_event("command_rejected", {
+            "request_id": request_id,
+            "reason": "unknown swarm_id"
+        })
+        return
+
+    job_id = swarm.get("job_id")
+    if not job_id:
+        _finalize_swarm_termination(provider, request_id, swarm_id, job_id)
+        with SCHEDULER_LOCK:
+            TERMINATION_IN_PROGRESS.discard(str(swarm_id))
+        return
+
+    timeout_s = (
+        config.get("router", {}).get("graceful_terminate_timeout_seconds")
+        if isinstance(config.get("router"), dict)
+        else None
+    )
+    if not isinstance(timeout_s, (int, float)) or timeout_s <= 0:
+        timeout_s = GRACEFUL_TERMINATE_TIMEOUT_SECONDS
+
+    poll_s = (
+        config.get("router", {}).get("graceful_terminate_poll_seconds")
+        if isinstance(config.get("router"), dict)
+        else None
+    )
+    if not isinstance(poll_s, (int, float)) or poll_s <= 0:
+        poll_s = GRACEFUL_TERMINATE_POLL_SECONDS
+
+    deadline = time.time() + float(timeout_s)
+    timed_out = False
+    while time.time() < deadline:
+        if _is_swarm_quiescent(swarm_id):
+            break
+        time.sleep(float(poll_s))
+    else:
+        timed_out = True
+
+    try:
+        provider.terminate(job_id)
+    except Exception as e:
+        swarm = SWARMS.get(str(swarm_id))
+        if swarm and swarm.get("status") == "terminating":
+            swarm["status"] = "running"
+            swarm.pop("terminating_since", None)
+            save_state()
+        with SCHEDULER_LOCK:
+            TERMINATION_IN_PROGRESS.discard(str(swarm_id))
+        emit_event("command_rejected", {
+            "request_id": request_id,
+            "reason": str(e)
+        })
+        return
+
+    _finalize_swarm_termination(provider, request_id, swarm_id, job_id)
+    if timed_out:
+        emit_event("debug", {
+            "source": "router",
+            "message": f"graceful terminate timed out for swarm {swarm_id}; forced termination"
+        })
+    with SCHEDULER_LOCK:
+        TERMINATION_IN_PROGRESS.discard(str(swarm_id))
+
+
+def _dispatch_inter_swarm_queue(config):
     """
     Route queued inter-swarm work to the first idle node in each target swarm.
     """
@@ -289,7 +465,7 @@ def _dispatch_inter_swarm_queue(config, provider):
                 item = queue_for_target[0]
 
             target_swarm = SWARMS.get(str(target_swarm_id))
-            if not target_swarm or target_swarm.get("status") == "terminated":
+            if not target_swarm or target_swarm.get("status") in ("terminated", "terminating"):
                 with SCHEDULER_LOCK:
                     INTER_SWARM_QUEUE[target_swarm_id].popleft()
                     if not INTER_SWARM_QUEUE[target_swarm_id]:
@@ -301,6 +477,23 @@ def _dispatch_inter_swarm_queue(config, provider):
                     "reason": "target swarm unavailable",
                 })
                 _emit_queue_updated()
+                save_state()
+                continue
+
+            target_provider = _provider_for_swarm(target_swarm_id)
+            if not target_provider:
+                with SCHEDULER_LOCK:
+                    INTER_SWARM_QUEUE[target_swarm_id].popleft()
+                    if not INTER_SWARM_QUEUE[target_swarm_id]:
+                        INTER_SWARM_QUEUE.pop(target_swarm_id, None)
+                emit_event("inter_swarm_dropped", {
+                    "queue_id": item.get("queue_id"),
+                    "source_swarm_id": item.get("source_swarm_id"),
+                    "target_swarm_id": target_swarm_id,
+                    "reason": "provider unavailable",
+                })
+                _emit_queue_updated()
+                save_state()
                 continue
 
             selector = item.get("selector") or "idle"
@@ -330,6 +523,7 @@ def _dispatch_inter_swarm_queue(config, provider):
                         "reason": "no valid target nodes",
                     })
                     _emit_queue_updated()
+                    save_state()
                     continue
 
                 content = item.get("content")
@@ -337,7 +531,7 @@ def _dispatch_inter_swarm_queue(config, provider):
                 for node_id in targets:
                     threading.Thread(
                         target=perform_injection,
-                        args=(config, provider, request_id, str(target_swarm_id), str(job_id), int(node_id), content),
+                        args=(config, target_provider, request_id, str(target_swarm_id), str(job_id), int(node_id), content),
                         daemon=True
                     ).start()
 
@@ -355,6 +549,7 @@ def _dispatch_inter_swarm_queue(config, provider):
                     "nodes": targets if selector == "nodes" else None,
                 })
                 _emit_queue_updated()
+                save_state()
                 continue
 
             idle_node_id = _first_idle_node_id(target_swarm_id)
@@ -372,7 +567,7 @@ def _dispatch_inter_swarm_queue(config, provider):
             _mark_outstanding(target_swarm_id, idle_node_id, +1)
             success, injection_id, error = perform_injection(
                 config,
-                provider,
+                target_provider,
                 request_id,
                 str(target_swarm_id),
                 str(job_id),
@@ -405,6 +600,7 @@ def _dispatch_inter_swarm_queue(config, provider):
                 "injection_id": injection_id,
             })
             _emit_queue_updated()
+            save_state()
 
 
 def execute_synthetic_approved_command(meta, job_id, call_id):
@@ -974,11 +1170,9 @@ import queue
 COMMAND_QUEUE = queue.Queue()
 TCP_CLIENTS = []
 
-def run_daemon(config, provider):
+def run_daemon(config, providers):
     global ACTIVE_PROVIDER
-    ACTIVE_PROVIDER = provider
-
-    stdout_buffer = b""
+    ACTIVE_PROVIDER = None
 
     # TCP control server
     import socket, sys
@@ -1024,75 +1218,99 @@ def run_daemon(config, provider):
 
     threading.Thread(target=tcp_server, daemon=True).start()
 
-    # Start follower asynchronously so it cannot block daemon startup
-    proc = None
+    # Start one follower per backend provider so mixed-provider launches stream events.
+    follower_procs = {}
+    stdout_buffers = {}
 
-    def start_follower_async():
-        nonlocal proc
+    def start_follower_async(backend, provider):
         try:
             proc = provider.start_follower()
+            if proc:
+                follower_procs[backend] = proc
+                stdout_buffers[backend] = b""
         except Exception as e:
-            print(f"Follower failed to start: {e}", flush=True)
+            print(f"Follower failed to start for {backend}: {e}", flush=True)
 
-    threading.Thread(target=start_follower_async, daemon=True).start()
+    for backend, provider in providers.items():
+        threading.Thread(target=start_follower_async, args=(backend, provider), daemon=True).start()
 
     debug_event("daemon_started")
+    # Resume queued inter-swarm work after router restart.
+    _dispatch_inter_swarm_queue(config)
 
     while True:
         streams = []
-        if proc:
-            streams = [proc.stdout, proc.stderr]
+        fd_to_stream = {}
+        for backend, proc in follower_procs.items():
+            if not proc:
+                continue
+            if proc.stdout:
+                streams.append(proc.stdout)
+                fd_to_stream[proc.stdout.fileno()] = ("stdout", backend, proc.stdout)
+            if proc.stderr:
+                streams.append(proc.stderr)
+                fd_to_stream[proc.stderr.fileno()] = ("stderr", backend, proc.stderr)
 
-        ready, _, _ = select.select(
-            streams,
-            [],
-            [],
-            0.2
-        )
+        if streams:
+            ready, _, _ = select.select(streams, [], [], 0.2)
+        else:
+            time.sleep(0.2)
+            ready = []
 
-        # Follower stdout
-        if proc and proc.stdout in ready:
-            chunk = os.read(proc.stdout.fileno(), 4096)
-            if chunk:
-                stdout_buffer += chunk
+        for stream in ready:
+            stream_type, backend, raw_stream = fd_to_stream.get(stream.fileno(), (None, None, None))
+            if stream_type is None:
+                continue
 
-                while b"\n" in stdout_buffer:
-                    line, stdout_buffer = stdout_buffer.split(b"\n", 1)
-                    line = line.decode().strip()
-                    if not line:
-                        continue
+            chunk = os.read(raw_stream.fileno(), 4096)
+            if not chunk:
+                continue
 
-                    try:
-                        event = json.loads(line)
-                    except:
-                        continue
+            if stream_type == "stderr":
+                line = chunk.decode(errors="ignore").strip()
+                if line and DEBUG:
+                    print(f"[follower:{backend}:stderr] {line}", flush=True)
+                continue
 
-                    translated = translate_event(event)
-                    if translated:
-                        event_name, data = translated
-                        if event_name == "thread_status":
-                            status = data.get("status") or {}
-                            status_type = status.get("type") if isinstance(status, dict) else None
-                            key = _node_key(data.get("swarm_id"), data.get("node_id"))
-                            with SCHEDULER_LOCK:
-                                if status_type == "active":
-                                    NODE_THREAD_ACTIVE[key] = True
-                                elif status_type == "idle":
-                                    NODE_THREAD_ACTIVE[key] = False
-                                    # Reconcile missed turn_complete events so idle queue
-                                    # dispatch cannot deadlock on stale outstanding counts.
-                                    NODE_OUTSTANDING[key] = 0
-                            if status_type == "idle":
-                                _dispatch_inter_swarm_queue(config, provider)
-                        if event_name == "turn_complete":
-                            _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
-                            _dispatch_inter_swarm_queue(config, provider)
-                        if event_name == "task_complete":
-                            # Some traces emit task_complete without a matching turn_complete;
-                            # reconcile outstanding count to avoid idle-queue starvation.
-                            _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
-                            _dispatch_inter_swarm_queue(config, provider)
-                        emit_event(event_name, data)
+            stdout_buffers[backend] = stdout_buffers.get(backend, b"") + chunk
+            while b"\n" in stdout_buffers[backend]:
+                line_raw, rest = stdout_buffers[backend].split(b"\n", 1)
+                stdout_buffers[backend] = rest
+                line = line_raw.decode().strip()
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except Exception:
+                    continue
+
+                translated = translate_event(event)
+                if translated:
+                    event_name, data = translated
+                    if event_name == "thread_status":
+                        status = data.get("status") or {}
+                        status_type = status.get("type") if isinstance(status, dict) else None
+                        key = _node_key(data.get("swarm_id"), data.get("node_id"))
+                        with SCHEDULER_LOCK:
+                            if status_type == "active":
+                                NODE_THREAD_ACTIVE[key] = True
+                            elif status_type == "idle":
+                                NODE_THREAD_ACTIVE[key] = False
+                                # Reconcile missed turn_complete events so idle queue
+                                # dispatch cannot deadlock on stale outstanding counts.
+                                NODE_OUTSTANDING[key] = 0
+                        if status_type == "idle":
+                            _dispatch_inter_swarm_queue(config)
+                    if event_name == "turn_complete":
+                        _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
+                        _dispatch_inter_swarm_queue(config)
+                    if event_name == "task_complete":
+                        # Some traces emit task_complete without a matching turn_complete;
+                        # reconcile outstanding count to avoid idle-queue starvation.
+                        _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
+                        _dispatch_inter_swarm_queue(config)
+                    emit_event(event_name, data)
 
         # Process queued stdin commands
 # Process queued stdin commands
@@ -1117,11 +1335,41 @@ def run_daemon(config, provider):
                 nodes = payload.get("nodes", 1)
                 system_prompt = payload.get("system_prompt", "")
                 agents_md_content = payload.get("agents_md_content")
+                provider_id = payload.get("provider")
+                provider_params = payload.get("provider_params")
                 if not isinstance(agents_md_content, str) or not agents_md_content.strip():
                     agents_md_content = None
+                if not isinstance(provider_params, dict):
+                    provider_params = {}
+
+                spec_by_id = {spec.get("id"): spec for spec in PROVIDER_SPECS}
+                if not provider_id:
+                    provider_id = PROVIDER_SPECS[0]["id"] if PROVIDER_SPECS else None
+                provider_spec = spec_by_id.get(provider_id)
+                if not provider_spec:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": f"unknown provider: {provider_id}"
+                    })
+                    continue
+                provider_backend = provider_spec.get("backend")
+                launch_provider = _provider_for_id(provider_backend)
+                if not launch_provider:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": f"provider backend unavailable: {provider_backend}"
+                    })
+                    continue
+                launch_defaults = provider_spec.get("defaults")
+                launch_defaults = launch_defaults if isinstance(launch_defaults, dict) else {}
+                effective_launch_params = {**launch_defaults, **provider_params}
 
                 try:
-                    job_id = provider.launch(nodes, agents_md_content=agents_md_content)
+                    job_id = launch_provider.launch(
+                        nodes,
+                        agents_md_content=agents_md_content,
+                        launch_params=effective_launch_params,
+                    )
                 except Exception as e:
                     emit_event("command_rejected", {
                         "request_id": request_id,
@@ -1136,7 +1384,9 @@ def run_daemon(config, provider):
                     "node_count": nodes,
                     "system_prompt": system_prompt,
                     "status": "running",
-                    "backend": config.get("cluster", {}).get("backend", "slurm")
+                    "provider": provider_backend,
+                    "provider_id": provider_id,
+                    "provider_params": effective_launch_params,
                 }
 
                 JOB_TO_SWARM[job_id] = swarm_id
@@ -1149,16 +1399,18 @@ def run_daemon(config, provider):
                     "request_id": request_id,
                     "swarm_id": swarm_id,
                     "job_id": job_id,
-                    "node_count": nodes
+                    "node_count": nodes,
+                    "provider": provider_backend,
+                    "provider_id": provider_id,
                 })
 
                 for node_id in range(nodes):
                     threading.Thread(
                         target=perform_injection,
-                        args=(config, provider, request_id, swarm_id, job_id, node_id, system_prompt),
+                        args=(config, launch_provider, request_id, swarm_id, job_id, node_id, system_prompt),
                         daemon=True
                     ).start()
-                _dispatch_inter_swarm_queue(config, provider)
+                _dispatch_inter_swarm_queue(config)
 
             elif command == "inject":
                 swarm_id = payload.get("swarm_id")
@@ -1168,9 +1420,22 @@ def run_daemon(config, provider):
                 swarm = SWARMS.get(swarm_id)
                 if not swarm:
                     continue
+                if swarm.get("status") in ("terminating", "terminated"):
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "swarm is terminating or terminated"
+                    })
+                    continue
 
                 job_id = swarm["job_id"]
                 node_count = swarm["node_count"]
+                swarm_provider = _provider_for_swarm(swarm_id)
+                if not swarm_provider:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "provider unavailable for swarm"
+                    })
+                    continue
 
                 if nodes == "all":
                     targets = range(node_count)
@@ -1182,7 +1447,7 @@ def run_daemon(config, provider):
                 for node_id in targets:
                     threading.Thread(
                         target=perform_injection,
-                        args=(config, provider, request_id, swarm_id, job_id, node_id, content),
+                        args=(config, swarm_provider, request_id, swarm_id, job_id, node_id, content),
                         daemon=True
                     ).start()
 
@@ -1205,6 +1470,12 @@ def run_daemon(config, provider):
                     emit_event("command_rejected", {
                         "request_id": request_id,
                         "reason": "unknown target_swarm_id"
+                    })
+                    continue
+                if target_swarm.get("status") in ("terminating", "terminated"):
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "target swarm is terminating or terminated"
                     })
                     continue
                 if selector not in ("idle", "all", "nodes"):
@@ -1234,7 +1505,8 @@ def run_daemon(config, provider):
                     "nodes": queued_nodes,
                 })
                 _emit_queue_updated()
-                _dispatch_inter_swarm_queue(config, provider)
+                save_state()
+                _dispatch_inter_swarm_queue(config)
 
             elif command == "queue_list":
                 emit_event("queue_list", {
@@ -1247,6 +1519,12 @@ def run_daemon(config, provider):
                 emit_event("swarm_list", {
                     "request_id": request_id,
                     "swarms": SWARMS
+                })
+
+            elif command == "providers_list":
+                emit_event("providers_list", {
+                    "request_id": request_id,
+                    "providers": PROVIDER_SPECS,
                 })
 
             elif command == "swarm_status":
@@ -1263,6 +1541,17 @@ def run_daemon(config, provider):
                 def handle_swarm_status():
                     try:
                         job_id = swarm.get("job_id")
+                        swarm_provider = _provider_for_swarm(swarm_id)
+                        if not swarm_provider:
+                            emit_event("swarm_status", {
+                                "request_id": request_id,
+                                "swarm_id": swarm_id,
+                                "job_id": job_id,
+                                "node_count": swarm.get("node_count"),
+                                "status": swarm.get("status", "unknown"),
+                                "error": "provider unavailable",
+                            })
+                            return
 
                         if not job_id:
                             swarm["status"] = "terminated"
@@ -1276,7 +1565,7 @@ def run_daemon(config, provider):
                             })
                             return
 
-                        state = provider.get_job_state(job_id)
+                        state = swarm_provider.get_job_state(job_id)
 
                         if not state:
                             if swarm.get("status") != "terminated":
@@ -1325,6 +1614,14 @@ def run_daemon(config, provider):
                     emit_event("command_rejected", {
                         "request_id": request_id,
                         "reason": "unknown approval request"
+                    })
+                    continue
+
+                approval_provider = _provider_for_swarm(meta.get("swarm_id"))
+                if not approval_provider:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "provider unavailable for approval route"
                     })
                     continue
 
@@ -1491,7 +1788,7 @@ def run_daemon(config, provider):
                                 daemon=True,
                             ).start()
                     else:
-                        provider.send_control(
+                        approval_provider.send_control(
                             job_id,
                             meta["node_id"],
                             control_payload,
@@ -1525,57 +1822,50 @@ def run_daemon(config, provider):
             elif command == "swarm_terminate":
                 swarm_id = payload.get("swarm_id")
                 swarm = SWARMS.get(swarm_id)
-                if swarm:
-                    job_id = swarm.get("job_id")
+                if not swarm:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown swarm_id"
+                    })
+                    continue
 
-                    try:
-                        provider.terminate(job_id)
-                    except Exception as e:
+                with SCHEDULER_LOCK:
+                    if str(swarm_id) in TERMINATION_IN_PROGRESS:
                         emit_event("command_rejected", {
                             "request_id": request_id,
-                            "reason": str(e)
+                            "reason": "termination already in progress"
                         })
                         continue
+                    TERMINATION_IN_PROGRESS.add(str(swarm_id))
 
-                    # Mark swarm terminated (do not delete immediately)
-                    if swarm.get("status") != "terminated":
-                        swarm["status"] = "terminated"
-                        swarm["terminated_at"] = time.time()
-                        save_state()
+                if swarm.get("status") != "terminated":
+                    swarm["status"] = "terminating"
+                    swarm["terminating_since"] = time.time()
+                    save_state()
+
+                emit_event("swarm_status", {
+                    "request_id": request_id,
+                    "swarm_id": swarm_id,
+                    "job_id": swarm.get("job_id"),
+                    "node_count": swarm.get("node_count"),
+                    "status": "terminating"
+                })
+
+                terminate_provider = _provider_for_swarm(swarm_id)
+                if not terminate_provider:
                     with SCHEDULER_LOCK:
-                        node_count = int(swarm.get("node_count") or 0)
-                        for node_id in range(node_count):
-                            key = _node_key(swarm_id, node_id)
-                            NODE_THREAD_ACTIVE.pop(key, None)
-                            NODE_OUTSTANDING.pop(key, None)
-                    with SCHEDULER_LOCK:
-                        node_count = int(swarm.get("node_count") or 0)
-                        for node_id in range(node_count):
-                            key = _node_key(swarm_id, node_id)
-                            NODE_THREAD_ACTIVE.pop(key, None)
-                            NODE_OUTSTANDING.pop(key, None)
-
-                    # Provider-specific archival (best-effort)
-                    try:
-                        provider.archive(job_id, swarm_id)
-                    except Exception:
-                        pass
-
-                    emit_event("swarm_terminated", {
+                        TERMINATION_IN_PROGRESS.discard(str(swarm_id))
+                    emit_event("command_rejected", {
                         "request_id": request_id,
-                        "swarm_id": swarm_id
+                        "reason": "provider unavailable for termination"
                     })
-                    with SCHEDULER_LOCK:
-                        dropped = list(INTER_SWARM_QUEUE.pop(str(swarm_id), []))
-                    for item in dropped:
-                        emit_event("inter_swarm_dropped", {
-                            "queue_id": item.get("queue_id"),
-                            "request_id": item.get("request_id"),
-                            "source_swarm_id": item.get("source_swarm_id"),
-                            "target_swarm_id": swarm_id,
-                            "reason": "target swarm terminated",
-                        })
-                    _emit_queue_updated()
+                    continue
+
+                threading.Thread(
+                    target=_graceful_terminate_swarm,
+                    args=(config, terminate_provider, request_id, str(swarm_id)),
+                    daemon=True
+                ).start()
 # ================================
 # Main
 # ================================
@@ -1606,17 +1896,27 @@ def main():
     # Store absolute config path so swarm_launch uses the same config
     config["_config_path"] = str(Path(args.config).resolve())
 
-    # Load persisted state and reconcile with cluster backend
+    # Build provider catalog/instances
+    global PROVIDER_SPECS, PROVIDERS
+    PROVIDER_SPECS = get_provider_specs(config)
+    PROVIDERS = build_providers(config, PROVIDER_SPECS)
+
+    # Load persisted state and reconcile with cluster backends
     load_state()
 
-    # Migration: ensure terminated swarms have terminated_at (for legacy entries)
+    # Migration: ensure terminated swarms have terminated_at and provider binding.
+    default_backend = PROVIDER_SPECS[0]["backend"] if PROVIDER_SPECS else None
     for swarm in SWARMS.values():
         if swarm.get("status") == "terminated" and "terminated_at" not in swarm:
             swarm["terminated_at"] = time.time()
+        if "provider" not in swarm:
+            if swarm.get("backend"):
+                swarm["provider"] = swarm.get("backend")
+            elif default_backend:
+                swarm["provider"] = default_backend
     save_state()
 
-    provider = build_provider(config)
-    reconcile(provider)
+    reconcile(PROVIDERS)
 
     # Ensure state is flushed on shutdown
     import signal
@@ -1629,7 +1929,7 @@ def main():
     signal.signal(signal.SIGINT, graceful_shutdown)
 
     if args.daemon:
-        run_daemon(config, provider)
+        run_daemon(config, PROVIDERS)
 
 
 if __name__ == "__main__":

@@ -69,25 +69,35 @@ Invalid protocol versions are ignored.
 
 ## Supported Commands
 
+Provider presets for launch can be configured via `launch_providers` in config.
+Each preset selects a backend (`slurm` or `local`) and can include defaults and
+UI field definitions for provider-specific launch parameters.
+
 ### `swarm_launch`
 
-Provision a new Slurm job and create swarm entry.
+Provision a new backend job and create swarm entry.
 
 Payload:
 - `nodes`
-- `partition`
-- `time`
-- `account` (optional)
-- `qos` (optional)
 - `system_prompt`
 - `agents_md_content` (optional, copied to each node as `AGENTS.md`)
+- `provider` (optional provider preset id)
+- `provider_params` (optional provider-specific launch values)
 
 Behavior:
-1. Calls `allocate_and_prepare.py` locally.
+1. Selects launch provider backend.
+2. Passes merged `defaults + provider_params` to provider launch.
 2. Extracts `job_id`.
 3. Registers new `swarm_id`.
 4. Emits `swarm_launched`.
 5. Injects `system_prompt` into all nodes asynchronously.
+
+---
+
+### `providers_list`
+
+Returns launch provider catalog (id/label/backend/defaults/launch_fields) so UI can
+render provider picker and provider-specific parameter forms.
 
 ---
 
@@ -128,7 +138,8 @@ Executed in background thread to avoid blocking control loop.
 
 ### `swarm_terminate`
 
-Cancels Slurm job via `scancel`.
+Marks swarm as `terminating`, waits for agents to become idle (best effort,
+bounded by timeout), then cancels Slurm job via `scancel`.
 
 ---
 
@@ -140,6 +151,7 @@ In-memory structures:
 SWARMS: { swarm_id → { job_id, node_count, status, ... } }
 JOB_TO_SWARM: { job_id → swarm_id }
 LAST_USAGE: { job_id:node_id:injection_id → total_tokens }
+INTER_SWARM_QUEUE: { target_swarm_id → deque[queue_item] }
 ```
 
 Persistent state stored in:
@@ -149,6 +161,8 @@ router_state.json
 ```
 
 Loaded at startup and reconciled with Slurm.
+Persisted fields include swarm registry and inter-swarm queue, so queued
+`enqueue_inject` work resumes after router restart.
 
 ---
 

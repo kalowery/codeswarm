@@ -111,15 +111,17 @@ export default function Home() {
     const node = swarm.nodes[nodeId]
     if (!node || node.turns.length === 0) return { attention: false, working: false, ready: true }
 
-    const last = node.turns[node.turns.length - 1]
-    if (last.phase === 'streaming' || last.phase === 'executing') {
-      return { attention: false, working: true, ready: false }
-    }
-
-    if (last.phase === 'awaiting_approval') {
+    const hasApproval = node.turns.some((t) => t.phase === 'awaiting_approval' && !!t.approval)
+    if (hasApproval) {
       return { attention: true, working: false, ready: false }
     }
 
+    const hasWorking = node.turns.some((t) => t.phase === 'streaming' || t.phase === 'executing')
+    if (hasWorking) {
+      return { attention: false, working: true, ready: false }
+    }
+
+    const last = node.turns[node.turns.length - 1]
     if (last.phase === 'completed') return { attention: false, working: false, ready: true }
 
     return { attention: false, working: false, ready: false }
@@ -161,6 +163,8 @@ export default function Home() {
   const [showLaunch, setShowLaunch] = useState(false)
   const [viewModeBySwarm, setViewModeBySwarm] = useState<Record<string, SwarmViewMode>>({})
   const nodeScrollRef = useRef<HTMLDivElement | null>(null)
+  const tabsPanelRef = useRef<HTMLDivElement | null>(null)
+  const scrolledApprovalKeyRef = useRef<string>('')
   const gridViewportRef = useRef<HTMLDivElement | null>(null)
   const gridLayoutRef = useRef<GridLayout>({ cols: 1, scale: 1 })
   const [canScrollLeft, setCanScrollLeft] = useState(false)
@@ -330,6 +334,34 @@ export default function Home() {
     }
   }, [active?.swarm_id, active?.node_count, activeViewMode])
 
+  useEffect(() => {
+    if (!active || activeViewMode !== 'tabs') return
+    const activeNodeId = activeNodeBySwarm[active.swarm_id] ?? 0
+    const activeNode = active.nodes[activeNodeId]
+    if (!activeNode) return
+
+    const pendingTurn = activeNode.turns.find((t) => t.phase === 'awaiting_approval' && !!t.approval)
+    if (!pendingTurn) {
+      scrolledApprovalKeyRef.current = ''
+      return
+    }
+    const approvalKey = `${active.swarm_id}:${activeNodeId}:${pendingTurn.approval?.call_id ?? pendingTurn.injection_id}`
+    if (scrolledApprovalKeyRef.current === approvalKey) return
+
+    const panel = tabsPanelRef.current
+    if (!panel) return
+
+    const raf = requestAnimationFrame(() => {
+      const el = panel.querySelector('[data-awaiting-approval="true"]') as HTMLElement | null
+      if (el) {
+        scrolledApprovalKeyRef.current = approvalKey
+        el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    })
+
+    return () => cancelAnimationFrame(raf)
+  }, [active, activeViewMode, activeNodeBySwarm])
+
   async function sendApproval(
     job_id: string,
     call_id: string,
@@ -447,7 +479,7 @@ export default function Home() {
                 )}
 
                 {turn.phase === 'awaiting_approval' && turn.approval && (
-                  <div className="text-xs bg-amber-900 border border-amber-500 rounded p-2">
+                  <div data-awaiting-approval="true" className="text-xs bg-amber-900 border border-amber-500 rounded p-2">
                     <div className="text-amber-300 mb-1">Execution approval required</div>
                     <div className="text-slate-200">
                       $ {Array.isArray(turn.approval.command)
@@ -710,6 +742,11 @@ export default function Home() {
                   <div className="text-sm text-slate-400">
                     {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
                   </div>
+                  {(swarm.provider_id || swarm.provider) && (
+                    <div className="text-xs text-slate-500 mt-1">
+                      Provider: {swarm.provider_id || swarm.provider}
+                    </div>
+                  )}
                   <div className="text-xs text-slate-500 mt-1">
                     Est. spend: {formatUsd(swarmSessionCost)}
                   </div>
@@ -835,7 +872,7 @@ export default function Home() {
 
               if (activeViewMode === 'tabs') {
                 return (
-                  <div className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
+                  <div ref={tabsPanelRef} className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
                     <div className="mb-3 border-b border-slate-800 pb-3">
                       <div className="flex items-center gap-2">
                         {canScrollLeft && (

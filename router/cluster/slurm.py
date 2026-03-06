@@ -16,15 +16,25 @@ class SlurmProvider(ClusterProvider):
         self.cluster_cfg = config.get("cluster", {})
         self.slurm_cfg = self.cluster_cfg.get("slurm", {})
 
-    def launch(self, nodes: int, agents_md_content: str | None = None) -> str:
+    def launch(
+        self,
+        nodes: int,
+        agents_md_content: str | None = None,
+        launch_params: dict | None = None,
+    ) -> str:
         config_path = self.config.get("_config_path")
         if not config_path:
             raise RuntimeError("Router config path not available for swarm launch")
 
-        partition = self.slurm_cfg.get("partition")
-        time_limit = self.slurm_cfg.get("time_limit")
-        account = self.slurm_cfg.get("account")
-        qos = self.slurm_cfg.get("qos")
+        launch_params = launch_params if isinstance(launch_params, dict) else {}
+        partition = launch_params.get("partition") or self.slurm_cfg.get("partition")
+        time_limit = launch_params.get("time_limit") or self.slurm_cfg.get("time_limit")
+        account = launch_params.get("account") if "account" in launch_params else self.slurm_cfg.get("account")
+        qos = launch_params.get("qos") if "qos" in launch_params else self.slurm_cfg.get("qos")
+        if isinstance(account, str) and not account.strip():
+            account = None
+        if isinstance(qos, str) and not qos.strip():
+            qos = None
 
         if not partition:
             raise RuntimeError("Slurm partition not configured")

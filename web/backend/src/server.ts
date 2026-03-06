@@ -30,6 +30,11 @@ let interSwarmQueueItems: any[] = [];
 const requestPromptMap = new Map<string, string>();
 const injectionPromptMap = new Map<string, string>();
 const processedAutoRoutes = new Set<string>();
+let launchProviders: any[] = [];
+const pendingProvidersRequests = new Map<
+  string,
+  { resolve: (providers: any[]) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+>();
 
 type AutoRouteDirective =
   | { targetAlias?: string; mode: 'idle'; prompt: string }
@@ -211,6 +216,17 @@ function handleAutoRoutingFromTaskComplete(data: any) {
   handleAutoRoutingFromFinalText(data, finalText);
 }
 
+function requestProvidersCatalog(timeoutMs = 5000): Promise<any[]> {
+  return new Promise((resolve, reject) => {
+    const request_id = router.send('providers_list', {});
+    const timer = setTimeout(() => {
+      pendingProvidersRequests.delete(request_id);
+      reject(new Error('Timed out waiting for providers_list'));
+    }, timeoutMs);
+    pendingProvidersRequests.set(request_id, { resolve, reject, timer });
+  });
+}
+
 // --- Helper: request swarm status ---
 function requestStatus(swarm_id: string) {
   const request_id = router.send('swarm_status', { swarm_id });
@@ -231,13 +247,13 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'swarm_launched') {
-    const { swarm_id, job_id, node_count, request_id } = data;
+    const { swarm_id, job_id, node_count, request_id, provider, provider_id } = data;
 
     // Use user-provided alias if available
     const alias = pendingAliases[request_id] || `swarm-${swarm_id.slice(0, 8)}`;
     delete pendingAliases[request_id];
 
-    const record = state.createSwarm(swarm_id, alias, job_id, node_count);
+    const record = state.createSwarm(swarm_id, alias, job_id, node_count, { provider, provider_id });
 
     // Initially mark as pending until Slurm confirms
     state.updateStatus(swarm_id, 'pending');
@@ -246,6 +262,18 @@ router.on('event', (msg: any) => {
 
     // Immediately request real Slurm status
     requestStatus(swarm_id);
+  }
+
+  if (event === 'providers_list') {
+    const providers = Array.isArray(data?.providers) ? data.providers : [];
+    launchProviders = providers;
+    const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
+    if (requestId && pendingProvidersRequests.has(requestId)) {
+      const pending = pendingProvidersRequests.get(requestId)!;
+      clearTimeout(pending.timer);
+      pendingProvidersRequests.delete(requestId);
+      pending.resolve(providers);
+    }
   }
 
   // --- Core conversational events (explicit mapping for backwards compatibility) ---
@@ -336,8 +364,11 @@ router.on('event', (msg: any) => {
           swarm_id,
           alias,
           swarm.job_id,
-          swarm.node_count
+          swarm.node_count,
+          { provider: swarm.provider, provider_id: swarm.provider_id }
         );
+      } else {
+        state.updateProviderMeta(swarm_id, swarm.provider, swarm.provider_id);
       }
     }
 
@@ -387,16 +418,20 @@ router.on('event', (msg: any) => {
 
 // --- REST Endpoints ---
 app.post('/launch', (req, res) => {
-  const { nodes, prompt, alias, agents_md_content } = req.body;
+  const { nodes, prompt, alias, agents_md_content, provider, provider_params } = req.body;
   const agentsContent =
     typeof agents_md_content === 'string' && agents_md_content.trim().length > 0
       ? agents_md_content
       : undefined;
+  const normalizedProvider = typeof provider === 'string' && provider.trim().length > 0 ? provider : undefined;
+  const normalizedProviderParams = provider_params && typeof provider_params === 'object' ? provider_params : undefined;
 
   const request_id = router.send('swarm_launch', {
     nodes,
     system_prompt: prompt,
-    agents_md_content: agentsContent
+    agents_md_content: agentsContent,
+    provider: normalizedProvider,
+    provider_params: normalizedProviderParams
   });
 
   // Store alias temporarily until swarm_launched event arrives
@@ -491,6 +526,18 @@ app.get('/swarms', (req, res) => {
 
 app.get('/queue', (req, res) => {
   res.json(interSwarmQueueItems);
+});
+
+app.get('/providers', async (req, res) => {
+  try {
+    const providers = await requestProvidersCatalog();
+    return res.json(providers);
+  } catch (err) {
+    if (launchProviders.length > 0) {
+      return res.json(launchProviders);
+    }
+    return res.status(500).json({ error: 'Unable to fetch provider catalog' });
+  }
 });
 
 app.post('/approval', (req, res) => {

@@ -43,7 +43,12 @@ Payload:
 ```json
 {
   "nodes": 4,
-  "system_prompt": "..."
+  "system_prompt": "...",
+  "agents_md_content": "optional markdown string",
+  "provider": "optional provider id",
+  "provider_params": {
+    "provider-specific": "values"
+  }
 }
 ```
 
@@ -57,11 +62,48 @@ Data fields:
 - `swarm_id`
 - `job_id`
 - `node_count`
+- `provider` (backend id used for this swarm)
+- `provider_id` (launch provider preset id)
 
 Notes:
 
-- provider-specific launch parameters come from config, not command payload.
 - router immediately injects `system_prompt` to each node.
+
+### 3.1a `providers_list`
+
+Payload:
+
+```json
+{}
+```
+
+Result event: `providers_list`
+
+Data:
+
+```json
+{
+  "request_id": "...",
+  "providers": [
+    {
+      "id": "slurm-a100",
+      "label": "Slurm A100",
+      "backend": "slurm",
+      "defaults": {
+        "partition": "a100",
+        "time_limit": "01:00:00"
+      },
+      "launch_fields": [
+        {
+          "key": "partition",
+          "label": "Partition",
+          "type": "text"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ### 3.2 `inject`
 
@@ -101,7 +143,8 @@ Data:
       "node_count": 1,
       "system_prompt": "...",
       "status": "running|terminated",
-      "backend": "local|slurm",
+      "provider": "local|slurm",
+      "provider_id": "provider preset id",
       "terminated_at": 0
     }
   }
@@ -187,7 +230,10 @@ Payload:
 { "swarm_id": "..." }
 ```
 
-Result event: `swarm_terminated`
+Result events:
+
+- `swarm_status` with `status: "terminating"`
+- `swarm_terminated`
 
 Data:
 

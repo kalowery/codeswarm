@@ -28,7 +28,12 @@ class LocalProvider(ClusterProvider):
         # Archive root (optional)
         self.archive_root = self.config.get("archive_root")
 
-    def launch(self, nodes: int, agents_md_content: str | None = None) -> str:
+    def launch(
+        self,
+        nodes: int,
+        agents_md_content: str | None = None,
+        launch_params: dict | None = None,
+    ) -> str:
         job_id = f"local_{uuid.uuid4().hex[:8]}"
         procs: List[subprocess.Popen] = []
 

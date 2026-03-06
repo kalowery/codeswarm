@@ -14,5 +14,17 @@
   },
   "router": {
     "inject_timeout_seconds": 60
-  }
+  },
+  "launch_providers": [
+    {
+      "id": "slurm-default",
+      "label": "Slurm Default",
+      "backend": "slurm"
+    },
+    {
+      "id": "local-dev",
+      "label": "Local Dev",
+      "backend": "local"
+    }
+  ]
 }

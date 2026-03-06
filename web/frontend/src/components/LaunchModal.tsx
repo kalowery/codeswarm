@@ -1,9 +1,40 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 interface Props {
   onClose: () => void
+}
+
+interface ProviderFieldOption {
+  label?: string
+  value: string
+}
+
+interface ProviderLaunchField {
+  key: string
+  label?: string
+  type?: 'text' | 'number' | 'boolean' | 'select'
+  default?: string | number | boolean
+  required?: boolean
+  placeholder?: string
+  options?: ProviderFieldOption[]
+}
+
+interface ProviderLaunchPanel {
+  id?: string
+  title?: string
+  description?: string
+  fields?: ProviderLaunchField[]
+}
+
+interface LaunchProvider {
+  id: string
+  label?: string
+  backend: string
+  defaults?: Record<string, any>
+  launch_fields?: ProviderLaunchField[]
+  launch_panels?: ProviderLaunchPanel[]
 }
 
 export default function LaunchModal({ onClose }: Props) {
@@ -12,7 +43,57 @@ export default function LaunchModal({ onClose }: Props) {
   const [prompt, setPrompt] = useState('')
   const [agentsMdName, setAgentsMdName] = useState('')
   const [agentsMdContent, setAgentsMdContent] = useState('')
+  const [providers, setProviders] = useState<LaunchProvider[]>([])
+  const [selectedProvider, setSelectedProvider] = useState('')
+  const [providerValues, setProviderValues] = useState<Record<string, string>>({})
+  const [activeTab, setActiveTab] = useState<'general' | 'provider'>('general')
   const [loading, setLoading] = useState(false)
+  const [loadingProviders, setLoadingProviders] = useState(true)
+
+  useEffect(() => {
+    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+    setLoadingProviders(true)
+    fetch(`${apiBase}/providers`)
+      .then((res) => res.json())
+      .then((data) => {
+        const list = Array.isArray(data) ? (data as LaunchProvider[]) : []
+        setProviders(list)
+        if (list.length > 0) {
+          const first = list[0]
+          setSelectedProvider(first.id)
+        }
+      })
+      .catch(() => {
+        setProviders([])
+      })
+      .finally(() => setLoadingProviders(false))
+  }, [])
+
+  const activeProvider = useMemo(
+    () => providers.find((p) => p.id === selectedProvider),
+    [providers, selectedProvider]
+  )
+
+  useEffect(() => {
+    if (!activeProvider) {
+      setProviderValues({})
+      return
+    }
+    const defaults: Record<string, string> = {}
+    const panelFields = (activeProvider.launch_panels ?? [])
+      .flatMap((panel) => (Array.isArray(panel.fields) ? panel.fields : []))
+    const fields = [
+      ...(Array.isArray(activeProvider.launch_fields) ? activeProvider.launch_fields : []),
+      ...panelFields
+    ]
+    for (const field of fields) {
+      const providerDefault = activeProvider.defaults?.[field.key]
+      const fieldDefault = typeof field.default !== 'undefined' ? field.default : providerDefault
+      if (typeof fieldDefault === 'undefined' || fieldDefault === null) continue
+      defaults[field.key] = String(fieldDefault)
+    }
+    setProviderValues(defaults)
+  }, [activeProvider])
 
   async function handleLaunch() {
     const nodeCount = parseInt(nodes, 10)
@@ -25,6 +106,40 @@ export default function LaunchModal({ onClose }: Props) {
     try {
       setLoading(true)
       const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+      const provider_params: Record<string, string | number | boolean> = {}
+      const allProviderFields = activeProvider
+        ? [
+            ...(Array.isArray(activeProvider.launch_fields) ? activeProvider.launch_fields : []),
+            ...(activeProvider.launch_panels ?? []).flatMap((panel) => (Array.isArray(panel.fields) ? panel.fields : []))
+          ]
+        : []
+      if (allProviderFields.length > 0) {
+        for (const field of allProviderFields) {
+          const raw = providerValues[field.key] ?? ''
+          const required = !!field.required
+          const type = field.type ?? 'text'
+          if (required && raw.trim() === '') {
+            alert(`Missing required field: ${field.label ?? field.key}`)
+            setLoading(false)
+            return
+          }
+          if (raw.trim() === '') continue
+          if (type === 'number') {
+            const n = Number(raw)
+            if (Number.isNaN(n)) {
+              alert(`Invalid number for ${field.label ?? field.key}`)
+              setLoading(false)
+              return
+            }
+            provider_params[field.key] = n
+          } else if (type === 'boolean') {
+            provider_params[field.key] = raw === 'true'
+          } else {
+            provider_params[field.key] = raw
+          }
+        }
+      }
+
       const res = await fetch(`${apiBase}/launch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -32,7 +147,9 @@ export default function LaunchModal({ onClose }: Props) {
           nodes: nodeCount,
           prompt,
           alias,
-          agents_md_content: agentsMdContent || undefined
+          agents_md_content: agentsMdContent || undefined,
+          provider: selectedProvider || undefined,
+          provider_params: Object.keys(provider_params).length > 0 ? provider_params : undefined
         })
       })
 
@@ -49,70 +166,225 @@ export default function LaunchModal({ onClose }: Props) {
     }
   }
 
+  const renderField = (field: ProviderLaunchField) => {
+    const type = field.type ?? 'text'
+    const label = field.label ?? field.key
+    const value = providerValues[field.key] ?? ''
+    if (type === 'boolean') {
+      return (
+        <label key={field.key} className="flex items-center gap-2 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={value === 'true'}
+            onChange={(e) =>
+              setProviderValues((prev) => ({ ...prev, [field.key]: e.target.checked ? 'true' : 'false' }))
+            }
+          />
+          {label}
+        </label>
+      )
+    }
+    if (type === 'select' && Array.isArray(field.options) && field.options.length > 0) {
+      return (
+        <div key={field.key}>
+          <label className="block text-sm text-slate-400 mb-1">{label}</label>
+          <select
+            value={value}
+            onChange={(e) => setProviderValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
+            className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+          >
+            <option value="">(default)</option>
+            {field.options.map((opt) => (
+              <option key={`${field.key}-${opt.value}`} value={opt.value}>
+                {opt.label ?? opt.value}
+              </option>
+            ))}
+          </select>
+        </div>
+      )
+    }
+    return (
+      <div key={field.key}>
+        <label className="block text-sm text-slate-400 mb-1">
+          {label}{field.required ? ' *' : ''}
+        </label>
+        <input
+          type={type === 'number' ? 'number' : 'text'}
+          value={value}
+          onChange={(e) => setProviderValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
+          className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+          placeholder={field.placeholder}
+        />
+      </div>
+    )
+  }
+
+  const renderProviderFields = () => {
+    const panels = activeProvider?.launch_panels ?? []
+    if (panels.length > 0) {
+      return (
+        <div className="space-y-3">
+          {panels.map((panel, panelIdx) => {
+            const fields = Array.isArray(panel.fields) ? panel.fields : []
+            if (fields.length === 0) return null
+            return (
+              <div
+                key={panel.id ?? `${activeProvider?.id}-panel-${panelIdx}`}
+                className="space-y-3 rounded border border-slate-700 p-3 bg-slate-950/30"
+              >
+                <div className="text-xs uppercase tracking-wide text-slate-500">
+                  {panel.title ?? `Provider Panel ${panelIdx + 1}`}
+                </div>
+                {panel.description && (
+                  <div className="text-xs text-slate-500">{panel.description}</div>
+                )}
+                {fields.map((field) => renderField(field))}
+              </div>
+            )
+          })}
+        </div>
+      )
+    }
+
+    const fields = activeProvider?.launch_fields ?? []
+    if (fields.length === 0) {
+      return (
+        <div className="text-sm text-slate-500">
+          No provider-specific parameters for this provider.
+        </div>
+      )
+    }
+    return (
+      <div className="space-y-3 rounded border border-slate-700 p-3 bg-slate-950/30">
+        <div className="text-xs uppercase tracking-wide text-slate-500">Provider Parameters</div>
+        {fields.map((field) => renderField(field))}
+      </div>
+    )
+  }
+
+  const hasProviderParams = (() => {
+    if (!activeProvider) return false
+    const panelFields = (activeProvider.launch_panels ?? []).some(
+      (panel) => Array.isArray(panel.fields) && panel.fields.length > 0
+    )
+    if (panelFields) return true
+    return Array.isArray(activeProvider.launch_fields) && activeProvider.launch_fields.length > 0
+  })()
+
+  const showProviderTab = hasProviderParams
+
+  useEffect(() => {
+    if (!showProviderTab && activeTab === 'provider') {
+      setActiveTab('general')
+    }
+  }, [showProviderTab, activeTab])
+
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
-      <div className="bg-slate-900 border border-slate-800 rounded-lg w-[500px] p-6">
+      <div className="bg-slate-900 border border-slate-800 rounded-lg w-[560px] h-[680px] max-h-[82vh] p-6 flex flex-col">
         <h2 className="text-lg font-semibold mb-4">Launch Swarm</h2>
 
-        <div className="space-y-4">
-          <div>
-            <label className="block text-sm text-slate-400 mb-1">Alias</label>
-            <input
-              value={alias}
-              onChange={(e) => setAlias(e.target.value)}
+        <div className="mb-4">
+          <label className="block text-sm text-slate-400 mb-1">Provider</label>
+          {loadingProviders ? (
+            <div className="text-sm text-slate-500">Loading providers...</div>
+          ) : (
+            <select
+              value={selectedProvider}
+              onChange={(e) => setSelectedProvider(e.target.value)}
               className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
-              placeholder="optional-name"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm text-slate-400 mb-1">Agents</label>
-            <input
-              type="number"
-              min={1}
-              value={nodes}
-              onChange={(e) => setNodes(e.target.value)}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm text-slate-400 mb-1">System Prompt</label>
-            <textarea
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-24"
-              placeholder="You are a skilled GPU programmer..."
-            />
-          </div>
-
-          <div>
-            <label className="block text-sm text-slate-400 mb-1">AGENTS.md (optional)</label>
-            <input
-              type="file"
-              accept=".md,text/markdown,text/plain"
-              onChange={async (e) => {
-                const file = e.target.files?.[0]
-                if (!file) {
-                  setAgentsMdName('')
-                  setAgentsMdContent('')
-                  return
-                }
-                const text = await file.text()
-                setAgentsMdName(file.name)
-                setAgentsMdContent(text)
-              }}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 file:mr-3 file:rounded file:border-0 file:bg-slate-700 file:px-3 file:py-1 file:text-slate-100"
-            />
-            {agentsMdName ? (
-              <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
-            ) : (
-              <p className="mt-1 text-xs text-slate-500">If selected, this file is copied into each node as AGENTS.md.</p>
-            )}
-          </div>
+            >
+              {providers.map((provider) => (
+                <option key={provider.id} value={provider.id}>
+                  {provider.label || provider.id}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
 
-        <div className="flex justify-end mt-6 space-x-3">
+        {showProviderTab && (
+          <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs mb-4 self-start">
+            <button
+              onClick={() => setActiveTab('general')}
+              className={`px-3 py-1 ${activeTab === 'general' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+            >
+              General
+            </button>
+            <button
+              onClick={() => setActiveTab('provider')}
+              className={`px-3 py-1 ${activeTab === 'provider' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+            >
+              Provider Params
+            </button>
+          </div>
+        )}
+
+        <div className="space-y-4 overflow-y-auto pr-1 flex-1 min-h-0">
+          {(!showProviderTab || activeTab === 'general') && (
+            <>
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">Alias</label>
+                <input
+                  value={alias}
+                  onChange={(e) => setAlias(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                  placeholder="optional-name"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">Agents</label>
+                <input
+                  type="number"
+                  min={1}
+                  value={nodes}
+                  onChange={(e) => setNodes(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">System Prompt</label>
+                <textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-24"
+                  placeholder="You are a skilled GPU programmer..."
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm text-slate-400 mb-1">AGENTS.md (optional)</label>
+                <input
+                  type="file"
+                  accept=".md,text/markdown,text/plain"
+                  onChange={async (e) => {
+                    const file = e.target.files?.[0]
+                    if (!file) {
+                      setAgentsMdName('')
+                      setAgentsMdContent('')
+                      return
+                    }
+                    const text = await file.text()
+                    setAgentsMdName(file.name)
+                    setAgentsMdContent(text)
+                  }}
+                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 file:mr-3 file:rounded file:border-0 file:bg-slate-700 file:px-3 file:py-1 file:text-slate-100"
+                />
+                {agentsMdName ? (
+                  <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
+                ) : (
+                  <p className="mt-1 text-xs text-slate-500">If selected, this file is copied into each node as AGENTS.md.</p>
+                )}
+              </div>
+            </>
+          )}
+
+          {showProviderTab && activeTab === 'provider' && renderProviderFields()}
+        </div>
+
+        <div className="flex justify-end mt-6 space-x-3 shrink-0">
           <button
             onClick={onClose}
             className="px-4 py-2 bg-slate-700 rounded"
