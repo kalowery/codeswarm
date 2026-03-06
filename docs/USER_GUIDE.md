@@ -50,10 +50,19 @@ npm --prefix web/frontend run dev
 - requires `ssh.login_alias` and `cluster.slurm.*`
 - mailbox under `<workspace_root>/<cluster_subdir>/mailbox`
 
+### AWS mode
+
+- backend: `cluster.backend = "aws"` (or AWS launch provider preset)
+- allocates EC2 compute nodes + shared EBS volume
+- mounts shared workspace at `cluster.workspace_root`
+- supports multiple workers per node via provider launch fields
+- optional `delete_ebs_on_shutdown` controls EBS deletion during terminate
+- detailed setup guide: `docs/AWS_SETUP.md`
+
 ### Multi-provider launch presets
 
 - optional config key: `launch_providers`
-- each entry declares a launch preset: `id`, `label`, `backend`
+- each entry declares a launch preset: `id`, `label`, `backend` (`local`/`slurm`/`aws`)
 - optional `defaults` and `launch_fields` let providers expose custom launch UI inputs
 
 ## 3. Launch a swarm

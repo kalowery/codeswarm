@@ -70,7 +70,7 @@ Invalid protocol versions are ignored.
 ## Supported Commands
 
 Provider presets for launch can be configured via `launch_providers` in config.
-Each preset selects a backend (`slurm` or `local`) and can include defaults and
+Each preset selects a backend (`slurm`, `local`, or `aws`) and can include defaults and
 UI field definitions for provider-specific launch parameters.
 
 ### `swarm_launch`

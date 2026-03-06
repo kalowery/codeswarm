@@ -18,11 +18,17 @@ export class RouterClient {
     return requestId;
   }
 
-  launch(nodes: number, systemPrompt: string) {
-    return this.sendCommand("swarm_launch", {
+  launch(nodes: number, systemPrompt: string, provider?: string) {
+    const payload: any = {
       nodes,
       system_prompt: systemPrompt,
-    });
+    };
+
+    if (typeof provider === "string" && provider.trim()) {
+      payload.provider = provider.trim();
+    }
+
+    return this.sendCommand("swarm_launch", payload);
   }
 
   listSwarms() {

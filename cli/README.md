@@ -84,6 +84,7 @@ Launch:
 codeswarm launch \
   --nodes 4 \
   --prompt "You are a focused autonomous agent." \
+  --provider slurm-default \
   --config ../configs/hpcfund.json
 ```
 
@@ -93,6 +94,12 @@ codeswarm launch \
 |------|------------|
 | `--nodes` | Number of swarm nodes |
 | `--prompt` | System prompt injected at launch |
+
+#### Optional Flags
+
+| Flag | Description |
+|------|------------|
+| `--provider` | Launch provider preset id (e.g. `slurm-default`, `aws-default`) |
 
 Backend-specific parameters (partition, time, account, etc.) are defined in the router configuration file.
 

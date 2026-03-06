@@ -38,13 +38,28 @@ def load_config(path):
             ])
         elif backend == "local":
             continue
+        elif backend == "aws":
+            required.extend([
+                ("cluster", "workspace_root"),
+                ("cluster", "cluster_subdir"),
+                ("cluster.aws", "region"),
+                ("cluster.aws", "ami_id"),
+                ("cluster.aws", "subnet_id"),
+                ("cluster.aws", "key_name"),
+                ("cluster.aws", "ssh_private_key_path"),
+            ])
         else:
             raise RuntimeError(f"Unsupported cluster backend: {backend}")
 
     for section, key in required:
+        if section == "cluster.aws":
+            cluster_cfg = data.get("cluster") if isinstance(data.get("cluster"), dict) else {}
+            aws_cfg = cluster_cfg.get("aws") if isinstance(cluster_cfg.get("aws"), dict) else {}
+            if key not in aws_cfg:
+                raise RuntimeError(f"Missing required config field: cluster.aws.{key}")
+            continue
+
         if section not in data or key not in data[section]:
-            raise RuntimeError(
-                f"Missing required config field: {section}.{key}"
-            )
+            raise RuntimeError(f"Missing required config field: {section}.{key}")
 
     return data

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 import subprocess
 
 
@@ -11,12 +11,13 @@ class ClusterProvider(ABC):
         nodes: int,
         agents_md_content: str | None = None,
         launch_params: dict | None = None,
+        progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
         """Launch swarm and return backend job_id."""
         pass
 
     @abstractmethod
-    def terminate(self, job_id: str) -> None:
+    def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
         pass
 
     @abstractmethod

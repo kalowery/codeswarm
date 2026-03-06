@@ -1,4 +1,5 @@
 from .slurm import SlurmProvider
+from .aws import AwsProvider
 from ..providers.local_provider import LocalProvider
 
 
@@ -33,6 +34,47 @@ def _default_launch_fields_for_backend(backend: str, config: dict):
                 "label": "QoS",
                 "type": "text",
                 "default": slurm_cfg.get("qos") or "",
+                "required": False,
+            },
+        ]
+
+    if backend == "aws":
+        aws_cfg = config.get("cluster", {}).get("aws", {})
+        return [
+            {
+                "key": "instance_type",
+                "label": "Instance Type",
+                "type": "text",
+                "default": aws_cfg.get("instance_type", ""),
+                "required": True,
+                "placeholder": "c7i.4xlarge",
+            },
+            {
+                "key": "node_count",
+                "label": "Compute Nodes",
+                "type": "number",
+                "default": aws_cfg.get("node_count", 1),
+                "required": False,
+            },
+            {
+                "key": "workers_per_node",
+                "label": "Workers Per Node",
+                "type": "number",
+                "default": aws_cfg.get("workers_per_node", 1),
+                "required": False,
+            },
+            {
+                "key": "ebs_volume_size_gb",
+                "label": "Shared EBS Size (GiB)",
+                "type": "number",
+                "default": aws_cfg.get("ebs_volume_size_gb", 100),
+                "required": True,
+            },
+            {
+                "key": "delete_ebs_on_shutdown",
+                "label": "Delete EBS On Shutdown",
+                "type": "boolean",
+                "default": aws_cfg.get("delete_ebs_on_shutdown", False),
                 "required": False,
             },
         ]
@@ -132,6 +174,9 @@ def _build_backend_provider(config: dict, backend: str):
         local_cfg = cluster_cfg.get("local", {})
         local_cfg = {**cluster_cfg, **local_cfg}
         return LocalProvider(local_cfg)
+
+    if backend == "aws":
+        return AwsProvider(config)
 
     raise RuntimeError(f"Unsupported cluster backend: {backend}")
 

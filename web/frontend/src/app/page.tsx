@@ -92,12 +92,26 @@ export default function Home() {
 
   useEffect(() => {
     const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
-    fetch(`${apiBase}/swarms`)
-      .then((res) => res.json())
+
+    const fetchJson = async (url: string) => {
+      const res = await fetch(url)
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`)
+      }
+      return res.json()
+    }
+
+    fetchJson(`${apiBase}/swarms`)
       .then((data) => setSwarms(data))
-    fetch(`${apiBase}/queue`)
-      .then((res) => res.json())
+      .catch((err) => {
+        console.warn('Failed to fetch swarms:', err)
+      })
+
+    fetchJson(`${apiBase}/queue`)
       .then((data) => setInterSwarmQueue(data))
+      .catch((err) => {
+        console.warn('Failed to fetch queue:', err)
+      })
   }, [setSwarms, setInterSwarmQueue])
 
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
@@ -710,6 +724,16 @@ export default function Home() {
                 <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
               </div>
               <div className="text-sm text-amber-400">LAUNCHING...</div>
+              {launch.message && (
+                <div className="text-xs text-slate-400 mt-1 whitespace-pre-wrap break-words max-h-24 overflow-y-auto">
+                  {launch.message}
+                </div>
+              )}
+              {(launch.provider_id || launch.provider || launch.stage) && (
+                <div className="text-[11px] text-slate-500 mt-1">
+                  {[launch.provider_id || launch.provider, launch.stage].filter(Boolean).join(' · ')}
+                </div>
+              )}
             </div>
           ))}
 

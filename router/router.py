@@ -423,8 +423,12 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id):
     else:
         timed_out = True
 
+    terminate_params = swarm.get("provider_params") if isinstance(swarm, dict) else None
+    if not isinstance(terminate_params, dict):
+        terminate_params = None
+
     try:
-        provider.terminate(job_id)
+        provider.terminate(job_id, terminate_params=terminate_params)
     except Exception as e:
         swarm = SWARMS.get(str(swarm_id))
         if swarm and swarm.get("status") == "terminating":
@@ -1364,11 +1368,31 @@ def run_daemon(config, providers):
                 launch_defaults = launch_defaults if isinstance(launch_defaults, dict) else {}
                 effective_launch_params = {**launch_defaults, **provider_params}
 
+                emit_event("swarm_launch_progress", {
+                    "request_id": request_id,
+                    "provider": provider_backend,
+                    "provider_id": provider_id,
+                    "stage": "queued",
+                    "message": "Launch request queued",
+                    "timestamp": time.time(),
+                })
+
+                def _launch_progress(stage, message):
+                    emit_event("swarm_launch_progress", {
+                        "request_id": request_id,
+                        "provider": provider_backend,
+                        "provider_id": provider_id,
+                        "stage": str(stage),
+                        "message": str(message),
+                        "timestamp": time.time(),
+                    })
+
                 try:
                     job_id = launch_provider.launch(
                         nodes,
                         agents_md_content=agents_md_content,
                         launch_params=effective_launch_params,
+                        progress_cb=_launch_progress,
                     )
                 except Exception as e:
                     emit_event("command_rejected", {

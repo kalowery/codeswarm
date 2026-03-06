@@ -4,7 +4,7 @@ import json
 import shlex
 import base64
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .base import ClusterProvider
 
@@ -21,7 +21,16 @@ class SlurmProvider(ClusterProvider):
         nodes: int,
         agents_md_content: str | None = None,
         launch_params: dict | None = None,
+        progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
+        def _progress(stage: str, message: str):
+            if callable(progress_cb):
+                try:
+                    progress_cb(stage, message)
+                except Exception:
+                    pass
+
+        _progress("starting", f"Preparing Slurm launch for {nodes} node(s)")
         config_path = self.config.get("_config_path")
         if not config_path:
             raise RuntimeError("Router config path not available for swarm launch")
@@ -38,9 +47,11 @@ class SlurmProvider(ClusterProvider):
 
         if not partition:
             raise RuntimeError("Slurm partition not configured")
+        _progress("config", f"Using partition: {partition}")
 
         if not time_limit:
             raise RuntimeError("Slurm time_limit not configured")
+        _progress("config", f"Using time limit: {time_limit}")
 
         repo_root = Path(__file__).resolve().parents[2]
         allocate_script = repo_root / "slurm" / "allocate_and_prepare.py"
@@ -70,16 +81,31 @@ class SlurmProvider(ClusterProvider):
             ).decode("ascii")
             cmd += ["--agents-md-b64", agents_md_b64]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        _progress("submitting", "Running Slurm allocate and prepare script")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
 
-        if result.returncode != 0:
+        output_lines = []
+        if proc.stdout is not None:
+            for raw in proc.stdout:
+                output_lines.append(raw)
+                line = raw.strip()
+                if line:
+                    _progress("slurm_setup", line)
+
+        exit_code = proc.wait()
+        output = "".join(output_lines)
+
+        if exit_code != 0:
             raise RuntimeError(
-                f"Swarm launch failed (exit {result.returncode}).\n"
-                f"STDOUT:\n{result.stdout}\n"
-                f"STDERR:\n{result.stderr}"
+                f"Swarm launch failed (exit {exit_code}).\n"
+                f"OUTPUT:\n{output}"
             )
-
-        output = result.stdout + result.stderr
 
         match = re.search(r"JOB_ID=(\d+)", output)
         if not match:
@@ -88,9 +114,11 @@ class SlurmProvider(ClusterProvider):
         if not match:
             raise RuntimeError(f"Unable to parse Slurm JOB_ID. Output:\n{output}")
 
+        _progress("ready", f"Slurm job is ready: {match.group(1)}")
+
         return match.group(1)
 
-    def terminate(self, job_id: str) -> None:
+    def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
         login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:
             raise RuntimeError("SSH login_alias not configured")

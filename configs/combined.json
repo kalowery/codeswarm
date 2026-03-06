@@ -1,19 +1,19 @@
 {
   "ssh": {
-    "login_alias": "your-login-alias"
+    "login_alias": "klowery"
   },
   "cluster": {
-    "workspace_root": "/path/to/shared/workspace",
+    "workspace_root": "/workspace",
     "cluster_subdir": "codeswarm",
     "aws": {
       "region": "us-east-1",
-      "ami_id": "ami-xxxxxxxx",
-      "subnet_id": "subnet-xxxxxxxx",
-      "security_group_id": "sg-xxxxxxxx",
+      "ami_id": "ami-0b6c6ebed2801a5cb",
+      "subnet_id": "subnet-791a0352",
+      "security_group_id": "sg-07eb6ee5a1a1c47af",
       "key_name": "codeswarm-keypair",
       "ssh_user": "ubuntu",
-      "ssh_private_key_path": "~/.ssh/codeswarm.pem",
-      "instance_type": "c7i.4xlarge",
+      "ssh_private_key_path": "~/.ssh/codeswarm-keypair.pem",
+      "instance_type": "t2.2xlarge",
       "workers_per_node": 2,
       "ebs_volume_size_gb": 250,
       "delete_ebs_on_shutdown": false
@@ -23,7 +23,12 @@
       "time_limit": "00:20:00",
       "account": null,
       "qos": null
-    }
+    },
+  "local": {
+    "workspace_root": "runs",
+    "archive_root": "/tmp/archives"
+  }
+
   },
   "router": {
     "inject_timeout_seconds": 60

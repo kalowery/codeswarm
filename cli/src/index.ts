@@ -2,7 +2,7 @@
 
 import { Command } from "commander";
 import { TcpTransport } from "./router/transport/TcpTransport.js";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { RouterClient } from "./router/RouterClient.js";
 import { EventFormatter } from "./formatter/EventFormatter.js";
 import path from "path";
@@ -11,6 +11,44 @@ import net from "net";
 import { runDoctor } from "./commands/doctor.js";
 
 const program = new Command();
+
+function isCompatiblePython(command: string): boolean {
+  try {
+    const probe = spawnSync(
+      command,
+      ["-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+      { encoding: "utf-8" }
+    );
+
+    if (probe.status !== 0) return false;
+    const version = String(probe.stdout || "").trim();
+    const [majorRaw, minorRaw] = version.split(".");
+    const major = Number(majorRaw);
+    const minor = Number(minorRaw);
+    return Number.isFinite(major) && Number.isFinite(minor) && (major > 3 || (major === 3 && minor >= 10));
+  } catch {
+    return false;
+  }
+}
+
+function resolvePythonCommand(): string {
+  const override = process.env.CODESWARM_PYTHON;
+  if (override && isCompatiblePython(override)) {
+    return override;
+  }
+
+  const candidates = ["python3.12", "python3.11", "python3.10", "python3"];
+  for (const cmd of candidates) {
+    if (isCompatiblePython(cmd)) {
+      return cmd;
+    }
+  }
+
+  throw new Error(
+    "No compatible Python found (requires 3.10+). " +
+    "Install Python 3.10+ or set CODESWARM_PYTHON to a compatible interpreter."
+  );
+}
 
 program
   .name("codeswarm")
@@ -96,6 +134,7 @@ program
   .description("Launch new swarm")
   .requiredOption("--nodes <number>", "Number of nodes")
   .requiredOption("--prompt <text>", "System prompt")
+  .option("--provider <providerId>", "Launch provider preset id")
   .option("--config <path>", "Path to router config")
   .option("--router <address>", "Router address override (host:port)")
   .option("--debug", "Print raw JSON messages from router", false)
@@ -111,6 +150,16 @@ program
       if (!requestId || e?.data?.request_id !== requestId) return;
 
       switch (e.event) {
+        case "swarm_launch_progress": {
+          const stage = e.data?.stage ? String(e.data.stage) : "progress";
+          const message = e.data?.message ? String(e.data.message) : "";
+          if (message) {
+            console.log(`[launch:${stage}] ${message}`);
+          } else {
+            console.log(`[launch:${stage}]`);
+          }
+          break;
+        }
         case "swarm_launched":
           console.log("Swarm launched successfully:\n");
           Object.entries(e.data).forEach(([k, v]) => {
@@ -130,7 +179,8 @@ program
 
     requestId = client.launch(
       parseInt(cmd.nodes),
-      cmd.prompt
+      cmd.prompt,
+      cmd.provider
     );
   });
 
@@ -280,7 +330,7 @@ program
 
 async function createTransport(opts: any) {
   const __dirname = path.dirname(new URL(import.meta.url).pathname);
-  const routerPath = path.resolve(__dirname, "../../router/router.py");
+  const pythonCmd = resolvePythonCommand();
 
   let host = "127.0.0.1";
   let port = 8765;
@@ -339,7 +389,7 @@ async function createTransport(opts: any) {
       const repoRoot = path.resolve(__dirname, "../../");
 
       const routerProcess = spawn(
-        "python3",
+        pythonCmd,
         ["-u", "-m", "router.router", "--config", opts.config, "--daemon"],
         {
           stdio: "ignore",
@@ -502,6 +552,7 @@ async function runWebStack(opts: any) {
   const configPath = opts.config
     ? path.resolve(process.cwd(), opts.config)
     : path.join(repoRoot, "configs", "hpcfund.json");
+  const pythonCmd = resolvePythonCommand();
 
   console.log("[web] Starting Codeswarm web stack...\n");
 
@@ -531,7 +582,7 @@ async function runWebStack(opts: any) {
   // Router (daemon + debug mode)
   spawnWithPrefix(
     "router",
-    "python3",
+    pythonCmd,
     ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
     repoRoot
   );

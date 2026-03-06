@@ -4,7 +4,7 @@ import shutil
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 
 from ..cluster.base import ClusterProvider
@@ -33,7 +33,10 @@ class LocalProvider(ClusterProvider):
         nodes: int,
         agents_md_content: str | None = None,
         launch_params: dict | None = None,
+        progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
+        if callable(progress_cb):
+            progress_cb("starting", f"Launching {nodes} local worker(s)")
         job_id = f"local_{uuid.uuid4().hex[:8]}"
         procs: List[subprocess.Popen] = []
 
@@ -67,9 +70,11 @@ class LocalProvider(ClusterProvider):
             procs.append(p)
 
         self.jobs[job_id] = procs
+        if callable(progress_cb):
+            progress_cb("ready", f"Local swarm ready: {job_id}")
         return job_id
 
-    def terminate(self, job_id: str) -> None:
+    def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
         procs = self.jobs.get(job_id, [])
         for p in procs:
             try:

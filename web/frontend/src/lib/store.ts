@@ -90,10 +90,20 @@ export interface InterSwarmQueueItem {
   created_at?: number
 }
 
+export interface PendingLaunchRecord {
+  alias: string
+  stage?: string
+  message?: string
+  provider?: string
+  provider_id?: string
+  created_at: number
+  updated_at: number
+}
+
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
   interSwarmQueue: InterSwarmQueueItem[]
-  pendingLaunches: Record<string, { alias: string }>
+  pendingLaunches: Record<string, PendingLaunchRecord>
   selectedSwarm?: string
   pendingPrompt?: string
   launchError: string | null
@@ -103,6 +113,7 @@ interface SwarmStore {
   setLaunchError: (message: string) => void
   clearLaunchError: () => void
   addPendingLaunch: (request_id: string, alias: string) => void
+  updatePendingLaunch: (request_id: string, update: Partial<PendingLaunchRecord>) => void
   removePendingLaunch: (request_id: string) => void
   setSwarms: (swarms: any[]) => void
   setInterSwarmQueue: (items: InterSwarmQueueItem[]) => void
@@ -207,11 +218,48 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
     clearLaunchError: () => set({ launchError: null }),
     addPendingLaunch: (request_id: string, alias: string) =>
       set((state) => ({
+        // Launch progress events can arrive before this local placeholder exists;
+        // preserve any existing progress metadata when creating/updating the ghost card.
         pendingLaunches: {
           ...state.pendingLaunches,
-          [request_id]: { alias }
+          [request_id]: {
+            alias,
+            stage: state.pendingLaunches[request_id]?.stage,
+            message: state.pendingLaunches[request_id]?.message,
+            provider: state.pendingLaunches[request_id]?.provider,
+            provider_id: state.pendingLaunches[request_id]?.provider_id,
+            created_at: state.pendingLaunches[request_id]?.created_at ?? Date.now(),
+            updated_at: Date.now()
+          }
         }
       })),
+    updatePendingLaunch: (request_id: string, update: Partial<PendingLaunchRecord>) =>
+      set((state) => {
+        const existing = state.pendingLaunches[request_id]
+        if (!existing) {
+          return {
+            pendingLaunches: {
+              ...state.pendingLaunches,
+              [request_id]: {
+                alias: 'Launching swarm',
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                ...update
+              }
+            }
+          }
+        }
+        return {
+          pendingLaunches: {
+            ...state.pendingLaunches,
+            [request_id]: {
+              ...existing,
+              ...update,
+              updated_at: Date.now()
+            }
+          }
+        }
+      }),
     removePendingLaunch: (request_id: string) =>
       set((state) => {
         const copy = { ...state.pendingLaunches }
@@ -310,6 +358,18 @@ export const useSwarmStore = create<SwarmStore>((set, get) => {
         }
         // Clear any previous launch error
         get().clearLaunchError()
+      }
+
+      if (type === 'swarm_launch_progress') {
+        const request_id = typeof payload?.request_id === 'string' ? payload.request_id : ''
+        if (request_id) {
+          get().updatePendingLaunch(request_id, {
+            stage: typeof payload?.stage === 'string' ? payload.stage : undefined,
+            message: typeof payload?.message === 'string' ? payload.message : undefined,
+            provider: typeof payload?.provider === 'string' ? payload.provider : undefined,
+            provider_id: typeof payload?.provider_id === 'string' ? payload.provider_id : undefined
+          })
+        }
       }
 
       if (type === 'command_rejected') {
