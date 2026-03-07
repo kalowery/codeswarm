@@ -76,6 +76,9 @@ class AwsProvider(ClusterProvider):
         cmd = ["aws", "--region", self.region] + args
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
+            auth_error = self._aws_auth_error(result.stdout, result.stderr)
+            if auth_error:
+                raise RuntimeError(auth_error)
             raise RuntimeError(
                 f"AWS command failed: {' '.join(cmd)}\n"
                 f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
@@ -87,6 +90,30 @@ class AwsProvider(ClusterProvider):
             except json.JSONDecodeError as e:
                 raise RuntimeError(f"Failed to parse AWS JSON output: {e}\nOutput: {out}") from e
         return result
+
+    @staticmethod
+    def _aws_auth_error(stdout: str, stderr: str) -> str | None:
+        combined = f"{stdout}\n{stderr}".lower()
+        markers = [
+            "session has expired",
+            "expiredtoken",
+            "invalidclienttokenid",
+            "unable to locate credentials",
+            "could not be found",
+            "no credential providers",
+            "the security token included in the request is invalid",
+        ]
+        if any(marker in combined for marker in markers):
+            return (
+                "AWS authentication on this launch host is invalid or expired. "
+                "Run `aws login` (or refresh your AWS credentials/profile), confirm with "
+                "`aws sts get-caller-identity`, then retry launch."
+            )
+        return None
+
+    def _verify_aws_auth(self) -> None:
+        # Fail fast before provisioning resources if local AWS credentials are stale.
+        self._aws(["sts", "get-caller-identity"], expect_json=True)
 
     def _ssh_cmd(self, host: str, remote_cmd: str) -> list[str]:
         if not self.ssh_private_key_path:
@@ -605,6 +632,8 @@ done
             raise RuntimeError("Swarm launch requires at least one agent")
 
         _progress("starting", f"Preparing AWS launch for {total_workers} worker(s)")
+        _progress("auth", "Validating AWS CLI authentication on launch host")
+        self._verify_aws_auth()
 
         instance_type = str(launch_params.get("instance_type") or self.aws_cfg.get("instance_type") or "").strip()
         if not instance_type:

@@ -61,6 +61,8 @@ The launch host is the machine running Codeswarm router/provider code.
 - `ssh` and `rsync`
 - Python version compatible with Codeswarm runtime
 
+Codeswarm launch now performs an AWS auth preflight (`sts get-caller-identity`) and will fail fast if your session is expired.
+
 ### Required environment
 
 - `OPENAI_API_KEY` must be set on the launch host
@@ -79,6 +81,8 @@ export OPENAI_API_KEY=sk-...
 aws sts get-caller-identity
 ls -l ~/.ssh/codeswarm.pem
 ```
+
+If launch fails with an auth/expired-session message, rerun `aws login`, verify `aws sts get-caller-identity`, then retry.
 
 ## 3. AWS Config Fields
 
@@ -204,4 +208,3 @@ During terminate:
 
 1. Terminate all instances for the swarm job
 2. Conditionally delete EBS (based on `delete_ebs_on_shutdown`)
-
