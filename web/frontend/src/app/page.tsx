@@ -66,6 +66,25 @@ function latestSessionUsage(turns: NodeTurn[]): TokenUsage | undefined {
   return best
 }
 
+function buildTurnsSignature(turns: NodeTurn[]) {
+  if (!turns || turns.length === 0) return '0'
+  const last = turns[turns.length - 1]
+  const deltasLen = Array.isArray(last.deltas)
+    ? last.deltas.reduce((sum, part) => sum + String(part ?? '').length, 0)
+    : 0
+  const execStdoutLen = last.execution?.stdout ? String(last.execution.stdout).length : 0
+  return [
+    turns.length,
+    last.phase ?? '',
+    deltasLen,
+    (last.reasoning ?? '').length,
+    (last.error ?? '').length,
+    last.usage?.total_tokens ?? '',
+    execStdoutLen,
+    !!last.approval
+  ].join(':')
+}
+
 function formatUsd(value: number) {
   return value.toLocaleString(undefined, {
     style: 'currency',
@@ -179,13 +198,40 @@ export default function Home() {
   const [viewModeBySwarm, setViewModeBySwarm] = useState<Record<string, SwarmViewMode>>({})
   const nodeScrollRef = useRef<HTMLDivElement | null>(null)
   const tabsPanelRef = useRef<HTMLDivElement | null>(null)
+  const tabsTurnsViewportRef = useRef<HTMLDivElement | null>(null)
   const scrolledApprovalKeyRef = useRef<string>('')
+  const turnsSignatureRef = useRef<string>('')
+  const pendingUserScrollAcknowledgeRef = useRef(false)
+  const programmaticScrollUntilRef = useRef(0)
   const gridViewportRef = useRef<HTMLDivElement | null>(null)
   const gridLayoutRef = useRef<GridLayout>({ cols: 1, scale: 1 })
   const [canScrollLeft, setCanScrollLeft] = useState(false)
   const [canScrollRight, setCanScrollRight] = useState(false)
+  const [showUnseenContentBelow, setShowUnseenContentBelow] = useState(false)
   const [gridLayout, setGridLayout] = useState<GridLayout>({ cols: 1, scale: 1 })
   const activeViewMode: SwarmViewMode = active ? (viewModeBySwarm[active.swarm_id] ?? 'tabs') : 'tabs'
+  const activeNodeId = active ? (activeNodeBySwarm[active.swarm_id] ?? 0) : 0
+  const activeNode = active ? active.nodes[activeNodeId] : undefined
+  const activeTurnsSignature = buildTurnsSignature(activeNode?.turns ?? [])
+
+  function hasContentBelowViewport(el: HTMLDivElement) {
+    return el.scrollTop + el.clientHeight < el.scrollHeight - 6
+  }
+
+  function handleTabsTurnsScroll() {
+    const el = tabsTurnsViewportRef.current
+    if (!el) return
+    const hasBelow = hasContentBelowViewport(el)
+    const now = Date.now()
+    if (pendingUserScrollAcknowledgeRef.current && now > programmaticScrollUntilRef.current) {
+      pendingUserScrollAcknowledgeRef.current = false
+      setShowUnseenContentBelow(false)
+      return
+    }
+    if (!hasBelow) {
+      setShowUnseenContentBelow(false)
+    }
+  }
 
   function updateScrollButtons() {
     const el = nodeScrollRef.current
@@ -363,19 +409,45 @@ export default function Home() {
     const approvalKey = `${active.swarm_id}:${activeNodeId}:${pendingTurn.approval?.call_id ?? pendingTurn.injection_id}`
     if (scrolledApprovalKeyRef.current === approvalKey) return
 
-    const panel = tabsPanelRef.current
+    const panel = tabsTurnsViewportRef.current
     if (!panel) return
 
     const raf = requestAnimationFrame(() => {
       const el = panel.querySelector('[data-awaiting-approval="true"]') as HTMLElement | null
       if (el) {
         scrolledApprovalKeyRef.current = approvalKey
+        programmaticScrollUntilRef.current = Date.now() + 1500
         el.scrollIntoView({ block: 'center', behavior: 'smooth' })
       }
     })
 
     return () => cancelAnimationFrame(raf)
   }, [active, activeViewMode, activeNodeBySwarm])
+
+  useEffect(() => {
+    if (!active || activeViewMode !== 'tabs') {
+      setShowUnseenContentBelow(false)
+      pendingUserScrollAcknowledgeRef.current = false
+      turnsSignatureRef.current = ''
+      return
+    }
+
+    if (turnsSignatureRef.current === activeTurnsSignature) return
+    turnsSignatureRef.current = activeTurnsSignature
+
+    const raf = requestAnimationFrame(() => {
+      const el = tabsTurnsViewportRef.current
+      if (!el) return
+      if (hasContentBelowViewport(el)) {
+        pendingUserScrollAcknowledgeRef.current = true
+        setShowUnseenContentBelow(true)
+      } else {
+        setShowUnseenContentBelow(false)
+      }
+    })
+
+    return () => cancelAnimationFrame(raf)
+  }, [active?.swarm_id, activeViewMode, activeNodeId, activeTurnsSignature])
 
   async function sendApproval(
     job_id: string,
@@ -909,7 +981,7 @@ export default function Home() {
 
               if (activeViewMode === 'tabs') {
                 return (
-                  <div ref={tabsPanelRef} className="bg-slate-900 border border-slate-800 rounded p-4 h-[400px] overflow-y-auto text-sm space-y-4">
+                  <div ref={tabsPanelRef} className="relative bg-slate-900 border border-slate-800 rounded p-4 h-[400px] text-sm flex flex-col min-h-0">
                     <div className="mb-3 border-b border-slate-800 pb-3">
                       <div className="flex items-center gap-2">
                         {canScrollLeft && (
@@ -974,7 +1046,27 @@ export default function Home() {
                       </div>
                     </div>
 
-                    {renderTurns(activeNode.turns, active.job_id, active.known_exec_policies)}
+                    <div
+                      ref={tabsTurnsViewportRef}
+                      onScroll={handleTabsTurnsScroll}
+                      className="relative flex-1 min-h-0 overflow-y-auto pr-1"
+                    >
+                      {renderTurns(activeNode.turns, active.job_id, active.known_exec_policies)}
+                    </div>
+                    {showUnseenContentBelow && (
+                      <button
+                        className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-indigo-500 bg-slate-900/95 px-3 py-1 text-xs text-indigo-300 shadow hover:bg-slate-800"
+                        onClick={() => {
+                          const el = tabsTurnsViewportRef.current
+                          pendingUserScrollAcknowledgeRef.current = false
+                          setShowUnseenContentBelow(false)
+                          if (!el) return
+                          el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+                        }}
+                      >
+                        New content below
+                      </button>
+                    )}
                   </div>
                 )
               }
