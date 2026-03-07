@@ -280,8 +280,8 @@ export default function LaunchModal({ onClose }: Props) {
   }, [showProviderTab, activeTab])
 
   return (
-    <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
-      <div className="bg-slate-900 border border-slate-800 rounded-lg w-[560px] h-[680px] max-h-[82vh] p-6 flex flex-col">
+    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center">
+      <div className="bg-slate-900 border border-slate-800 rounded-lg w-[560px] h-[680px] max-h-[82vh] p-6 flex flex-col shadow-2xl">
         <h2 className="text-lg font-semibold mb-4">Launch Swarm</h2>
 
         <div className="mb-4">

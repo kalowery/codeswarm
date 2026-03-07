@@ -1,0 +1,47 @@
+from abc import ABC, abstractmethod
+from typing import Callable, Dict, Optional
+import subprocess
+
+
+class ClusterProvider(ABC):
+
+    @abstractmethod
+    def launch(
+        self,
+        nodes: int,
+        agents_md_content: str | None = None,
+        launch_params: dict | None = None,
+        progress_cb: Callable[[str, str], None] | None = None,
+    ) -> str:
+        """Launch swarm and return backend job_id."""
+        pass
+
+    @abstractmethod
+    def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
+        pass
+
+    @abstractmethod
+    def get_job_state(self, job_id: str) -> Optional[str]:
+        """Return backend state string or None if not found."""
+        pass
+
+    @abstractmethod
+    def list_active_jobs(self) -> Dict[str, str]:
+        """Return mapping of job_id -> state."""
+        pass
+
+    @abstractmethod
+    def start_follower(self) -> subprocess.Popen | None:
+        """Return a process streaming worker events via stdout."""
+        pass
+
+    @abstractmethod
+    def inject(
+        self,
+        job_id: str,
+        node_id: int,
+        content: str,
+        injection_id: str
+    ) -> None:
+        """Deliver injection to worker."""
+        pass

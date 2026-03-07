@@ -15,7 +15,7 @@ from collections import defaultdict, deque
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
-from .cluster.factory import build_providers, get_provider_specs
+from .providers.factory import build_providers, get_provider_specs
 
 
 # ================================
@@ -35,6 +35,7 @@ PROVIDERS = {}
 PROVIDER_SPECS = []
 NODE_OUTSTANDING = defaultdict(int)
 NODE_THREAD_ACTIVE = defaultdict(bool)
+FINAL_ANSWER_SEEN = set()
 INTER_SWARM_QUEUE = defaultdict(deque)
 SCHEDULER_LOCK = threading.Lock()
 TERMINATION_IN_PROGRESS = set()
@@ -340,6 +341,27 @@ def _is_swarm_quiescent(swarm_id):
         return all(_is_node_quiescent(swarm_id, node_id) for node_id in range(node_count))
 
 
+def _is_swarm_quiescent_for_termination(swarm_id):
+    """
+    Termination quiescence is keyed on real queued/in-flight work (outstanding).
+    If a node is marked active but has no outstanding work, treat it as stale and
+    clear the active flag so shutdown is not delayed needlessly.
+    """
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return True
+    node_count = int(swarm.get("node_count") or 0)
+    with SCHEDULER_LOCK:
+        for node_id in range(node_count):
+            key = _node_key(swarm_id, node_id)
+            outstanding = int(NODE_OUTSTANDING.get(key, 0))
+            if outstanding > 0:
+                return False
+            if bool(NODE_THREAD_ACTIVE.get(key, False)):
+                NODE_THREAD_ACTIVE[key] = False
+        return True
+
+
 def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
     swarm = SWARMS.get(str(swarm_id))
     if not swarm:
@@ -356,6 +378,12 @@ def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
             key = _node_key(swarm_id, node_id)
             NODE_THREAD_ACTIVE.pop(key, None)
             NODE_OUTSTANDING.pop(key, None)
+        stale_final_keys = [
+            k for k in FINAL_ANSWER_SEEN
+            if isinstance(k, tuple) and len(k) == 3 and str(k[0]) == str(swarm_id)
+        ]
+        for key in stale_final_keys:
+            FINAL_ANSWER_SEEN.discard(key)
 
     # Provider-specific archival (best-effort)
     try:
@@ -379,6 +407,12 @@ def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
             "reason": "target swarm terminated",
         })
     _emit_queue_updated()
+
+    # User-terminated swarms should be removed from persisted active state
+    # immediately (not retained for TTL).
+    SWARMS.pop(str(swarm_id), None)
+    if job_id:
+        JOB_TO_SWARM.pop(str(job_id), None)
     save_state()
 
 
@@ -414,10 +448,46 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id):
     if not isinstance(poll_s, (int, float)) or poll_s <= 0:
         poll_s = GRACEFUL_TERMINATE_POLL_SECONDS
 
+    # If no nodes are currently active, stale outstanding counters should not
+    # block shutdown. Clear them once at terminate start.
+    node_count = int(swarm.get("node_count") or 0)
+    with SCHEDULER_LOCK:
+        all_idle_now = all(
+            not bool(NODE_THREAD_ACTIVE.get(_node_key(swarm_id, node_id), False))
+            for node_id in range(node_count)
+        )
+        if all_idle_now:
+            for node_id in range(node_count):
+                NODE_OUTSTANDING[_node_key(swarm_id, node_id)] = 0
+
+    provider_backend = str(swarm.get("provider") or "").strip().lower()
+    if not provider_backend:
+        provider_backend = str(swarm.get("backend") or "").strip().lower()
+    if provider_backend and provider_backend not in PROVIDERS:
+        # Some persisted states may store provider_id here; resolve to backend.
+        spec = next(
+            (item for item in PROVIDER_SPECS if str(item.get("id", "")).strip().lower() == provider_backend),
+            None,
+        )
+        if isinstance(spec, dict):
+            provider_backend = str(spec.get("backend") or provider_backend).strip().lower()
+
+    # Local swarms should not block for the full global graceful timeout when
+    # no tasks are actually in flight. Give local a shorter grace window.
+    if provider_backend == "local":
+        local_timeout_s = (
+            config.get("router", {}).get("local_graceful_terminate_timeout_seconds")
+            if isinstance(config.get("router"), dict)
+            else None
+        )
+        if not isinstance(local_timeout_s, (int, float)) or local_timeout_s <= 0:
+            local_timeout_s = 20
+        timeout_s = min(float(timeout_s), float(local_timeout_s))
+
     deadline = time.time() + float(timeout_s)
     timed_out = False
     while time.time() < deadline:
-        if _is_swarm_quiescent(swarm_id):
+        if _is_swarm_quiescent_for_termination(swarm_id):
             break
         time.sleep(float(poll_s))
     else:
@@ -806,9 +876,7 @@ def perform_injection(config, provider, request_id, swarm_id, job_id, node_id, c
 # ================================
 
 def translate_event(event):
-    if event.get("type") != "codex_rpc":
-        return None
-
+    event_type = event.get("type")
     job_id = str(event.get("job_id"))
     node_id = event.get("node_id")
     injection_id = event.get("injection_id")
@@ -816,6 +884,20 @@ def translate_event(event):
 
     # Ignore events from jobs not tracked by this router instance
     if not swarm_id:
+        return None
+
+    if event_type == "complete":
+        # Worker completion can arrive without a final idle/task_complete rpc.
+        # Treat it as idle so graceful termination does not wait on stale state.
+        return ("thread_status", {
+            "swarm_id": swarm_id,
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+            "status": {"type": "idle"},
+        })
+
+    if event_type != "codex_rpc":
         return None
 
     payload = event.get("payload", {})
@@ -839,8 +921,13 @@ def translate_event(event):
         return ("assistant_delta", {**base, "content": delta})
 
     if method == "codex/event/agent_message":
-        msg = payload["params"]["msg"].get("message")
-        return ("assistant", {**base, "content": msg})
+        msg_obj = payload.get("params", {}).get("msg", {})
+        msg = msg_obj.get("message")
+        return ("assistant", {
+            **base,
+            "content": msg,
+            "final_answer": str(msg_obj.get("phase") or "").lower() == "final_answer",
+        })
 
     if method in ("codex/event/item_completed", "item/completed"):
         params = payload.get("params", {})
@@ -872,7 +959,11 @@ def translate_event(event):
                             content = "".join(chunks)
 
                 if isinstance(content, str) and content:
-                    return ("assistant", {**base, "content": content})
+                    return ("assistant", {
+                        **base,
+                        "content": content,
+                        "final_answer": str(item.get("phase") or "").lower() == "final_answer",
+                    })
                 return ("turn_complete", base)
 
     if method == "codex/event/token_count":
@@ -1315,6 +1406,23 @@ def run_daemon(config, providers):
                         # Some traces emit task_complete without a matching turn_complete;
                         # reconcile outstanding count to avoid idle-queue starvation.
                         _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
+                        _dispatch_inter_swarm_queue(config)
+                    if event_name == "assistant" and bool(data.get("final_answer")):
+                        final_key = (
+                            str(data.get("swarm_id")),
+                            int(data.get("node_id") if isinstance(data.get("node_id"), int) else -1),
+                            str(data.get("injection_id") or ""),
+                        )
+                        should_reconcile = False
+                        with SCHEDULER_LOCK:
+                            if final_key not in FINAL_ANSWER_SEEN:
+                                FINAL_ANSWER_SEEN.add(final_key)
+                                should_reconcile = True
+                                node_id = data.get("node_id")
+                                if isinstance(node_id, int):
+                                    NODE_THREAD_ACTIVE[_node_key(data.get("swarm_id"), node_id)] = False
+                        if should_reconcile:
+                            _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
                         _dispatch_inter_swarm_queue(config)
                     emit_event(event_name, data)
 
@@ -1857,9 +1965,14 @@ def run_daemon(config, providers):
 
                 with SCHEDULER_LOCK:
                     if str(swarm_id) in TERMINATION_IN_PROGRESS:
-                        emit_event("command_rejected", {
+                        # Treat repeated terminate requests as idempotent while
+                        # termination is already underway.
+                        emit_event("swarm_status", {
                             "request_id": request_id,
-                            "reason": "termination already in progress"
+                            "swarm_id": swarm_id,
+                            "job_id": swarm.get("job_id"),
+                            "node_count": swarm.get("node_count"),
+                            "status": "terminating"
                         })
                         continue
                     TERMINATION_IN_PROGRESS.add(str(swarm_id))

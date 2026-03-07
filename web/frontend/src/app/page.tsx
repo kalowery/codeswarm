@@ -117,6 +117,7 @@ export default function Home() {
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
   const swarmList = Object.values(swarms)
   const active = selected ? swarms[selected] : undefined
+  const activeIsTerminating = (active?.status ?? '').toLowerCase() === 'terminating'
 
   function getNodeVisualState(swarmId: string, nodeId: number) {
     const swarm = swarms[swarmId]
@@ -742,6 +743,7 @@ export default function Home() {
               const swarmSessionCost = Object.values(swarm.nodes).reduce((sum, node) => {
                 return sum + estimateUsageUsd(latestSessionUsage(node.turns))
               }, 0)
+              const swarmIsTerminating = (swarm.status ?? '').toLowerCase() === 'terminating'
 
               return (
                 <div
@@ -761,6 +763,11 @@ export default function Home() {
                   )}
                   {!swarmNeedsAttention(swarm.swarm_id) && !swarmHasWorking(swarm.swarm_id) && swarmIsReady(swarm.swarm_id) && (
                     <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-400" />
+                  )}
+                  {swarmIsTerminating && (
+                    <span className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] border border-amber-500/40 uppercase tracking-wide animate-pulse">
+                      Shutting down
+                    </span>
                   )}
                   <div className="font-medium">{swarm.alias}</div>
                   <div className="text-sm text-slate-400">
@@ -841,11 +848,17 @@ export default function Home() {
                 <div className="text-sm text-slate-400">
                   Status: {active.status ?? 'unknown'} · Slurm: {active.slurm_state}
                 </div>
+                {activeIsTerminating && (
+                  <div className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs">
+                    <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                    Swarm shutdown in progress
+                  </div>
+                )}
               </div>
               <button
-                disabled={isTerminating}
+                disabled={isTerminating || activeIsTerminating}
                 onClick={async () => {
-                  if (isTerminating) return
+                  if (isTerminating || activeIsTerminating) return
                   if (!confirm(`Terminate ${active.alias}? This cannot be undone.`)) return
                   try {
                     setIsTerminating(true)
@@ -856,12 +869,12 @@ export default function Home() {
                   }
                 }}
                 className={`px-3 py-1 rounded text-sm ${
-                  isTerminating
+                  (isTerminating || activeIsTerminating)
                     ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
                     : 'bg-rose-600 hover:bg-rose-500'
                 }`}
               >
-                {isTerminating ? 'Terminating…' : 'Terminate'}
+                {(isTerminating || activeIsTerminating) ? 'Terminating…' : 'Terminate'}
               </button>
             </div>
 

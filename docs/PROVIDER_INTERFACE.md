@@ -4,12 +4,13 @@ Codeswarm router is provider-agnostic and delegates backend-specific behavior to
 
 Current implementations:
 
-- `router/providers/local_provider.py` (`LocalProvider`)
-- `router/cluster/slurm.py` (`SlurmProvider`)
+- `router/providers/local.py` (`LocalProvider`)
+- `router/providers/slurm.py` (`SlurmProvider`)
+- `router/providers/aws.py` (`AwsProvider`)
 
 ## 1. Core provider contract
 
-`ClusterProvider` (`router/cluster/base.py`) defines:
+`ClusterProvider` (`router/providers/base.py`) defines:
 
 ```python
 class ClusterProvider(ABC):
@@ -26,7 +27,7 @@ In addition, current router behavior expects providers to expose:
 - `send_control(job_id, node_id, message)` for approval/control payload delivery
 - `archive(job_id, swarm_id)` for best-effort post-termination archival
 
-Both local and slurm providers currently implement these methods.
+Local, slurm, and aws providers implement these methods.
 
 ## 2. Responsibilities
 
@@ -106,4 +107,3 @@ Workers should not depend on Slurm-specific env vars for control-plane behavior.
 ## 5. Design guarantees
 
 Router remains free of backend-specific mechanics (SSH/Slurm details live in providers), enabling additional providers without router command-protocol changes.
-
