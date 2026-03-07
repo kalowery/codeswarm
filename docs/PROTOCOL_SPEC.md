@@ -142,7 +142,7 @@ Data:
       "job_id": "...",
       "node_count": 1,
       "system_prompt": "...",
-      "status": "running|terminated",
+      "status": "running|terminating|terminated",
       "provider": "local|slurm",
       "provider_id": "provider preset id",
       "terminated_at": 0
@@ -167,7 +167,7 @@ Data (success):
 - `swarm_id`
 - `job_id`
 - `node_count`
-- `status` (`running` or `terminated`)
+- `status` (`running`, `terminating`, or `terminated`)
 
 Data (error path):
 
@@ -239,6 +239,11 @@ Data:
 
 - `request_id`
 - `swarm_id`
+
+Notes:
+
+- Repeat terminate requests while termination is already in progress are treated idempotently; router emits `swarm_status` (`terminating`) again.
+- `swarm_removed` is a separate cleanup/pruning event and is not the primary success signal for terminate.
 
 ### 3.7 `enqueue_inject`
 

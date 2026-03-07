@@ -1336,6 +1336,19 @@ def run_daemon(config, providers):
     _dispatch_inter_swarm_queue(config)
 
     while True:
+        # Remove exited follower processes so EOF pipes do not cause a tight
+        # select loop with immediate wakeups.
+        for backend, proc in list(follower_procs.items()):
+            try:
+                exited = proc.poll() is not None
+            except Exception:
+                exited = True
+            if exited:
+                follower_procs.pop(backend, None)
+                stdout_buffers.pop(backend, None)
+                if DEBUG:
+                    print(f"[router DEBUG] follower exited: {backend}", flush=True)
+
         streams = []
         fd_to_stream = {}
         for backend, proc in follower_procs.items():
@@ -1354,6 +1367,7 @@ def run_daemon(config, providers):
             time.sleep(0.2)
             ready = []
 
+        dead_backends = set()
         for stream in ready:
             stream_type, backend, raw_stream = fd_to_stream.get(stream.fileno(), (None, None, None))
             if stream_type is None:
@@ -1361,6 +1375,7 @@ def run_daemon(config, providers):
 
             chunk = os.read(raw_stream.fileno(), 4096)
             if not chunk:
+                dead_backends.add(backend)
                 continue
 
             if stream_type == "stderr":
@@ -1425,6 +1440,12 @@ def run_daemon(config, providers):
                             _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
                         _dispatch_inter_swarm_queue(config)
                     emit_event(event_name, data)
+
+        for backend in dead_backends:
+            follower_procs.pop(backend, None)
+            stdout_buffers.pop(backend, None)
+            if DEBUG:
+                print(f"[router DEBUG] follower stream EOF: {backend}", flush=True)
 
         # Process queued stdin commands
 # Process queued stdin commands

@@ -149,7 +149,7 @@ Use the Terminate action in UI.
 
 Router sends `swarm_terminate`, marks swarm status as `terminating`, waits for
 agents to go idle (or timeout), then terminates backend resources and emits
-`swarm_removed`.
+`swarm_terminated`.
 
 ## 10. Attention and navigation
 
@@ -161,7 +161,7 @@ agents to go idle (or timeout), then terminates backend resources and emits
 - Router persists swarm registry in `router_state.json`.
 - Router persists inter-swarm queue state in `router_state.json`.
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
-- Router marks terminated swarms, then prunes them by TTL/cap (`swarm_removed`).
+- User-terminated swarms are removed from router active state immediately after `swarm_terminated`.
 - UI shows per-agent and per-swarm estimated spend from cumulative token usage.
 - Optional frontend pricing env vars (USD per 1M tokens):
   - `NEXT_PUBLIC_INPUT_TOKENS_USD_PER_1M`
@@ -190,4 +190,12 @@ Ensure router is running on `127.0.0.1:8765` and backend can connect.
 
 ```bash
 npm --workspace=web/frontend run build
+```
+
+### Missing Node runtime modules (e.g. `commander`)
+
+If `codeswarm` CLI reports missing packages after git operations, restore workspace deps:
+
+```bash
+npm install --workspaces
 ```

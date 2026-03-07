@@ -4,6 +4,7 @@ Codeswarm is a provider-agnostic execution system for orchestrating multi-node C
 
 - Local processes (single machine)
 - Slurm clusters (HPC)
+- AWS EC2 + shared EBS
 
 It provides a router control plane, a backend API/WebSocket bridge, and a Next.js frontend.
 
@@ -35,6 +36,11 @@ cd codeswarm
 ```
 
 Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, and verifies Codex CLI login.
+If runtime packages are missing after branch switches or large git updates, run:
+
+```bash
+npm install --workspaces
+```
 
 3. Use local config
 
@@ -49,6 +55,8 @@ Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, 
   }
 }
 ```
+
+Note: `configs/combined.json` is intentionally treated as a local operator file and is not tracked by git.
 
 4. Start the full web stack
 
@@ -98,8 +106,10 @@ flowchart TD
     RT --> PR[Provider Interface]
     PR -->|local| LP[LocalProvider]
     PR -->|slurm| SP[SlurmProvider]
+    PR -->|aws| AP[AwsProvider]
     LP --> WK[Workers]
     SP --> WK
+    AP --> WK
     WK --> MB[Mailbox JSONL]
     MB --> RT
 ```
@@ -118,6 +128,7 @@ Core principles:
 - Spawns worker subprocesses.
 - Uses mailbox under `<workspace_root>/mailbox` (default `runs/mailbox`).
 - Optional archive move on terminate via `cluster.archive_root`.
+- When archive is enabled, per-job workspace plus mailbox artifacts are archived together under one job directory.
 
 ### Slurm
 

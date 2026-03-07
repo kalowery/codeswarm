@@ -8,22 +8,26 @@ This document reflects the configuration keys currently used by router and provi
 {
   "cluster": { ... },
   "ssh": { ... },
+  "launch_providers": [ ... ],
   "router": { ... }
 }
 ```
 
-`ssh` is required for `slurm` backend and optional for `local` backend.
+`ssh` is required for `slurm` backend and optional for `local`/`aws` backend.
 
 ## `cluster`
 
 ### Required
 
-- `cluster.backend`: `"local"` or `"slurm"`
+- Legacy mode: `cluster.backend`
+- Multi-provider mode: `launch_providers` entries with `backend`
 
 ### Local backend (`cluster.backend = "local"`)
 
 - `cluster.workspace_root` (optional, default: `runs`)
 - `cluster.archive_root` (optional)
+- `cluster.local.workspace_root` (optional override)
+- `cluster.local.archive_root` (optional override)
 
 Example:
 
@@ -87,6 +91,16 @@ Required:
 - `cluster.aws.key_name`
 - `cluster.aws.ssh_private_key_path`
 
+### Launch provider presets (`launch_providers`)
+
+Optional but recommended for mixed environments. Each preset includes:
+
+- `id`: UI/provider id (string)
+- `label`: UI label (string)
+- `backend`: `local` | `slurm` | `aws`
+- `defaults` (optional): default provider params
+- `launch_fields` / `launch_panels` (optional): UI form metadata
+
 ## `ssh`
 
 ### `ssh.login_alias`
@@ -102,13 +116,16 @@ Other `ssh.*` keys may exist (for operator use), but current router/provider cod
 
 ## `router`
 
-`router` section is currently optional and not enforced by the active router code path.
+`router` section is optional. Current keys consumed by router include:
 
-`router.*` values may exist in configs for future use and are ignored unless consumed by newer code.
+- `inject_timeout_seconds`
+- `graceful_terminate_timeout_seconds`
+- `graceful_terminate_poll_seconds`
+- `local_graceful_terminate_timeout_seconds`
 
 ## Validation behavior
 
 Validation is performed by `common/config.py`:
 
 - missing required fields for selected backend raise runtime errors
-- unsupported `cluster.backend` raises runtime error
+- unsupported backend in `cluster.backend` or `launch_providers.*.backend` raises runtime error

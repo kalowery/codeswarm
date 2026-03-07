@@ -68,6 +68,11 @@ Router requires `protocol` and `command`; `type` is expected by current clients.
 - `swarm_removed`
 - `command_rejected`
 
+Lifecycle notes:
+
+- `swarm_terminated` is the primary completion event for terminate requests.
+- `swarm_removed` is emitted for cleanup/prune removal paths and may occur independently of user terminate.
+
 ## Execution/approval events
 
 - `exec_approval_required`
