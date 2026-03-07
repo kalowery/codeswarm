@@ -41,6 +41,19 @@ export function useWebSocket() {
           console.log('RAW WS:', event.data)
           const msg = JSON.parse(event.data)
           console.log('PARSED WS:', msg)
+          if (msg?.type === 'workspace_archive_ready' && typeof msg?.payload?.download_url === 'string') {
+            const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+            const href = `${apiBase}${msg.payload.download_url}`
+            const a = document.createElement('a')
+            a.href = href
+            a.download = typeof msg?.payload?.archive_name === 'string' ? msg.payload.archive_name : ''
+            document.body.appendChild(a)
+            a.click()
+            a.remove()
+          }
+          if (msg?.type === 'workspace_archive_failed' && typeof msg?.payload?.reason === 'string') {
+            console.warn('Workspace archive export failed:', msg.payload.reason)
+          }
           handleMessage(msg)
         } catch (err) {
           console.error('WS parse error', err)

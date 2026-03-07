@@ -416,7 +416,55 @@ def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
     save_state()
 
 
-def _graceful_terminate_swarm(config, provider, request_id, swarm_id):
+def _maybe_export_workspace_archive(config, provider, request_id, swarm_id, job_id, terminate_params):
+    if not isinstance(terminate_params, dict):
+        return
+    if not bool(terminate_params.get("download_workspaces_on_shutdown", False)):
+        return
+    if not hasattr(provider, "create_workspace_archive"):
+        return
+
+    archive_root = (
+        config.get("router", {}).get("download_archive_root")
+        if isinstance(config.get("router"), dict)
+        else None
+    )
+    if not isinstance(archive_root, str) or not archive_root.strip():
+        archive_root = "/tmp/codeswarm-downloads"
+
+    output_dir = Path(str(archive_root)).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        archive_path = provider.create_workspace_archive(str(job_id), str(swarm_id), output_dir)
+    except Exception as e:
+        emit_event("workspace_archive_failed", {
+            "request_id": request_id,
+            "swarm_id": swarm_id,
+            "job_id": job_id,
+            "reason": str(e),
+        })
+        return
+
+    if not archive_path:
+        emit_event("workspace_archive_failed", {
+            "request_id": request_id,
+            "swarm_id": swarm_id,
+            "job_id": job_id,
+            "reason": "No workspace artifacts found to archive",
+        })
+        return
+
+    emit_event("workspace_archive_ready", {
+        "request_id": request_id,
+        "swarm_id": swarm_id,
+        "job_id": job_id,
+        "archive_path": str(archive_path),
+        "archive_name": Path(str(archive_path)).name,
+    })
+
+
+def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_overrides=None):
     swarm = SWARMS.get(str(swarm_id))
     if not swarm:
         emit_event("command_rejected", {
@@ -495,7 +543,10 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id):
 
     terminate_params = swarm.get("provider_params") if isinstance(swarm, dict) else None
     if not isinstance(terminate_params, dict):
-        terminate_params = None
+        terminate_params = {}
+    if isinstance(terminate_overrides, dict):
+        terminate_params = {**terminate_params, **terminate_overrides}
+    _maybe_export_workspace_archive(config, provider, request_id, swarm_id, job_id, terminate_params)
 
     try:
         provider.terminate(job_id, terminate_params=terminate_params)
@@ -2011,6 +2062,9 @@ def run_daemon(config, providers):
 
             elif command == "swarm_terminate":
                 swarm_id = payload.get("swarm_id")
+                terminate_params = payload.get("terminate_params")
+                if not isinstance(terminate_params, dict):
+                    terminate_params = None
                 swarm = SWARMS.get(swarm_id)
                 if not swarm:
                     emit_event("command_rejected", {
@@ -2058,7 +2112,7 @@ def run_daemon(config, providers):
 
                 threading.Thread(
                     target=_graceful_terminate_swarm,
-                    args=(config, terminate_provider, request_id, str(swarm_id)),
+                    args=(config, terminate_provider, request_id, str(swarm_id), terminate_params),
                     daemon=True
                 ).start()
 # ================================

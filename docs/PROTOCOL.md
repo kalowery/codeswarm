@@ -67,6 +67,8 @@ Router requires `protocol` and `command`; `type` is expected by current clients.
 - `swarm_terminated`
 - `swarm_removed`
 - `command_rejected`
+- `workspace_archive_ready`
+- `workspace_archive_failed`
 
 Lifecycle notes:
 

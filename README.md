@@ -163,6 +163,28 @@ UI prompt syntax supports both intra-swarm and cross-swarm targeting:
 Cross-swarm `idle` routes use the router queue and dispatch to the first target node with no outstanding work.
 The frontend sidebar also shows queued cross-swarm items (source/target/selector/age/content).
 
+## Agent Personas
+
+Codeswarm supports launching workers with an optional Agent Persona.
+
+Agent Persona definition:
+
+- a directory with:
+  - `AGENTS.md` at directory root (required)
+  - `skills/` subdirectory (optional)
+
+Launch UI behavior:
+
+- if a single file is selected, its content is copied into each worker workspace root as `AGENTS.md` (filename does not matter)
+- if a directory is selected, only root `AGENTS.md` and files under `skills/` are copied
+- persona skills are copied into each worker workspace root under `.agents/skills/...`
+
+Sample personas are provided under:
+
+- `personas/amd-gpu-developer`
+- `personas/full-stack-web-developer`
+- `personas/flutter-mobile-app-developer`
+
 ## Auto-Routing From Task Completion
 
 Backend inspects `task_complete` final assistant output and auto-submits any line that matches cross-swarm syntax:

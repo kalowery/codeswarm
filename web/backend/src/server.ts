@@ -2,6 +2,9 @@ import express from 'express'
 import cors from 'cors';
 import { WebSocketServer } from 'ws';
 import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
 import { RouterBridge } from './router/RouterBridge';
 import { SwarmStateManager } from './state/SwarmStateManager';
 import { WebSocketHub } from './ws/WebSocketHub';
@@ -30,6 +33,7 @@ let interSwarmQueueItems: any[] = [];
 const requestPromptMap = new Map<string, string>();
 const injectionPromptMap = new Map<string, string>();
 const processedAutoRoutes = new Set<string>();
+const workspaceDownloads = new Map<string, { archivePath: string; archiveName: string; createdAt: number }>();
 let launchProviders: any[] = [];
 const pendingProvidersRequests = new Map<
   string,
@@ -305,6 +309,36 @@ router.on('event', (msg: any) => {
     return;
   }
 
+  if (event === 'workspace_archive_ready') {
+    const archivePath = typeof data?.archive_path === 'string' ? data.archive_path : '';
+    const archiveName = typeof data?.archive_name === 'string' ? data.archive_name : path.basename(archivePath || 'workspace.tar.gz');
+    if (!archivePath || !fs.existsSync(archivePath)) {
+      hub.broadcast({
+        type: 'workspace_archive_failed',
+        payload: {
+          ...data,
+          reason: 'Workspace archive was reported but is not accessible on backend host'
+        }
+      });
+      return;
+    }
+
+    const token = randomUUID();
+    workspaceDownloads.set(token, {
+      archivePath,
+      archiveName,
+      createdAt: Date.now()
+    });
+    hub.broadcast({
+      type: 'workspace_archive_ready',
+      payload: {
+        ...data,
+        download_url: `/downloads/${token}`
+      }
+    });
+    return;
+  }
+
   if (event === 'turn_complete') {
     if (typeof data?.injection_id === 'string') {
       injectionPromptMap.delete(data.injection_id);
@@ -516,11 +550,33 @@ app.post('/inject/:alias', (req, res) => {
 app.post('/terminate/:alias', (req, res) => {
   const swarm = state.getByAlias(req.params.alias);
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
-
-  const request_id = router.send('swarm_terminate', { swarm_id: swarm.swarm_id });
+  const downloadWorkspaces = Boolean(req.body?.download_workspaces_on_shutdown);
+  const request_id = router.send('swarm_terminate', {
+    swarm_id: swarm.swarm_id,
+    terminate_params: downloadWorkspaces
+      ? { download_workspaces_on_shutdown: true }
+      : undefined
+  });
   requestSwarmMap[request_id] = swarm.swarm_id;
 
   res.json({ request_id });
+});
+
+app.get('/downloads/:token', (req, res) => {
+  const token = String(req.params.token || '').trim();
+  const record = workspaceDownloads.get(token);
+  if (!record) {
+    return res.status(404).json({ error: 'Unknown download token' });
+  }
+  if (!fs.existsSync(record.archivePath)) {
+    workspaceDownloads.delete(token);
+    return res.status(404).json({ error: 'Archive not found' });
+  }
+  res.download(record.archivePath, record.archiveName, (err) => {
+    if (!err) {
+      workspaceDownloads.delete(token);
+    }
+  });
 });
 
 app.get('/swarms', (req, res) => {

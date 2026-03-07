@@ -324,6 +324,7 @@ export default function Home() {
 
   const [isSending, setIsSending] = useState(false)
   const [isTerminating, setIsTerminating] = useState(false)
+  const [downloadWorkspaceOnTerminate, setDownloadWorkspaceOnTerminate] = useState(false)
   const [dotCount, setDotCount] = useState(0)
 
   function computeBestGridLayout(
@@ -918,7 +919,10 @@ export default function Home() {
               <div>
                 <h1 className="text-xl font-semibold">{active.alias}</h1>
                 <div className="text-sm text-slate-400">
-                  Status: {active.status ?? 'unknown'} · Slurm: {active.slurm_state}
+                  Status: {active.status ?? 'unknown'}
+                  {active.slurm_state
+                    ? ` · ${(active.provider ?? '').toLowerCase() === 'slurm' ? 'Slurm' : 'Backend'}: ${active.slurm_state}`
+                    : ''}
                 </div>
                 {activeIsTerminating && (
                   <div className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs">
@@ -935,7 +939,13 @@ export default function Home() {
                   try {
                     setIsTerminating(true)
                     const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
-                    await fetch(`${apiBase}/terminate/${active.alias}`, { method: 'POST' })
+                    await fetch(`${apiBase}/terminate/${active.alias}`, {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        download_workspaces_on_shutdown: downloadWorkspaceOnTerminate
+                      })
+                    })
                   } finally {
                     setIsTerminating(false)
                   }
@@ -949,6 +959,14 @@ export default function Home() {
                 {(isTerminating || activeIsTerminating) ? 'Terminating…' : 'Terminate'}
               </button>
             </div>
+            <label className="mb-3 inline-flex items-center gap-2 text-xs text-slate-400">
+              <input
+                type="checkbox"
+                checked={downloadWorkspaceOnTerminate}
+                onChange={(e) => setDownloadWorkspaceOnTerminate(e.target.checked)}
+              />
+              Download workspace archive on terminate
+            </label>
 
             <div className="mb-3 flex items-center justify-between">
               <div className="text-xs text-slate-500">

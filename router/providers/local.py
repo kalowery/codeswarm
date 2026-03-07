@@ -3,6 +3,7 @@ import uuid
 import shutil
 import json
 import os
+import tarfile
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional
@@ -157,6 +158,36 @@ class LocalProvider(ClusterProvider):
                     shutil.move(str(path), str(dest_dir / path.name))
         except Exception as e:
             print(f"[archive] LocalProvider failed to archive {swarm_id}: {e}")
+
+    def create_workspace_archive(self, job_id: str, swarm_id: str, output_dir: Path) -> str | None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = output_dir / f"swarm_{swarm_id}_{job_id}_workspaces.tar.gz"
+
+        runs_dir = self.workspace_root / job_id
+        mailbox_root = self.workspace_root / "mailbox"
+        included = 0
+
+        with tarfile.open(archive_path, "w:gz") as tar:
+            if runs_dir.exists():
+                tar.add(runs_dir, arcname=f"runs/{job_id}")
+                included += 1
+
+            for bucket in ("inbox", "outbox", "archive"):
+                source_dir = mailbox_root / bucket
+                if not source_dir.exists():
+                    continue
+                for path in source_dir.glob(f"{job_id}_*.jsonl"):
+                    tar.add(path, arcname=f"mailbox/{bucket}/{path.name}")
+                    included += 1
+
+        if included == 0:
+            try:
+                archive_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return None
+
+        return str(archive_path.resolve())
 
     def get_job_state(self, job_id: str) -> Optional[str]:
         procs = self.jobs.get(job_id)

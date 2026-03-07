@@ -146,6 +146,16 @@ Executed in background thread to avoid blocking control loop.
 Marks swarm as `terminating`, waits for agents to become idle (best effort,
 bounded by timeout), then cancels Slurm job via `scancel`.
 
+Payload supports optional `terminate_params`:
+
+- `download_workspaces_on_shutdown: true`
+
+When enabled, router asks provider to export workspace/mailbox artifacts as a
+tar.gz archive before backend termination and emits:
+
+- `workspace_archive_ready` (archive created)
+- `workspace_archive_failed` (archive export failed or empty)
+
 ---
 
 ## Multi-Swarm Registry

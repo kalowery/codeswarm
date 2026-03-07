@@ -75,6 +75,10 @@ Data fields:
 Notes:
 
 - router immediately injects `system_prompt` to each node.
+- `agents_bundle.mode = "directory"` represents Agent Persona payloads:
+  - `agents_md_content` is copied as `AGENTS.md`
+  - `skills_files` paths are copied under `.agents/skills/<path>`
+  - empty `skills_files` is valid (skills optional)
 
 ### 3.1a `providers_list`
 
@@ -234,13 +238,20 @@ If `(job_id, call_id)` is unknown, router emits `command_rejected`.
 Payload:
 
 ```json
-{ "swarm_id": "..." }
+{
+  "swarm_id": "...",
+  "terminate_params": {
+    "download_workspaces_on_shutdown": true
+  }
+}
 ```
 
 Result events:
 
 - `swarm_status` with `status: "terminating"`
 - `swarm_terminated`
+- optional `workspace_archive_ready`
+- optional `workspace_archive_failed`
 
 Data:
 
@@ -251,6 +262,7 @@ Notes:
 
 - Repeat terminate requests while termination is already in progress are treated idempotently; router emits `swarm_status` (`terminating`) again.
 - `swarm_removed` is a separate cleanup/pruning event and is not the primary success signal for terminate.
+- `workspace_archive_ready` includes `archive_path` and `archive_name`.
 
 ### 3.7 `enqueue_inject`
 

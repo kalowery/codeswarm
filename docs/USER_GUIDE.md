@@ -74,9 +74,21 @@ In UI:
 - set system prompt
 - choose provider
 - fill provider-specific launch fields (if presented)
+- optionally select an Agent Persona input:
+  - single file: copied as `AGENTS.md`
+  - persona directory: must contain root `AGENTS.md`; `skills/` is optional
 - launch
 
 Router emits `swarm_launched`, then injects the system prompt to all nodes.
+
+### Agent Persona copy rules
+
+When a persona directory is selected, each worker workspace receives:
+
+- `AGENTS.md` in workspace root
+- `.agents/skills/...` (only files under persona `skills/`)
+
+Files outside persona `AGENTS.md` and `skills/` are ignored.
 
 ## 4. Inject prompts
 
@@ -146,6 +158,11 @@ Matching lines are auto-submitted as new routes, enabling chained multi-swarm ex
 ## 9. Terminate a swarm
 
 Use the Terminate action in UI.
+
+Optional:
+
+- enable `Download workspace archive on terminate` in the swarm detail pane to export workspace data before teardown.
+- browser downloads a `tar.gz` archive generated on the backend host.
 
 Router sends `swarm_terminate`, marks swarm status as `terminating`, waits for
 agents to go idle (or timeout), then terminates backend resources and emits

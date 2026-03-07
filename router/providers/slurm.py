@@ -141,6 +141,81 @@ class SlurmProvider(ClusterProvider):
         # Router does not enforce filesystem moves for Slurm backend.
         return
 
+    def create_workspace_archive(self, job_id: str, swarm_id: str, output_dir: Path) -> str | None:
+        login_alias = self.config.get("ssh", {}).get("login_alias")
+        if not login_alias:
+            raise RuntimeError("SSH login_alias not configured")
+
+        cluster_cfg = self.config.get("cluster", {})
+        slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+        workspace_root = str(slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root") or "").rstrip("/")
+        cluster_subdir = str(slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir") or "").strip("/")
+        if not workspace_root or not cluster_subdir:
+            raise RuntimeError("Missing Slurm workspace_root/cluster_subdir for archive export")
+
+        base = f"{workspace_root}/{cluster_subdir}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = output_dir / f"swarm_{swarm_id}_{job_id}_workspaces.tar.gz"
+
+        remote_script = f"""
+set -euo pipefail
+BASE={shlex.quote(base)}
+JOB={shlex.quote(str(job_id))}
+TMP=$(mktemp -d)
+ROOT="$TMP/export"
+mkdir -p "$ROOT"
+FOUND=0
+
+if [ -d "$BASE/runs/$JOB" ]; then
+  mkdir -p "$ROOT/runs"
+  cp -a "$BASE/runs/$JOB" "$ROOT/runs/"
+  FOUND=1
+fi
+
+for bucket in inbox outbox archive; do
+  SRC="$BASE/mailbox/$bucket"
+  if [ ! -d "$SRC" ]; then
+    continue
+  fi
+  mkdir -p "$ROOT/mailbox/$bucket"
+  found_bucket=0
+  while IFS= read -r -d '' f; do
+    cp -a "$f" "$ROOT/mailbox/$bucket/"
+    found_bucket=1
+    FOUND=1
+  done < <(find "$SRC" -maxdepth 1 -type f -name "${{JOB}}_*.jsonl" -print0)
+  if [ "$found_bucket" -eq 0 ]; then
+    rmdir "$ROOT/mailbox/$bucket" 2>/dev/null || true
+  fi
+done
+
+if [ "$FOUND" -eq 0 ]; then
+  rm -rf "$TMP"
+  exit 3
+fi
+
+tar -C "$ROOT" -czf - .
+rm -rf "$TMP"
+"""
+
+        cmd = ["ssh", login_alias, "/bin/bash -lc " + shlex.quote(remote_script)]
+        with open(archive_path, "wb") as out_f:
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate()
+
+        if proc.returncode == 3:
+            archive_path.unlink(missing_ok=True)
+            return None
+        if proc.returncode != 0:
+            archive_path.unlink(missing_ok=True)
+            err = (stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to export Slurm workspace archive: {err}")
+        if archive_path.stat().st_size == 0:
+            archive_path.unlink(missing_ok=True)
+            return None
+
+        return str(archive_path.resolve())
+
     def get_job_state(self, job_id: str) -> Optional[str]:
         login_alias = self.config.get("ssh", {}).get("login_alias")
         if not login_alias:

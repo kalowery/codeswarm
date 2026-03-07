@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Optional
 import subprocess
+from pathlib import Path
 
 
 class ClusterProvider(ABC):
@@ -46,3 +47,15 @@ class ClusterProvider(ABC):
     ) -> None:
         """Deliver injection to worker."""
         pass
+
+    def create_workspace_archive(
+        self,
+        job_id: str,
+        swarm_id: str,
+        output_dir: Path,
+    ) -> str | None:
+        """
+        Optional hook used by terminate flow when archive download is requested.
+        Return absolute archive path when created, else None.
+        """
+        return None

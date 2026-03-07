@@ -905,6 +905,71 @@ done
         # AWS backend keeps data on EBS unless delete_ebs_on_shutdown is enabled.
         return
 
+    def create_workspace_archive(self, job_id: str, swarm_id: str, output_dir: Path) -> str | None:
+        coordinator_host = self._coordinator_host_for_job(str(job_id))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = output_dir / f"swarm_{swarm_id}_{job_id}_workspaces.tar.gz"
+        base = self.base_path.rstrip("/")
+
+        remote_script = f"""
+set -euo pipefail
+BASE={self._quote(base)}
+JOB={self._quote(str(job_id))}
+TMP=$(mktemp -d)
+ROOT="$TMP/export"
+mkdir -p "$ROOT"
+FOUND=0
+
+if [ -d "$BASE/runs/$JOB" ]; then
+  mkdir -p "$ROOT/runs"
+  cp -a "$BASE/runs/$JOB" "$ROOT/runs/"
+  FOUND=1
+fi
+
+for bucket in inbox outbox archive; do
+  SRC="$BASE/mailbox/$bucket"
+  if [ ! -d "$SRC" ]; then
+    continue
+  fi
+  mkdir -p "$ROOT/mailbox/$bucket"
+  found_bucket=0
+  while IFS= read -r -d '' f; do
+    cp -a "$f" "$ROOT/mailbox/$bucket/"
+    found_bucket=1
+    FOUND=1
+  done < <(find "$SRC" -maxdepth 1 -type f -name "${{JOB}}_*.jsonl" -print0)
+  if [ "$found_bucket" -eq 0 ]; then
+    rmdir "$ROOT/mailbox/$bucket" 2>/dev/null || true
+  fi
+done
+
+if [ "$FOUND" -eq 0 ]; then
+  rm -rf "$TMP"
+  exit 3
+fi
+
+tar -C "$ROOT" -czf - .
+rm -rf "$TMP"
+"""
+
+        cmd = self._ssh_cmd(coordinator_host, "/bin/bash -lc " + self._quote(remote_script))
+        with open(archive_path, "wb") as out_f:
+            proc = subprocess.Popen(cmd, stdout=out_f, stderr=subprocess.PIPE)
+            _, stderr = proc.communicate()
+
+        if proc.returncode == 3:
+            archive_path.unlink(missing_ok=True)
+            return None
+        if proc.returncode != 0:
+            archive_path.unlink(missing_ok=True)
+            err = (stderr or b"").decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to export AWS workspace archive: {err}")
+        if archive_path.stat().st_size == 0:
+            archive_path.unlink(missing_ok=True)
+            return None
+
+        return str(archive_path.resolve())
+
     def get_job_state(self, job_id: str) -> Optional[str]:
         instances = self._get_instances_for_job(job_id)
         if not instances:
