@@ -418,11 +418,13 @@ router.on('event', (msg: any) => {
 
 // --- REST Endpoints ---
 app.post('/launch', (req, res) => {
-  const { nodes, prompt, alias, agents_md_content, provider, provider_params } = req.body;
+  const { nodes, prompt, alias, agents_md_content, agents_bundle, provider, provider_params } = req.body;
   const agentsContent =
     typeof agents_md_content === 'string' && agents_md_content.trim().length > 0
       ? agents_md_content
       : undefined;
+  const normalizedAgentsBundle =
+    agents_bundle && typeof agents_bundle === 'object' ? agents_bundle : undefined;
   const normalizedProvider = typeof provider === 'string' && provider.trim().length > 0 ? provider : undefined;
   const normalizedProviderParams = provider_params && typeof provider_params === 'object' ? provider_params : undefined;
 
@@ -430,6 +432,7 @@ app.post('/launch', (req, res) => {
     nodes,
     system_prompt: prompt,
     agents_md_content: agentsContent,
+    agents_bundle: normalizedAgentsBundle,
     provider: normalizedProvider,
     provider_params: normalizedProviderParams
   });

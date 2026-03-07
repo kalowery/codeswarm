@@ -6,6 +6,7 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Callable, Dict, Optional
 
 from .base import ClusterProvider
@@ -545,11 +546,22 @@ fi
         if res.returncode != 0:
             raise RuntimeError(f"Failed to bootstrap Codex tooling on coordinator:\n{res.stderr}")
 
-    def _prepare_run_directories(self, coordinator_host: str, job_id: str, workers: int, agents_md_content: str | None) -> None:
+    def _prepare_run_directories(
+        self,
+        coordinator_host: str,
+        job_id: str,
+        workers: int,
+        agents_md_content: str | None,
+        agents_bundle: dict | None,
+    ) -> None:
         run_base = f"{self.base_path}/runs/{job_id}"
         res = self._ssh(coordinator_host, f"mkdir -p {self._quote(run_base)}")
         if res.returncode != 0:
             raise RuntimeError(f"Failed to create run root directory:\n{res.stderr}")
+
+        bundle_md = (agents_bundle or {}).get("agents_md_content") if isinstance(agents_bundle, dict) else None
+        effective_md = bundle_md if isinstance(bundle_md, str) and bundle_md.strip() else agents_md_content
+        skill_files = self._bundle_skills_files(agents_bundle)
 
         for i in range(workers):
             agent_dir = f"{run_base}/agent_{i:02d}"
@@ -557,14 +569,24 @@ fi
             res = self._ssh(coordinator_host, cmd)
             if res.returncode != 0:
                 raise RuntimeError(f"Failed to initialize workspace for worker {i}:\n{res.stderr}")
-            if agents_md_content is not None:
+            if isinstance(effective_md, str) and effective_md.strip():
                 res = self._ssh(
                     coordinator_host,
                     f"cat > {self._quote(agent_dir + '/AGENTS.md')}",
-                    input_text=agents_md_content,
+                    input_text=effective_md,
                 )
                 if res.returncode != 0:
                     raise RuntimeError(f"Failed to write AGENTS.md for worker {i}:\n{res.stderr}")
+            for rel_path, content in skill_files:
+                remote_path = f"{agent_dir}/.agents/skills/{rel_path}"
+                remote_dir = str(PurePosixPath(remote_path).parent)
+                res = self._ssh(
+                    coordinator_host,
+                    f"mkdir -p {self._quote(remote_dir)} && cat > {self._quote(remote_path)}",
+                    input_text=content,
+                )
+                if res.returncode != 0:
+                    raise RuntimeError(f"Failed to write .agents/skills/{rel_path} for worker {i}:\n{res.stderr}")
 
     def _start_workers(self, host_assignments: dict[str, list[int]], job_id: str) -> None:
         for host, worker_ids in host_assignments.items():
@@ -616,6 +638,7 @@ done
         self,
         nodes: int,
         agents_md_content: str | None = None,
+        agents_bundle: dict | None = None,
         launch_params: dict | None = None,
         progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
@@ -766,7 +789,13 @@ done
             _progress("bootstrap", "Installing Codex runtime tools")
             self._ensure_codex_tools(coordinator_host)
             _progress("bootstrap", "Preparing per-worker run directories")
-            self._prepare_run_directories(coordinator_host, job_id, total_workers, agents_md_content)
+            self._prepare_run_directories(
+                coordinator_host,
+                job_id,
+                total_workers,
+                agents_md_content,
+                agents_bundle,
+            )
 
             host_order = [coordinator_host] + worker_hosts
             assignments: dict[str, list[int]] = {host: [] for host in host_order}
@@ -988,3 +1017,37 @@ done
         result = self._ssh(coordinator_host, remote_cmd)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+    @staticmethod
+    def _safe_skill_rel_path(path: str) -> str | None:
+        try:
+            parts = PurePosixPath(path).parts
+        except Exception:
+            return None
+        if not parts:
+            return None
+        if any(part in ("", ".", "..") for part in parts):
+            return None
+        return str(PurePosixPath(*parts))
+
+    def _bundle_skills_files(self, agents_bundle: dict | None) -> list[tuple[str, str]]:
+        if not isinstance(agents_bundle, dict):
+            return []
+        if str(agents_bundle.get("mode") or "file") != "directory":
+            return []
+        raw_files = agents_bundle.get("skills_files")
+        if not isinstance(raw_files, list):
+            return []
+        files: list[tuple[str, str]] = []
+        for item in raw_files:
+            if not isinstance(item, dict):
+                continue
+            rel_path = item.get("path")
+            content = item.get("content")
+            if not isinstance(rel_path, str) or not isinstance(content, str):
+                continue
+            safe_rel = self._safe_skill_rel_path(rel_path)
+            if not safe_rel:
+                continue
+            files.append((safe_rel, content))
+        return files

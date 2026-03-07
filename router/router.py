@@ -1470,10 +1470,44 @@ def run_daemon(config, providers):
                 nodes = payload.get("nodes", 1)
                 system_prompt = payload.get("system_prompt", "")
                 agents_md_content = payload.get("agents_md_content")
+                agents_bundle = payload.get("agents_bundle")
                 provider_id = payload.get("provider")
                 provider_params = payload.get("provider_params")
                 if not isinstance(agents_md_content, str) or not agents_md_content.strip():
                     agents_md_content = None
+                if not isinstance(agents_bundle, dict):
+                    agents_bundle = None
+                else:
+                    bundle_md = agents_bundle.get("agents_md_content")
+                    mode = agents_bundle.get("mode")
+                    raw_skills = agents_bundle.get("skills_files")
+                    if not isinstance(bundle_md, str) or not bundle_md.strip():
+                        bundle_md = None
+                    if mode not in ("file", "directory"):
+                        mode = "file"
+                    skills_files = []
+                    if isinstance(raw_skills, list):
+                        for item in raw_skills:
+                            if not isinstance(item, dict):
+                                continue
+                            rel_path = item.get("path")
+                            content = item.get("content")
+                            if (
+                                isinstance(rel_path, str)
+                                and rel_path.strip()
+                                and isinstance(content, str)
+                            ):
+                                skills_files.append({
+                                    "path": rel_path.strip(),
+                                    "content": content,
+                                })
+                    agents_bundle = {
+                        "mode": mode,
+                        "agents_md_content": bundle_md,
+                        "skills_files": skills_files,
+                    }
+                    if bundle_md is None and not skills_files:
+                        agents_bundle = None
                 if not isinstance(provider_params, dict):
                     provider_params = {}
 
@@ -1522,6 +1556,7 @@ def run_daemon(config, providers):
                     job_id = launch_provider.launch(
                         nodes,
                         agents_md_content=agents_md_content,
+                        agents_bundle=agents_bundle,
                         launch_params=effective_launch_params,
                         progress_cb=_launch_progress,
                     )

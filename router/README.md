@@ -80,7 +80,12 @@ Provision a new backend job and create swarm entry.
 Payload:
 - `nodes`
 - `system_prompt`
-- `agents_md_content` (optional, copied to each node as `AGENTS.md`)
+- `agents_md_content` (optional, copied to each worker workspace root as `AGENTS.md`)
+- `agents_bundle` (optional):
+  - `mode`: `file` or `directory`
+  - `agents_md_content`: string copied to `AGENTS.md`
+  - `skills_files`: list of `{ path, content }`
+  - when `mode=directory`, skills are copied to `.agents/skills/<path>` in each worker workspace root
 - `provider` (optional provider preset id)
 - `provider_params` (optional provider-specific launch values)
 

@@ -4,6 +4,7 @@ import shutil
 import json
 import os
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional
 
 
@@ -28,10 +29,51 @@ class LocalProvider(ClusterProvider):
         # Archive root (optional)
         self.archive_root = self.config.get("archive_root")
 
+    @staticmethod
+    def _safe_skill_rel_path(path: str) -> str | None:
+        try:
+            parts = PurePosixPath(path).parts
+        except Exception:
+            return None
+        if not parts:
+            return None
+        if any(part in ("", ".", "..") for part in parts):
+            return None
+        return str(PurePosixPath(*parts))
+
+    def _apply_agents_payload(self, agent_dir: Path, agents_md_content: str | None, agents_bundle: dict | None) -> None:
+        bundle_mode = str((agents_bundle or {}).get("mode") or "file")
+        bundle_md = (agents_bundle or {}).get("agents_md_content")
+        effective_md = bundle_md if isinstance(bundle_md, str) and bundle_md.strip() else agents_md_content
+        if isinstance(effective_md, str) and effective_md.strip():
+            (agent_dir / "AGENTS.md").write_text(effective_md, encoding="utf-8")
+
+        if bundle_mode != "directory":
+            return
+
+        raw_skills = (agents_bundle or {}).get("skills_files")
+        if not isinstance(raw_skills, list):
+            return
+
+        for item in raw_skills:
+            if not isinstance(item, dict):
+                continue
+            rel_path = item.get("path")
+            content = item.get("content")
+            if not isinstance(rel_path, str) or not isinstance(content, str):
+                continue
+            safe_rel = self._safe_skill_rel_path(rel_path)
+            if not safe_rel:
+                continue
+            dest = agent_dir / ".agents" / "skills" / safe_rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text(content, encoding="utf-8")
+
     def launch(
         self,
         nodes: int,
         agents_md_content: str | None = None,
+        agents_bundle: dict | None = None,
         launch_params: dict | None = None,
         progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
@@ -44,8 +86,7 @@ class LocalProvider(ClusterProvider):
             agent_index = f"{i:02d}"
             agent_dir = self.workspace_root / job_id / f"agent_{agent_index}"
             agent_dir.mkdir(parents=True, exist_ok=True)
-            if agents_md_content is not None:
-                (agent_dir / "AGENTS.md").write_text(agents_md_content, encoding="utf-8")
+            self._apply_agents_payload(agent_dir, agents_md_content, agents_bundle)
 
             # Locate worker relative to repository root
             worker_path = (

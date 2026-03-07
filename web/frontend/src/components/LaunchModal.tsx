@@ -37,12 +37,24 @@ interface LaunchProvider {
   launch_panels?: ProviderLaunchPanel[]
 }
 
+interface AgentsSkillFile {
+  path: string
+  content: string
+}
+
+interface AgentsBundlePayload {
+  mode: 'file' | 'directory'
+  agents_md_content: string
+  skills_files: AgentsSkillFile[]
+}
+
 export default function LaunchModal({ onClose }: Props) {
   const [alias, setAlias] = useState('')
   const [nodes, setNodes] = useState('1')
   const [prompt, setPrompt] = useState('')
   const [agentsMdName, setAgentsMdName] = useState('')
   const [agentsMdContent, setAgentsMdContent] = useState('')
+  const [agentsBundle, setAgentsBundle] = useState<AgentsBundlePayload | null>(null)
   const [providers, setProviders] = useState<LaunchProvider[]>([])
   const [selectedProvider, setSelectedProvider] = useState('')
   const [providerValues, setProviderValues] = useState<Record<string, string>>({})
@@ -148,6 +160,7 @@ export default function LaunchModal({ onClose }: Props) {
           prompt,
           alias,
           agents_md_content: agentsMdContent || undefined,
+          agents_bundle: agentsBundle || undefined,
           provider: selectedProvider || undefined,
           provider_params: Object.keys(provider_params).length > 0 ? provider_params : undefined
         })
@@ -217,6 +230,82 @@ export default function LaunchModal({ onClose }: Props) {
         />
       </div>
     )
+  }
+
+  const clearAgentsSelection = () => {
+    setAgentsMdName('')
+    setAgentsMdContent('')
+    setAgentsBundle(null)
+  }
+
+  const handleAgentsSelection = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files
+    if (!selected || selected.length === 0) {
+      clearAgentsSelection()
+      return
+    }
+
+    const files = Array.from(selected)
+    const hasDirectoryPaths = files.some((f) => {
+      const rel = String((f as any).webkitRelativePath || '')
+      return rel.includes('/')
+    })
+
+    if (!hasDirectoryPaths) {
+      const file = files[0]
+      const text = await file.text()
+      setAgentsMdName(file.name)
+      setAgentsMdContent(text)
+      setAgentsBundle({
+        mode: 'file',
+        agents_md_content: text,
+        skills_files: []
+      })
+      return
+    }
+
+    const firstRel = String((files[0] as any).webkitRelativePath || '')
+    const rootName = firstRel.split('/')[0]
+    if (!rootName) {
+      alert('Unable to resolve selected directory.')
+      clearAgentsSelection()
+      return
+    }
+
+    const agentsPath = `${rootName}/AGENTS.md`
+    const agentsFile = files.find((f) => String((f as any).webkitRelativePath || '') === agentsPath)
+    if (!agentsFile) {
+      alert('Selected directory must contain AGENTS.md at its root.')
+      clearAgentsSelection()
+      return
+    }
+
+    const skillsPrefix = `${rootName}/skills/`
+    const skillEntries = files
+      .map((file) => {
+        const rel = String((file as any).webkitRelativePath || '')
+        if (!rel.startsWith(skillsPrefix)) return null
+        const skillRelPath = rel.slice(skillsPrefix.length)
+        if (!skillRelPath || skillRelPath.endsWith('/')) return null
+        return { file, skillRelPath }
+      })
+      .filter((entry): entry is { file: File; skillRelPath: string } => entry !== null)
+
+    const agentsText = await agentsFile.text()
+    const skillsFiles: AgentsSkillFile[] = await Promise.all(
+      skillEntries.map(async ({ file, skillRelPath }) => ({
+        path: skillRelPath,
+        content: await file.text()
+      }))
+    )
+
+    setAgentsMdName(`${rootName}/ (persona directory)`)
+    setAgentsMdContent(agentsText)
+    setAgentsBundle({
+      mode: 'directory',
+      agents_md_content: agentsText,
+      skills_files: skillsFiles
+    })
   }
 
   const renderProviderFields = () => {
@@ -355,27 +444,18 @@ export default function LaunchModal({ onClose }: Props) {
               </div>
 
               <div>
-                <label className="block text-sm text-slate-400 mb-1">AGENTS.md (optional)</label>
+                <label className="block text-sm text-slate-400 mb-1">Agent Persona or AGENTS file (optional)</label>
                 <input
                   type="file"
-                  accept=".md,text/markdown,text/plain"
-                  onChange={async (e) => {
-                    const file = e.target.files?.[0]
-                    if (!file) {
-                      setAgentsMdName('')
-                      setAgentsMdContent('')
-                      return
-                    }
-                    const text = await file.text()
-                    setAgentsMdName(file.name)
-                    setAgentsMdContent(text)
-                  }}
+                  multiple
+                  onChange={handleAgentsSelection}
+                  {...({ webkitdirectory: 'true', directory: '' } as any)}
                   className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 file:mr-3 file:rounded file:border-0 file:bg-slate-700 file:px-3 file:py-1 file:text-slate-100"
                 />
                 {agentsMdName ? (
                   <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
                 ) : (
-                  <p className="mt-1 text-xs text-slate-500">If selected, this file is copied into each node as AGENTS.md.</p>
+                  <p className="mt-1 text-xs text-slate-500">If a single file is selected, it is copied as AGENTS.md. If a directory is selected, only AGENTS.md and skills/ (if present) are copied.</p>
                 )}
               </div>
             </>

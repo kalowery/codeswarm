@@ -45,6 +45,13 @@ Payload:
   "nodes": 4,
   "system_prompt": "...",
   "agents_md_content": "optional markdown string",
+  "agents_bundle": {
+    "mode": "file | directory",
+    "agents_md_content": "optional markdown string",
+    "skills_files": [
+      { "path": "tooling/SKILL.md", "content": "..." }
+    ]
+  },
   "provider": "optional provider id",
   "provider_params": {
     "provider-specific": "values"

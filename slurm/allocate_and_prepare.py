@@ -5,7 +5,9 @@ import subprocess
 import time
 import base64
 import shlex
+import json
 from pathlib import Path
+from pathlib import PurePosixPath
 
 # Make project root importable
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -27,6 +29,18 @@ def resolve_slurm_paths(config):
     workspace_root = slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root")
     cluster_subdir = slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir")
     return workspace_root, cluster_subdir
+
+
+def safe_skill_rel_path(path: str) -> str | None:
+    try:
+        parts = PurePosixPath(path).parts
+    except Exception:
+        return None
+    if not parts:
+        return None
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return str(PurePosixPath(*parts))
 
 
 def build_sbatch_script(args, config):
@@ -312,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--account")
     parser.add_argument("--qos")
     parser.add_argument("--agents-md-b64")
+    parser.add_argument("--agents-bundle-b64")
     parser.add_argument("--launch-codex-test", action="store_true")
     parser.add_argument("--launch-codex-run", action="store_true")
 
@@ -361,11 +376,39 @@ if __name__ == "__main__":
         run_base = f"{hpc_base}/runs/{job_id}"
         ssh_login(login_alias, f"mkdir -p {run_base}")
         agents_md_content = None
+        agents_bundle = None
         if args.agents_md_b64:
             try:
                 agents_md_content = base64.b64decode(args.agents_md_b64).decode("utf-8")
             except Exception as e:
                 raise RuntimeError(f"Invalid --agents-md-b64 payload: {e}") from e
+        if args.agents_bundle_b64:
+            try:
+                decoded = base64.b64decode(args.agents_bundle_b64).decode("utf-8")
+                parsed = json.loads(decoded)
+                if isinstance(parsed, dict):
+                    agents_bundle = parsed
+            except Exception as e:
+                raise RuntimeError(f"Invalid --agents-bundle-b64 payload: {e}") from e
+
+        bundle_md = agents_bundle.get("agents_md_content") if isinstance(agents_bundle, dict) else None
+        if isinstance(bundle_md, str) and bundle_md.strip():
+            agents_md_content = bundle_md
+        bundle_mode = str(agents_bundle.get("mode") or "file") if isinstance(agents_bundle, dict) else "file"
+        raw_skills = agents_bundle.get("skills_files") if isinstance(agents_bundle, dict) else []
+        skill_files = []
+        if bundle_mode == "directory" and isinstance(raw_skills, list):
+            for item in raw_skills:
+                if not isinstance(item, dict):
+                    continue
+                rel_path = item.get("path")
+                content = item.get("content")
+                if not isinstance(rel_path, str) or not isinstance(content, str):
+                    continue
+                safe_rel = safe_skill_rel_path(rel_path)
+                if not safe_rel:
+                    continue
+                skill_files.append((safe_rel, content))
 
         for i in range(args.nodes):
             agent_dir = f"{run_base}/agent_{i:02d}"
@@ -379,6 +422,15 @@ if __name__ == "__main__":
                     login_alias,
                     f"cat > {shlex.quote(agent_dir + '/AGENTS.md')}",
                     input_text=agents_md_content,
+                )
+            for rel_path, content in skill_files:
+                remote_file = f"{agent_dir}/.agents/skills/{rel_path}"
+                remote_dir = str(PurePosixPath(remote_file).parent)
+                ssh_login(login_alias, f"mkdir -p {shlex.quote(remote_dir)}")
+                ssh_login(
+                    login_alias,
+                    f"cat > {shlex.quote(remote_file)}",
+                    input_text=content,
                 )
 
     print("Waiting for RUNNING state...")

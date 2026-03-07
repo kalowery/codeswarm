@@ -10,6 +10,7 @@ class ClusterProvider(ABC):
         self,
         nodes: int,
         agents_md_content: str | None = None,
+        agents_bundle: dict | None = None,
         launch_params: dict | None = None,
         progress_cb: Callable[[str, str], None] | None = None,
     ) -> str:
