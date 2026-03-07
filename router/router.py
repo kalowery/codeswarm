@@ -30,6 +30,7 @@ JOB_TO_SWARM = {}
 LAST_USAGE = {}
 PENDING_APPROVALS = {}
 PENDING_APPROVAL_DECISIONS = {}
+RESOLVED_APPROVALS = {}
 ACTIVE_PROVIDER = None
 PROVIDERS = {}
 PROVIDER_SPECS = []
@@ -47,6 +48,91 @@ MAX_TERMINATED = 100
 STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
 GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
 GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
+RESOLVED_APPROVAL_TTL_SECONDS = 180
+
+
+def _normalize_node_id(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _approval_key(job_id, call_id, node_id):
+    return (str(job_id), _normalize_node_id(node_id), str(call_id))
+
+
+def _approval_lookup(job_id, call_id, node_id=None, injection_id=None):
+    norm_job_id = str(job_id)
+    norm_call_id = str(call_id)
+    norm_node_id = _normalize_node_id(node_id)
+
+    if norm_node_id is not None:
+        direct_key = (norm_job_id, norm_node_id, norm_call_id)
+        meta = PENDING_APPROVALS.get(direct_key)
+        if meta:
+            return direct_key, meta
+
+    matches = []
+    for key, meta in PENDING_APPROVALS.items():
+        if key[0] != norm_job_id or key[2] != norm_call_id:
+            continue
+        matches.append((key, meta))
+
+    if not matches:
+        return (None, None)
+
+    if injection_id is not None:
+        norm_injection_id = str(injection_id)
+        by_injection = [
+            (key, meta)
+            for key, meta in matches
+            if str(meta.get("injection_id")) == norm_injection_id
+        ]
+        if len(by_injection) == 1:
+            return by_injection[0]
+        if len(by_injection) > 1:
+            # Prefer most recent if injection id was somehow reused.
+            by_injection.sort(
+                key=lambda item: float(item[1].get("created_at_ts") or 0.0),
+                reverse=True,
+            )
+            return by_injection[0]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    # Ambiguous call_id across nodes; prefer most recent as a best effort.
+    matches.sort(
+        key=lambda item: float(item[1].get("created_at_ts") or 0.0),
+        reverse=True,
+    )
+    return matches[0]
+
+
+def _mark_approval_resolved(job_id, call_id, node_id):
+    key = _approval_key(job_id, call_id, node_id)
+    RESOLVED_APPROVALS[key] = time.time()
+
+
+def _is_recently_resolved_approval(job_id, call_id, node_id):
+    now = time.time()
+    expired = [
+        key
+        for key, ts in RESOLVED_APPROVALS.items()
+        if (now - float(ts)) > RESOLVED_APPROVAL_TTL_SECONDS
+    ]
+    for key in expired:
+        RESOLVED_APPROVALS.pop(key, None)
+    key = _approval_key(job_id, call_id, node_id)
+    ts = RESOLVED_APPROVALS.get(key)
+    if ts is None:
+        return False
+    return (now - float(ts)) <= RESOLVED_APPROVAL_TTL_SECONDS
 
 
 def save_state():
@@ -1120,6 +1206,7 @@ def translate_event(event):
     if method in ("codex/event/exec_approval_request", "item/commandExecution/requestApproval"):
         params = payload.get("params", {})
         msg = params.get("msg")
+        event_turn_id = None
 
         if msg:
             # Shape A: codex/event/exec_approval_request
@@ -1129,6 +1216,7 @@ def translate_event(event):
             cwd = msg.get("cwd")
             proposed_execpolicy_amendment = msg.get("proposed_execpolicy_amendment")
             available_decisions = msg.get("available_decisions")
+            event_turn_id = msg.get("turn_id") or params.get("id")
         else:
             # Shape B: item/commandExecution/requestApproval
             call_id = params.get("itemId")
@@ -1137,11 +1225,15 @@ def translate_event(event):
             cwd = params.get("cwd")
             proposed_execpolicy_amendment = params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
             available_decisions = params.get("availableDecisions") or params.get("available_decisions")
+            event_turn_id = params.get("turnId")
 
         rpc_id = payload.get("id")
+        request_id_hint = None
+        if rpc_id is None and isinstance(params.get("id"), (int, str)):
+            request_id_hint = params.get("id")
 
         if call_id:
-            key = (job_id, call_id)
+            key = _approval_key(job_id, call_id, node_id)
             existing = PENDING_APPROVALS.get(key, {})
 
             # Keep the strongest request shape when both legacy and request-style
@@ -1169,12 +1261,15 @@ def translate_event(event):
                 "swarm_id": swarm_id,
                 "node_id": node_id,
                 "injection_id": injection_id,
+                "turn_id": event_turn_id,
                 "rpc_id": merged_rpc_id,
+                "request_id_hint": existing.get("request_id_hint") or request_id_hint,
                 "approval_method": method,
                 "command": command,
                 "cwd": cwd,
                 "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
                 "available_decisions": merged_available,
+                "created_at_ts": time.time(),
             }
             pass  # debug removed
 
@@ -1237,6 +1332,7 @@ def translate_event(event):
             "exec_approval_required",
             {
                 **base,
+                "injection_id": event_turn_id or base.get("injection_id"),
                 "call_id": call_id,
                 "command": command,
                 "reason": reason,
@@ -1253,6 +1349,7 @@ def translate_event(event):
             "command_started",
             {
                 **base,
+                "injection_id": msg.get("turn_id") or base.get("injection_id"),
                 "call_id": msg.get("call_id"),
                 "command": msg.get("command"),
                 "cwd": msg.get("cwd"),
@@ -1266,6 +1363,7 @@ def translate_event(event):
             "command_completed",
             {
                 **base,
+                "injection_id": msg.get("turn_id") or base.get("injection_id"),
                 "call_id": msg.get("call_id"),
                 "command": msg.get("command"),
                 "cwd": msg.get("cwd"),
@@ -1844,17 +1942,84 @@ def run_daemon(config, providers):
             elif command == "approve_execution":
                 job_id = payload.get("job_id")
                 call_id = payload.get("call_id")
+                node_id = payload.get("node_id")
+                injection_id = payload.get("injection_id")
                 approved = payload.get("approved")
                 decision = payload.get("decision")
 
-                key = (str(job_id), call_id)
-                pass  # debug removed
-                meta = PENDING_APPROVALS.get(key)
+                key, meta = _approval_lookup(
+                    job_id,
+                    call_id,
+                    node_id=node_id,
+                    injection_id=injection_id,
+                )
 
                 if not meta:
+                    if _is_recently_resolved_approval(job_id, call_id, node_id):
+                        emit_event("exec_approval_resolved", {
+                            "request_id": request_id,
+                            "job_id": job_id,
+                            "call_id": call_id,
+                            "node_id": _normalize_node_id(node_id),
+                            "injection_id": injection_id,
+                            "approved": approved,
+                            "decision": decision,
+                            "idempotent": True,
+                        })
+                        continue
+
+                    norm_node_id = _normalize_node_id(node_id)
+                    fallback_swarm_id = JOB_TO_SWARM.get(str(job_id))
+                    fallback_provider = _provider_for_swarm(fallback_swarm_id) if fallback_swarm_id else None
+                    if (
+                        fallback_provider is not None
+                        and norm_node_id is not None
+                        and call_id is not None
+                    ):
+                        fallback_decision = decision
+                        if fallback_decision is None:
+                            fallback_decision = "accept" if bool(approved) else "cancel"
+
+                        params_payload = {
+                            "call_id": call_id,
+                            "callId": call_id,
+                            "approved": bool(approved),
+                            "decision": fallback_decision,
+                        }
+                        if isinstance(fallback_decision, dict):
+                            params_payload.update(fallback_decision)
+
+                        try:
+                            fallback_provider.send_control(
+                                str(job_id),
+                                norm_node_id,
+                                {
+                                    "method": "exec/approvalResponse",
+                                    "params": params_payload,
+                                },
+                            )
+                            _mark_approval_resolved(job_id, call_id, norm_node_id)
+                            emit_event("exec_approval_resolved", {
+                                "request_id": request_id,
+                                "job_id": job_id,
+                                "call_id": call_id,
+                                "node_id": norm_node_id,
+                                "injection_id": injection_id,
+                                "approved": approved,
+                                "decision": decision,
+                                "recovered_without_pending_meta": True,
+                            })
+                            continue
+                        except Exception:
+                            pass
+
                     emit_event("command_rejected", {
                         "request_id": request_id,
-                        "reason": "unknown approval request"
+                        "reason": "unknown approval request",
+                        "job_id": job_id,
+                        "call_id": call_id,
+                        "node_id": _normalize_node_id(node_id),
+                        "injection_id": injection_id,
                     })
                     continue
 
@@ -1868,6 +2033,11 @@ def run_daemon(config, providers):
 
                 try:
                     rpc_id = meta.get("rpc_id")
+                    if rpc_id is None:
+                        # Some approval events omit top-level payload.id but carry
+                        # a request identifier in params.id. Use it as best-effort
+                        # RPC correlation before falling back to notification mode.
+                        rpc_id = meta.get("request_id_hint")
                     available_decisions = meta.get("available_decisions") or []
 
                     def _extract_amendment_from_decision(d):
@@ -2051,11 +2221,14 @@ def run_daemon(config, providers):
                     continue
 
                 del PENDING_APPROVALS[key]
+                _mark_approval_resolved(job_id, call_id, meta.get("node_id"))
 
                 emit_event("exec_approval_resolved", {
                     "request_id": request_id,
                     "job_id": job_id,
                     "call_id": call_id,
+                    "node_id": meta.get("node_id"),
+                    "injection_id": meta.get("injection_id"),
                     "approved": approved,
                     "decision": decision,
                 })

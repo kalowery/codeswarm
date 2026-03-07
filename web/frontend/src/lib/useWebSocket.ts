@@ -38,9 +38,7 @@ export function useWebSocket() {
 
       ws.onmessage = (event) => {
         try {
-          console.log('RAW WS:', event.data)
           const msg = JSON.parse(event.data)
-          console.log('PARSED WS:', msg)
           if (msg?.type === 'workspace_archive_ready' && typeof msg?.payload?.download_url === 'string') {
             const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
             const href = `${apiBase}${msg.payload.download_url}`
