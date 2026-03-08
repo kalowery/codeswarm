@@ -61,24 +61,53 @@ export default function LaunchModal({ onClose }: Props) {
   const [activeTab, setActiveTab] = useState<'general' | 'provider'>('general')
   const [loading, setLoading] = useState(false)
   const [loadingProviders, setLoadingProviders] = useState(true)
+  const [providersError, setProvidersError] = useState<string | null>(null)
 
   useEffect(() => {
     const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
     setLoadingProviders(true)
-    fetch(`${apiBase}/providers`)
-      .then((res) => res.json())
-      .then((data) => {
-        const list = Array.isArray(data) ? (data as LaunchProvider[]) : []
-        setProviders(list)
-        if (list.length > 0) {
-          const first = list[0]
-          setSelectedProvider(first.id)
+    setProvidersError(null)
+    let cancelled = false
+    const delays = [0, 500, 1000, 2000]
+    const load = async () => {
+      for (let i = 0; i < delays.length; i += 1) {
+        if (cancelled) return
+        const delay = delays[i] ?? 0
+        if (delay > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          if (cancelled) return
         }
-      })
-      .catch(() => {
-        setProviders([])
-      })
-      .finally(() => setLoadingProviders(false))
+        try {
+          const res = await fetch(`${apiBase}/providers`)
+          if (!res.ok) throw new Error(`HTTP ${res.status}`)
+          const data = await res.json()
+          const list = Array.isArray(data) ? (data as LaunchProvider[]) : []
+          if (list.length === 0) {
+            if (i < delays.length - 1) continue
+            setProviders([])
+            setProvidersError('No providers returned. Check router config and backend connection.')
+            return
+          }
+          setProviders(list)
+          setProvidersError(null)
+          setSelectedProvider((current) =>
+            current && list.some((p) => p.id === current) ? current : list[0].id
+          )
+          return
+        } catch {
+          if (i === delays.length - 1) {
+            setProviders([])
+            setProvidersError('Unable to load providers from backend.')
+          }
+        }
+      }
+    }
+    load().finally(() => {
+      if (!cancelled) setLoadingProviders(false)
+    })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const activeProvider = useMemo(
@@ -377,6 +406,8 @@ export default function LaunchModal({ onClose }: Props) {
           <label className="block text-sm text-slate-400 mb-1">Provider</label>
           {loadingProviders ? (
             <div className="text-sm text-slate-500">Loading providers...</div>
+          ) : providersError ? (
+            <div className="text-sm text-rose-400">{providersError}</div>
           ) : (
             <select
               value={selectedProvider}

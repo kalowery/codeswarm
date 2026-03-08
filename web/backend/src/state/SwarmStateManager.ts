@@ -90,6 +90,12 @@ export class SwarmStateManager {
     return Array.from(this.swarms.values());
   }
 
+  clearAll() {
+    this.swarms.clear();
+    this.aliasIndex.clear();
+    this.saveState();
+  }
+
   remove(swarm_id: string) {
     const record = this.swarms.get(swarm_id);
     if (!record) return;

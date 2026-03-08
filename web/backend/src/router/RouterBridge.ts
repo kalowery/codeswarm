@@ -10,6 +10,7 @@ export interface RouterEvent {
 export class RouterBridge extends EventEmitter {
   private socket?: net.Socket;
   private buffer = '';
+  private connected = false;
 
   constructor(private host = '127.0.0.1', private port = 8765) {
     super();
@@ -18,6 +19,8 @@ export class RouterBridge extends EventEmitter {
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.socket = net.createConnection({ host: this.host, port: this.port }, () => {
+        this.connected = true;
+        this.emit('connected');
         resolve();
       });
 
@@ -36,11 +39,26 @@ export class RouterBridge extends EventEmitter {
         }
       });
 
-      this.socket.on('error', reject);
+      this.socket.on('close', () => {
+        this.connected = false;
+        this.emit('disconnected');
+      });
+
+      this.socket.on('error', (err) => {
+        this.connected = false;
+        reject(err);
+      });
     });
   }
 
+  isConnected(): boolean {
+    return Boolean(this.connected && this.socket && !this.socket.destroyed);
+  }
+
   send(command: string, payload: any): string {
+    if (!this.isConnected()) {
+      throw new Error('Router connection unavailable');
+    }
     const request_id = randomUUID();
     const envelope = {
       protocol: 'codeswarm.router.v1',
@@ -51,7 +69,7 @@ export class RouterBridge extends EventEmitter {
     };
     const serialized = JSON.stringify(envelope);
     console.log('Sending to router:', serialized);
-    this.socket?.write(serialized + '\n');
+    this.socket!.write(serialized + '\n');
     return request_id;
   }
 }

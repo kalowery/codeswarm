@@ -104,6 +104,7 @@ export default function Home() {
   const setActiveNode = useSwarmStore((s) => s.setActiveNode)
   const interSwarmQueue = useSwarmStore((s) => s.interSwarmQueue)
   const setInterSwarmQueue = useSwarmStore((s) => s.setInterSwarmQueue)
+  const handleMessage = useSwarmStore((s) => s.handleMessage)
   const launchError = useSwarmStore((s) => s.launchError)
   const clearLaunchError = useSwarmStore((s) => s.clearLaunchError)
 
@@ -145,7 +146,7 @@ export default function Home() {
           const nodeId = Number(nodeIdRaw)
           for (const approval of approvals ?? []) {
             if (!approval?.call_id) continue
-            merged.set(approval.call_id, { nodeId, approval })
+            merged.set(`${nodeId}:${approval.call_id}`, { nodeId, approval })
           }
         }
 
@@ -154,8 +155,9 @@ export default function Home() {
           for (const turn of node.turns ?? []) {
             const approval = turn.approval
             if (!approval?.call_id) continue
-            if (merged.has(approval.call_id)) continue
-            merged.set(approval.call_id, {
+            const key = `${nodeId}:${approval.call_id}`
+            if (merged.has(key)) continue
+            merged.set(key, {
               nodeId,
               approval: {
                 call_id: approval.call_id,
@@ -533,6 +535,13 @@ export default function Home() {
     if (!res.ok) {
       throw new Error(`Approval failed (${res.status})`)
     }
+
+    // Force an immediate approval-state refresh after each submit so
+    // missed websocket events cannot leave stale approval panels.
+    fetch(`${apiBase}/approvals`)
+      .then((snapshotRes) => snapshotRes.json())
+      .then((data) => handleMessage({ type: 'approvals_snapshot', payload: data }))
+      .catch(() => {})
   }
 
   async function withApprovalSubmit(callId: string, action: () => Promise<void>) {
@@ -609,6 +618,10 @@ export default function Home() {
     return rule.join(' ')
   }
 
+  function approvalIsBusy(approval: PendingApproval) {
+    return approval.status === 'submitted' || approval.status === 'acknowledged'
+  }
+
   function renderFallbackApprovals(
     pendingApprovals: PendingApproval[] | undefined,
     turnCallIds: Set<string>,
@@ -628,9 +641,12 @@ export default function Home() {
               $ {Array.isArray(approval.command) ? approval.command.join(' ') : approval.command}
             </div>
             <div className="mt-1 text-slate-300">{approval.reason}</div>
+            {approval.status && (
+              <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
+            )}
             <div className="mt-2 flex flex-wrap items-center gap-2">
               <button
-                disabled={!!approvalSubmitting[approval.call_id]}
+                disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                 className="px-2 py-1 bg-emerald-700 rounded text-xs hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed"
                 onClick={async () => {
                   await withApprovalSubmit(approval.call_id, () =>
@@ -651,7 +667,7 @@ export default function Home() {
                 approval.proposed_execpolicy_amendment.length > 0 &&
                 approvalHasPolicyOption(approval.available_decisions) && (
                   <button
-                    disabled={!!approvalSubmitting[approval.call_id]}
+                    disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                     className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
                     onClick={async () => {
                       await withApprovalSubmit(approval.call_id, () =>
@@ -673,7 +689,7 @@ export default function Home() {
                   </button>
                 )}
               <button
-                disabled={!!approvalSubmitting[approval.call_id]}
+                disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                 className="px-2 py-1 bg-rose-600 rounded text-xs hover:bg-rose-500 disabled:opacity-60 disabled:cursor-not-allowed"
                 onClick={async () => {
                   await withApprovalSubmit(approval.call_id, () =>
@@ -727,6 +743,7 @@ export default function Home() {
   ) {
     const turnCallIds = new Set(
       turns
+        .filter((t) => t.phase === 'awaiting_approval' && !!t.approval)
         .map((t) => t.approval?.call_id)
         .filter((v): v is string => typeof v === 'string' && v.length > 0)
     )
@@ -1226,9 +1243,12 @@ export default function Home() {
                         $ {Array.isArray(approval.command) ? approval.command.join(' ') : approval.command}
                       </div>
                       <div className="mt-1 text-slate-300">{approval.reason}</div>
+                      {approval.status && (
+                        <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
+                      )}
                       <div className="mt-2 flex flex-wrap gap-2">
                         <button
-                          disabled={!!approvalSubmitting[approval.call_id]}
+                          disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                           className="px-2 py-1 bg-emerald-700 rounded text-xs hover:bg-emerald-600 disabled:opacity-60 disabled:cursor-not-allowed"
                           onClick={async () => {
                             await withApprovalSubmit(approval.call_id, () =>
@@ -1249,7 +1269,7 @@ export default function Home() {
                           approval.proposed_execpolicy_amendment.length > 0 &&
                           approvalHasPolicyOption(approval.available_decisions) && (
                             <button
-                              disabled={!!approvalSubmitting[approval.call_id]}
+                              disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                               className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
                               onClick={async () => {
                                 await withApprovalSubmit(approval.call_id, () =>
@@ -1271,7 +1291,7 @@ export default function Home() {
                             </button>
                           )}
                         <button
-                          disabled={!!approvalSubmitting[approval.call_id]}
+                          disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                           className="px-2 py-1 bg-rose-600 rounded text-xs hover:bg-rose-500 disabled:opacity-60 disabled:cursor-not-allowed"
                           onClick={async () => {
                             await withApprovalSubmit(approval.call_id, () =>

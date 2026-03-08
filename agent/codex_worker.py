@@ -327,9 +327,11 @@ def main():
                         payload = event.get("payload", {})
 
                         if payload.get("type") == "rpc_response":
-                            rpc_id = payload.get("rpc_id")
+                            response_id = payload.get("rpc_id")
                             result = payload.get("result")
-                            send_response(rpc_id, result)
+                            # Preserve local request id counter type; inbox rpc ids can be
+                            # int or string depending on upstream request shape.
+                            send_response(response_id, result)
                         else:
                             method = payload.get("method")
                             params = payload.get("params")

@@ -261,3 +261,18 @@ class LocalProvider(ClusterProvider):
 
         with open(inbox_path, "a") as f:
             f.write(json.dumps(payload) + "\n")
+
+        # Trace approval/control routing to node inbox for debugging.
+        try:
+            method = message.get("method") if isinstance(message, dict) else None
+            rpc_id = message.get("rpc_id") if isinstance(message, dict) else None
+            params = message.get("params") if isinstance(message, dict) else None
+            call_id = None
+            if isinstance(params, dict):
+                call_id = params.get("call_id") or params.get("callId")
+            print(
+                f"[local PROVIDER CONTROL] job_id={job_id} node_id={int(node_id)} method={method} rpc_id={rpc_id} call_id={call_id}",
+                flush=True,
+            )
+        except Exception:
+            pass

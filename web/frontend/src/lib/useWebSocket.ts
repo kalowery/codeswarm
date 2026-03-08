@@ -9,6 +9,7 @@ export function useWebSocket() {
   const retryCount = useRef(0)
   const socketRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<NodeJS.Timeout | null>(null)
+  const approvalsPollTimer = useRef<NodeJS.Timeout | null>(null)
 
   useEffect(() => {
     let isMounted = true
@@ -34,6 +35,18 @@ export function useWebSocket() {
           .then((res) => res.json())
           .then((data) => setSwarms(data))
           .catch(() => {})
+        fetch(`${apiBase}/approvals`)
+          .then((res) => res.json())
+          .then((data) => handleMessage({ type: 'approvals_snapshot', payload: data }))
+          .catch(() => {})
+
+        if (approvalsPollTimer.current) clearInterval(approvalsPollTimer.current)
+        approvalsPollTimer.current = setInterval(() => {
+          fetch(`${apiBase}/approvals`)
+            .then((res) => res.json())
+            .then((data) => handleMessage({ type: 'approvals_snapshot', payload: data }))
+            .catch(() => {})
+        }, 2000)
       }
 
       ws.onmessage = (event) => {
@@ -62,6 +75,10 @@ export function useWebSocket() {
         if (!isMounted) return
         console.log('WebSocket disconnected')
         setStatus('disconnected')
+        if (approvalsPollTimer.current) {
+          clearInterval(approvalsPollTimer.current)
+          approvalsPollTimer.current = null
+        }
 
         // Exponential backoff
         const delay = Math.min(1000 * 2 ** retryCount.current, 10000)
@@ -82,6 +99,7 @@ export function useWebSocket() {
     return () => {
       isMounted = false
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
+      if (approvalsPollTimer.current) clearInterval(approvalsPollTimer.current)
       if (socketRef.current) socketRef.current.close()
     }
   }, [handleMessage, setSwarms])

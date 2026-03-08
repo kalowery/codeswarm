@@ -588,7 +588,8 @@ async function runWebStack(opts: any) {
   );
 
   // Backend (dev mode)
-  spawnWithPrefix("backend", "npm", ["run", "dev"], backendPath);
+  // Use non-watch mode in web stack to avoid restart flapping.
+  spawnWithPrefix("backend", "npm", ["run", "web"], backendPath);
 
   // Frontend (dev mode)
   spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
