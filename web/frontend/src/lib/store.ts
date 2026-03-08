@@ -4,7 +4,8 @@ import { persist } from 'zustand/middleware'
 const MAX_TURNS_PER_NODE = 300
 const STREAM_IDLE_COMPLETE_MS = 1500
 const RESOLVED_APPROVAL_TTL_MS = 120000
-const APPROVAL_SNAPSHOT_BRIDGE_MS = 3000
+const PENDING_APPROVAL_STICKY_MS = 10000
+const RESOLVED_APPROVAL_STICKY_MS = 5000
 
 export type TurnPhase =
   | 'idle'
@@ -181,6 +182,88 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     return typeof expiresAt === 'number' && expiresAt > Date.now()
   }
 
+  const shouldKeepApprovalFromCache = (approval: PendingApproval) => {
+    const updatedAt = typeof approval.updated_at_ms === 'number' ? approval.updated_at_ms : 0
+    const ageMs = Date.now() - updatedAt
+    const status = approval.status
+    if (status === 'pending' || status === 'submitted' || status === 'acknowledged') {
+      return ageMs <= PENDING_APPROVAL_STICKY_MS
+    }
+    if (status === 'started' || status === 'resolved' || status === 'rejected' || status === 'timeout') {
+      return ageMs <= RESOLVED_APPROVAL_STICKY_MS
+    }
+    return ageMs <= PENDING_APPROVAL_STICKY_MS
+  }
+
+  const mergeSnapshotWithStickyPending = (
+    swarmId: string,
+    snapshotPending: Record<number, PendingApproval[]>,
+    existingPending: Record<number, PendingApproval[]> | undefined
+  ): Record<number, PendingApproval[]> => {
+    const merged: Record<number, PendingApproval[]> = {}
+    const existing = existingPending ?? {}
+
+    const upsert = (nodeId: number, approval: PendingApproval) => {
+      const current = merged[nodeId] ?? []
+      const prior = current.find((a) => a.call_id === approval.call_id)
+      if (!prior || isIncomingApprovalNewer(prior, approval)) {
+        merged[nodeId] = [...current.filter((a) => a.call_id !== approval.call_id), approval]
+      }
+    }
+
+    for (const [nodeIdRaw, approvals] of Object.entries(snapshotPending)) {
+      const nodeId = Number(nodeIdRaw)
+      if (!Number.isFinite(nodeId)) continue
+      for (const approval of approvals ?? []) {
+        upsert(nodeId, approval)
+      }
+    }
+
+    for (const [nodeIdRaw, approvals] of Object.entries(existing)) {
+      const nodeId = Number(nodeIdRaw)
+      if (!Number.isFinite(nodeId)) continue
+      for (const approval of approvals ?? []) {
+        if (!approval || !approval.call_id) continue
+        if (isApprovalRecentlyResolved(swarmId, nodeId, approval.call_id)) continue
+        if (!shouldKeepApprovalFromCache(approval)) continue
+        upsert(nodeId, approval)
+      }
+    }
+
+    return merged
+  }
+
+  const markPendingApprovalStatus = (
+    pending: Record<number, PendingApproval[]> | undefined,
+    callId: string | undefined,
+    status: PendingApproval['status'],
+    nodeId?: number
+  ): Record<number, PendingApproval[]> => {
+    if (!pending || !callId) return pending ?? {}
+    const next: Record<number, PendingApproval[]> = {}
+    let changed = false
+    const now = Date.now()
+    for (const [nodeKey, approvals] of Object.entries(pending)) {
+      const currentNodeId = Number(nodeKey)
+      const source = approvals ?? []
+      if (Number.isFinite(nodeId) && currentNodeId !== nodeId) {
+        if (source.length > 0) next[currentNodeId] = source
+        continue
+      }
+      const updated = source.map((approval) => {
+        if (approval.call_id !== callId) return approval
+        changed = true
+        return {
+          ...approval,
+          status,
+          updated_at_ms: now
+        }
+      })
+      if (updated.length > 0) next[currentNodeId] = updated
+    }
+    return changed ? next : (pending ?? {})
+  }
+
   const parsePendingSnapshotForSwarm = (swarmId: string): Record<number, PendingApproval[]> => {
     const rawByNode = latestApprovalsSnapshot[swarmId]
     const nextPending: Record<number, PendingApproval[]> = {}
@@ -321,8 +404,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     return next
   }
 
-  const sameApproval = (nodeId: number, callId: string) => `${nodeId}:${callId}`
-
   const approvalFreshness = (approval: PendingApproval) => {
     if (typeof approval.approval_seq === 'number') return approval.approval_seq
     if (typeof approval.updated_at_ms === 'number') return approval.updated_at_ms
@@ -340,77 +421,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       return incomingSeq >= existingSeq
     }
     return approvalFreshness(incoming) >= approvalFreshness(existing)
-  }
-
-  const mergePendingApprovals = (
-    swarmId: string,
-    existing: Record<number, PendingApproval[]> | undefined,
-    incoming: Record<number, PendingApproval[]> | undefined
-  ): Record<number, PendingApproval[]> => {
-    const mergedByKey = new Map<string, { nodeId: number; approval: PendingApproval }>()
-    const incomingKeys = new Set<string>()
-
-    for (const [nodeIdRaw, approvals] of Object.entries(incoming ?? {})) {
-      const nodeId = Number(nodeIdRaw)
-      if (!Number.isFinite(nodeId)) continue
-      for (const approval of approvals ?? []) {
-        if (!approval?.call_id) continue
-        incomingKeys.add(sameApproval(nodeId, approval.call_id))
-      }
-    }
-
-    const now = Date.now()
-
-    for (const [nodeIdRaw, approvals] of Object.entries(existing ?? {})) {
-      const nodeId = Number(nodeIdRaw)
-      if (!Number.isFinite(nodeId)) continue
-      for (const approval of approvals ?? []) {
-        if (!approval?.call_id) continue
-        if (isApprovalRecentlyResolved(swarmId, nodeId, approval.call_id)) continue
-        const key = sameApproval(nodeId, approval.call_id)
-        if (!incomingKeys.has(key)) {
-          const lastTouch = Number(approval.updated_at_ms ?? approval.created_at_ms ?? 0)
-          const isBridgeStatus =
-            approval.status === 'pending' ||
-            approval.status === 'submitted'
-          const withinBridgeWindow = lastTouch > 0 && now - lastTouch <= APPROVAL_SNAPSHOT_BRIDGE_MS
-          if (!(isBridgeStatus && withinBridgeWindow)) {
-            continue
-          }
-        }
-        mergedByKey.set(key, { nodeId, approval })
-      }
-    }
-
-    for (const [nodeIdRaw, approvals] of Object.entries(incoming ?? {})) {
-      const nodeId = Number(nodeIdRaw)
-      if (!Number.isFinite(nodeId)) continue
-      for (const approval of approvals ?? []) {
-        if (!approval?.call_id) continue
-        if (isApprovalRecentlyResolved(swarmId, nodeId, approval.call_id)) continue
-        const key = sameApproval(nodeId, approval.call_id)
-        const existingApproval = mergedByKey.get(key)?.approval
-        if (isIncomingApprovalNewer(existingApproval, approval)) {
-          mergedByKey.set(key, { nodeId, approval })
-        }
-      }
-    }
-
-    const merged: Record<number, PendingApproval[]> = {}
-    for (const { nodeId, approval } of mergedByKey.values()) {
-      if (!merged[nodeId]) merged[nodeId] = []
-      merged[nodeId].push(approval)
-    }
-    for (const nodeIdRaw of Object.keys(merged)) {
-      const nodeId = Number(nodeIdRaw)
-      merged[nodeId].sort((a, b) => {
-        const tA = Number(a.created_at_ms ?? a.updated_at_ms ?? 0)
-        const tB = Number(b.created_at_ms ?? b.updated_at_ms ?? 0)
-        if (tA !== tB) return tA - tB
-        return String(a.call_id).localeCompare(String(b.call_id))
-      })
-    }
-    return merged
   }
 
   return {
@@ -490,6 +500,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         swarms.forEach((s) => {
           const existing = state.swarms[s.swarm_id]
+          const snapshotPending = parsePendingSnapshotForSwarm(s.swarm_id)
+          const hasSnapshotPending = Object.keys(snapshotPending).length > 0
 
           if (existing) {
             // Preserve existing nodes and turns, update metadata
@@ -499,8 +511,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
               known_exec_policies:
                 s.known_exec_policies ?? existing.known_exec_policies ?? [],
               pending_approvals:
-                Object.keys(parsePendingSnapshotForSwarm(s.swarm_id)).length > 0
-                  ? parsePendingSnapshotForSwarm(s.swarm_id)
+                hasSnapshotPending
+                  ? snapshotPending
                   : s.pending_approvals ?? existing.pending_approvals ?? {},
               nodes: existing.nodes
             }
@@ -515,8 +527,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
               ...s,
               known_exec_policies: [],
               pending_approvals:
-                Object.keys(parsePendingSnapshotForSwarm(s.swarm_id)).length > 0
-                  ? parsePendingSnapshotForSwarm(s.swarm_id)
+                hasSnapshotPending
+                  ? snapshotPending
                   : s.pending_approvals ?? {},
               nodes
             }
@@ -639,90 +651,18 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         for (const [swarmId, swarm] of Object.entries(state.swarms)) {
           const parsedPending = parsePendingSnapshotForSwarm(swarmId)
-          const nextPending = mergePendingApprovals(
+          const nextPending = mergeSnapshotWithStickyPending(
             swarmId,
-            swarm.pending_approvals,
-            parsedPending
+            parsedPending,
+            swarm.pending_approvals
           )
 
-          // Ensure each pending approval is represented in-turn for visibility.
+          // Pending approvals are rendered from pending_approvals only. Clear any
+          // stale per-turn approval state to avoid dual truth sources.
           const nextNodes: Record<number, NodeState> = { ...swarm.nodes }
-          for (const [nodeIdRaw, approvals] of Object.entries(nextPending)) {
-            const nodeId = Number(nodeIdRaw)
-            const node = nextNodes[nodeId]
-            if (!node) continue
-            let turns = [...node.turns]
-            const activeCallIds = new Set(
-              approvals
-                .map((a) => a.call_id)
-                .filter((v): v is string => typeof v === 'string' && v.length > 0)
-            )
-            for (const approval of approvals) {
-              const existingIdx = turns.findIndex((t) => t.approval?.call_id === approval.call_id)
-              const byInjectionIdx =
-                existingIdx >= 0
-                  ? existingIdx
-                  : approval.injection_id
-                  ? turns.findIndex((t) => t.injection_id === approval.injection_id)
-                  : -1
-              if (existingIdx >= 0) {
-                turns[existingIdx] = {
-                  ...turns[existingIdx],
-                  phase: 'awaiting_approval',
-                  approval: {
-                    call_id: approval.call_id,
-                    command: approval.command,
-                    reason: approval.reason,
-                    cwd: approval.cwd,
-                    proposed_execpolicy_amendment: approval.proposed_execpolicy_amendment,
-                    available_decisions: approval.available_decisions
-                  }
-                } as NodeTurn
-                continue
-              }
-              if (byInjectionIdx >= 0) {
-                turns[byInjectionIdx] = {
-                  ...turns[byInjectionIdx],
-                  phase: 'awaiting_approval',
-                  approval: {
-                    call_id: approval.call_id,
-                    command: approval.command,
-                    reason: approval.reason,
-                    cwd: approval.cwd,
-                    proposed_execpolicy_amendment: approval.proposed_execpolicy_amendment,
-                    available_decisions: approval.available_decisions
-                  }
-                } as NodeTurn
-              }
-            }
-            turns = turns
-              .map((t) => {
-                const callId = t.approval?.call_id
-                if (!callId) return t
-                if (activeCallIds.has(callId)) return t
-                return ({
-                  ...t,
-                  phase: t.phase === 'awaiting_approval' ? 'streaming' : t.phase,
-                  approval: undefined
-                } as NodeTurn)
-              })
-              .filter((t) => {
-                const isSynthetic = t.injection_id.startsWith('approval-')
-                const hasContent =
-                  (t.prompt ?? '').trim().length > 0 ||
-                  (t.reasoning ?? '').trim().length > 0 ||
-                  (t.deltas ?? []).some((d) => String(d ?? '').trim().length > 0)
-                return !(isSynthetic && !hasContent && !t.approval)
-              })
-            nextNodes[nodeId] = { ...node, turns: capTurns(turns) }
-          }
-
-          // For nodes without any active pending approval, clear stale turn.approval
-          // markers so fallback pending approvals are not accidentally suppressed.
           for (const [nodeIdRaw, node] of Object.entries(nextNodes)) {
             const nodeId = Number(nodeIdRaw)
             if (!Number.isFinite(nodeId)) continue
-            if (Object.prototype.hasOwnProperty.call(nextPending, nodeId)) continue
             let changed = false
             const turns = node.turns.map((t) => {
               if (!t.approval) return t
@@ -731,10 +671,22 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
                 ...t,
                 phase: t.phase === 'awaiting_approval' ? 'streaming' : t.phase,
                 approval: undefined
-              } as NodeTurn)
+                } as NodeTurn)
             })
             if (changed) {
-              nextNodes[nodeId] = { ...node, turns: capTurns(turns) }
+              nextNodes[nodeId] = {
+                ...node,
+                turns: capTurns(
+                  turns.filter((t) => {
+                    const isSynthetic = t.injection_id.startsWith('approval-')
+                    const hasContent =
+                      (t.prompt ?? '').trim().length > 0 ||
+                      (t.reasoning ?? '').trim().length > 0 ||
+                      (t.deltas ?? []).some((d) => String(d ?? '').trim().length > 0)
+                    return !(isSynthetic && !hasContent)
+                  })
+                )
+              }
             }
           }
 
@@ -1232,59 +1184,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         if (isApprovalRecentlyResolved(swarm.swarm_id, nodeId, callId)) {
           return
         }
-        const node = swarm.nodes[nodeId]
-        if (!node) return
-        const approvalState = {
-          call_id: payload.call_id,
-          command: payload.command,
-          reason: payload.reason,
-          cwd: payload.cwd,
-          proposed_execpolicy_amendment: payload.proposed_execpolicy_amendment,
-          available_decisions: payload.available_decisions
-        }
-
-        const targetIdx = node.turns.findIndex((t) => t.injection_id === payload.injection_id)
-        const fallbackIdx =
-          targetIdx >= 0
-            ? targetIdx
-            : node.turns.findIndex((t) => t.approval?.call_id === payload.call_id)
-
-        let updatedTurns: NodeTurn[]
-        let approvalTurn: NodeTurn | undefined
-        if (fallbackIdx >= 0) {
-          const mapped = node.turns.map((t, idx) =>
-            idx === fallbackIdx
-              ? ({
-                  ...t,
-                  phase: 'awaiting_approval',
-                  approval: approvalState
-                } as NodeTurn)
-              : t
-          )
-          approvalTurn = mapped[fallbackIdx]
-          updatedTurns = mapped.filter((_, idx) => idx !== fallbackIdx)
-        } else {
-          // If approval arrives before a matching turn is visible, append a
-          // synthetic turn so the dialog is never lost off-state.
-          approvalTurn = {
-            injection_id:
-              typeof payload.injection_id === 'string' && payload.injection_id
-                ? payload.injection_id
-                : `approval-${payload.call_id}`,
-            prompt: '',
-            deltas: [],
-            reasoning: '',
-            phase: 'awaiting_approval',
-            approval: approvalState
-          } as NodeTurn
-          updatedTurns = [...node.turns]
-        }
-
-        if (approvalTurn) {
-          // Keep pending approval at the tail so it is visible in active transcript
-          // even when the original turn index is older in history.
-          updatedTurns = [...updatedTurns, approvalTurn]
-        }
 
         const existingPendingForNode = (swarm.pending_approvals ?? {})[nodeId] ?? []
         const incomingPending: PendingApproval = {
@@ -1312,10 +1211,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           pending_approvals: {
             ...(swarm.pending_approvals ?? {}),
             [nodeId]: nextPendingForNode
-          },
-          nodes: {
-            ...swarm.nodes,
-            [nodeId]: { ...node, turns: capTurns(updatedTurns) }
           }
         })
         clearIdleCompletionTimer(swarm.swarm_id, nodeId, payload.injection_id)
@@ -1352,49 +1247,12 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           ? [...currentPolicies, newAmendment as string[]]
           : currentPolicies
 
-        const targetNodeKeys = hasResolvedNode
-          ? [String(resolvedNodeId)]
-          : Object.keys(updatedNodes)
-        for (const nodeKey of targetNodeKeys) {
-          const node = updatedNodes[Number(nodeKey)]
-          if (!node) continue
-
-          updatedNodes[Number(nodeKey)] = {
-            ...node,
-            turns: node.turns.map((t) => {
-              const isMatch =
-                t.approval?.call_id === payload.call_id &&
-                (!payload.injection_id || t.injection_id === payload.injection_id)
-              return isMatch
-                ? ({
-                    ...t,
-                    phase: 'streaming',
-                    approval: undefined
-                  } as NodeTurn)
-                : t
-            })
-          }
-        }
-
-        const updatedPendingApprovals: Record<number, PendingApproval[]> = {}
-        const pendingApprovals = swarm.pending_approvals ?? {}
-        for (const [nodeKey, approvals] of Object.entries(pendingApprovals)) {
-          const nodeNum = Number(nodeKey)
-          if (hasResolvedNode && nodeNum !== resolvedNodeId) {
-            if ((approvals ?? []).length > 0) {
-              updatedPendingApprovals[nodeNum] = approvals ?? []
-            }
-            continue
-          }
-          const filtered = (approvals ?? []).filter((a) => {
-            if (a.call_id !== payload.call_id) return true
-            if (!payload.injection_id) return false
-            return a.injection_id !== payload.injection_id
-          })
-          if (filtered.length > 0) {
-            updatedPendingApprovals[nodeNum] = filtered
-          }
-        }
+        const updatedPendingApprovals = markPendingApprovalStatus(
+          swarm.pending_approvals,
+          payload.call_id,
+          'resolved',
+          hasResolvedNode ? resolvedNodeId : undefined
+        )
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -1435,9 +1293,10 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         get().addOrUpdateSwarm({
           ...swarm,
-          pending_approvals: removePendingApprovalByCallId(
+          pending_approvals: markPendingApprovalStatus(
             swarm.pending_approvals,
             payload.call_id,
+            'started',
             nodeId
           ),
           nodes: {

@@ -56,6 +56,16 @@ const pendingProvidersRequests = new Map<
   string,
   { resolve: (providers: any[]) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
 >();
+const pendingApprovalsRequests = new Map<
+  string,
+  {
+    resolve: (approvals: Record<string, Record<number, ApprovalRecord[]>>) => void;
+    reject: (error: Error) => void;
+    timer: NodeJS.Timeout;
+  }
+>();
+let approvalsSyncTimer: NodeJS.Timeout | null = null;
+let approvalsSyncInFlight = false;
 type ApprovalStatus =
   | 'pending'
   | 'submitted'
@@ -180,6 +190,88 @@ function clonePendingApprovalsSnapshot() {
     snapshot[swarmId] = nodeMap;
   }
   return snapshot;
+}
+
+function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
+  const existingByKey = new Map<string, ApprovalRecord>();
+  for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
+    for (const [nodeId, approvals] of byNode.entries()) {
+      for (const approval of approvals ?? []) {
+        if (!approval?.call_id) continue;
+        existingByKey.set(`${swarmId}:${nodeId}:${approval.call_id}`, approval);
+      }
+    }
+  }
+
+  const nextBySwarm = new Map<string, Map<number, ApprovalRecord[]>>();
+  const now = Date.now();
+  const snapshot = rawSnapshot && typeof rawSnapshot === 'object' ? rawSnapshot : {};
+
+  for (const [swarmIdRaw, nodeMapRaw] of Object.entries(snapshot)) {
+    if (!nodeMapRaw || typeof nodeMapRaw !== 'object') continue;
+    const swarmId = String(swarmIdRaw);
+    const byNode = new Map<number, ApprovalRecord[]>();
+
+    for (const [nodeIdRaw, approvalsRaw] of Object.entries(nodeMapRaw as Record<string, any>)) {
+      const nodeId = normalizeNodeId(nodeIdRaw);
+      if (!Number.isFinite(nodeId)) continue;
+      const parsedNodeId = Number(nodeId);
+      if (!Array.isArray(approvalsRaw)) continue;
+
+      const approvals: ApprovalRecord[] = [];
+      for (const rawApproval of approvalsRaw) {
+        const callId = String(rawApproval?.call_id || '').trim();
+        if (!callId) continue;
+        const previous = existingByKey.get(`${swarmId}:${parsedNodeId}:${callId}`);
+        const preservedStatus =
+          previous?.status === 'submitted' || previous?.status === 'acknowledged'
+            ? previous.status
+            : 'pending';
+        const createdAtMs =
+          typeof rawApproval?.created_at_ms === 'number'
+            ? rawApproval.created_at_ms
+            : typeof rawApproval?.created_at_ts === 'number'
+            ? Math.floor(rawApproval.created_at_ts * 1000)
+            : typeof previous?.created_at_ms === 'number'
+            ? previous.created_at_ms
+            : now;
+
+        approvals.push({
+          job_id: typeof rawApproval?.job_id === 'string' ? rawApproval.job_id : previous?.job_id,
+          call_id: callId,
+          injection_id:
+            typeof rawApproval?.injection_id === 'string'
+              ? rawApproval.injection_id
+              : previous?.injection_id,
+          command: rawApproval?.command,
+          reason: typeof rawApproval?.reason === 'string' ? rawApproval.reason : '',
+          cwd: typeof rawApproval?.cwd === 'string' ? rawApproval.cwd : undefined,
+          proposed_execpolicy_amendment: rawApproval?.proposed_execpolicy_amendment,
+          available_decisions: rawApproval?.available_decisions,
+          created_at_ms: createdAtMs,
+          updated_at_ms: now,
+          approval_seq: nextApprovalSeq(),
+          status: preservedStatus,
+          submit_attempts: previous?.submit_attempts,
+          last_request_id: previous?.last_request_id
+        });
+      }
+
+      if (approvals.length > 0) {
+        approvals.sort((a, b) => a.created_at_ms - b.created_at_ms);
+        byNode.set(parsedNodeId, approvals);
+      }
+    }
+
+    if (byNode.size > 0) {
+      nextBySwarm.set(swarmId, byNode);
+    }
+  }
+
+  pendingApprovalsBySwarm.clear();
+  for (const [swarmId, byNode] of nextBySwarm.entries()) {
+    pendingApprovalsBySwarm.set(swarmId, byNode);
+  }
 }
 
 function broadcastApprovalsSnapshot() {
@@ -489,6 +581,10 @@ function handleAutoRoutingFromTaskComplete(data: any) {
 
 function requestProvidersCatalog(timeoutMs = 5000): Promise<any[]> {
   return new Promise((resolve, reject) => {
+    if (!router.isConnected()) {
+      resolve([]);
+      return;
+    }
     let request_id = '';
     try {
       request_id = sendRouterCommand('providers_list', {});
@@ -502,6 +598,55 @@ function requestProvidersCatalog(timeoutMs = 5000): Promise<any[]> {
     }, timeoutMs);
     pendingProvidersRequests.set(request_id, { resolve, reject, timer });
   });
+}
+
+function requestApprovalsSnapshot(
+  timeoutMs = 2500
+): Promise<Record<string, Record<number, ApprovalRecord[]>>> {
+  return new Promise((resolve, reject) => {
+    if (!router.isConnected()) {
+      resolve(clonePendingApprovalsSnapshot());
+      return;
+    }
+    let request_id = '';
+    try {
+      request_id = sendRouterCommand('approvals_list', {});
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error('Router unavailable'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingApprovalsRequests.delete(request_id);
+      reject(new Error('Timed out waiting for approvals_list'));
+    }, timeoutMs);
+    pendingApprovalsRequests.set(request_id, { resolve, reject, timer });
+  });
+}
+
+function stopApprovalsSyncLoop() {
+  if (approvalsSyncTimer) {
+    clearInterval(approvalsSyncTimer);
+    approvalsSyncTimer = null;
+  }
+}
+
+function startApprovalsSyncLoop() {
+  stopApprovalsSyncLoop();
+  const syncOnce = async () => {
+    if (!router.isConnected() || approvalsSyncInFlight) return;
+    approvalsSyncInFlight = true;
+    try {
+      await requestApprovalsSnapshot(2000);
+    } catch {
+      // Best-effort sync; keep the loop alive.
+    } finally {
+      approvalsSyncInFlight = false;
+    }
+  };
+  void syncOnce();
+  approvalsSyncTimer = setInterval(() => {
+    void syncOnce();
+  }, 1000);
 }
 
 function fallbackProvidersCatalog(): any[] {
@@ -656,6 +801,12 @@ router.on('event', (msg: any) => {
       call_id: typeof data?.call_id === 'string' ? data.call_id : ''
     });
     if (requestId) clearPendingLaunchTimer(requestId);
+    if (requestId && pendingApprovalsRequests.has(requestId)) {
+      const pending = pendingApprovalsRequests.get(requestId)!;
+      clearTimeout(pending.timer);
+      pendingApprovalsRequests.delete(requestId);
+      pending.reject(new Error(typeof data?.reason === 'string' ? data.reason : 'command rejected'));
+    }
     if (requestId && approvalKeyByRequestId.has(requestId)) {
       const key = approvalKeyByRequestId.get(requestId)!;
       approvalKeyByRequestId.delete(requestId);
@@ -715,6 +866,20 @@ router.on('event', (msg: any) => {
       pendingProvidersRequests.delete(requestId);
       pending.resolve(providers);
     }
+  }
+
+  if (event === 'approvals_list') {
+    const approvals = data?.approvals ?? {};
+    replacePendingApprovalsFromRouterSnapshot(approvals);
+    broadcastApprovalsSnapshot();
+    const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
+    if (requestId && pendingApprovalsRequests.has(requestId)) {
+      const pending = pendingApprovalsRequests.get(requestId)!;
+      clearTimeout(pending.timer);
+      pendingApprovalsRequests.delete(requestId);
+      pending.resolve(clonePendingApprovalsSnapshot());
+    }
+    return;
   }
 
   // --- Core conversational events (explicit mapping for backwards compatibility) ---
@@ -1067,10 +1232,17 @@ app.get('/queue', (req, res) => {
 });
 
 app.get('/approvals', (req, res) => {
-  res.json(clonePendingApprovalsSnapshot());
+  // Serve the backend cache; a background router sync loop keeps this current.
+  return res.json(clonePendingApprovalsSnapshot());
 });
 
 app.get('/providers', async (req, res) => {
+  if (!router.isConnected()) {
+    if (launchProviders.length > 0) {
+      return res.json(launchProviders);
+    }
+    return res.json(fallbackProvidersCatalog());
+  }
   try {
     let providers = await requestProvidersCatalog();
     if (!Array.isArray(providers) || providers.length === 0) {
@@ -1242,6 +1414,8 @@ async function connectWithRetry() {
       // Initial reconciliation
       sendRouterCommand('swarm_list', {});
       sendRouterCommand('queue_list', {});
+      sendRouterCommand('approvals_list', {});
+      startApprovalsSyncLoop();
 
       routerReconnectInProgress = false;
       break;
@@ -1254,6 +1428,7 @@ async function connectWithRetry() {
 
 router.on('disconnected', () => {
   console.log('Router disconnected; reconnecting...');
+  stopApprovalsSyncLoop();
   connectWithRetry().catch(() => {});
 });
 

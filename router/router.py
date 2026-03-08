@@ -131,6 +131,57 @@ def _is_recently_resolved_approval(job_id, call_id, node_id):
     return (now - float(ts)) <= RESOLVED_APPROVAL_TTL_SECONDS
 
 
+def _pending_approvals_snapshot():
+    snapshot = {}
+    # Snapshot keys first so iteration remains stable even while new
+    # approvals arrive from worker streams.
+    items = list(PENDING_APPROVALS.items())
+
+    for key, meta in items:
+        if not isinstance(key, tuple) or len(key) != 3:
+            continue
+        if not isinstance(meta, dict):
+            continue
+
+        job_id, node_id, call_id = key
+        norm_node_id = _normalize_node_id(node_id)
+        if norm_node_id is None:
+            continue
+
+        swarm_id = meta.get("swarm_id") or JOB_TO_SWARM.get(str(job_id))
+        if not swarm_id:
+            continue
+
+        created_at_ts = meta.get("created_at_ts")
+        try:
+            created_at_ms = int(float(created_at_ts) * 1000) if created_at_ts is not None else int(time.time() * 1000)
+        except Exception:
+            created_at_ms = int(time.time() * 1000)
+
+        approval = {
+            "job_id": str(job_id),
+            "call_id": str(call_id),
+            "injection_id": meta.get("injection_id"),
+            "turn_id": meta.get("turn_id"),
+            "command": meta.get("command"),
+            "reason": meta.get("reason"),
+            "cwd": meta.get("cwd"),
+            "proposed_execpolicy_amendment": meta.get("proposed_execpolicy_amendment"),
+            "available_decisions": meta.get("available_decisions"),
+            "created_at_ms": created_at_ms,
+        }
+
+        node_map = snapshot.setdefault(str(swarm_id), {})
+        node_list = node_map.setdefault(norm_node_id, [])
+        node_list.append(approval)
+
+    for node_map in snapshot.values():
+        for approvals in node_map.values():
+            approvals.sort(key=lambda a: int(a.get("created_at_ms", 0)))
+
+    return snapshot
+
+
 def save_state():
     try:
         # Snapshot mutable in-memory structures while holding the scheduler lock
@@ -1231,29 +1282,60 @@ def translate_event(event):
         )
 
     # --- Command execution normalization ---
-    if method in ("codex/event/exec_approval_request", "item/commandExecution/requestApproval"):
+    if method in (
+        "codex/event/exec_approval_request",
+        "item/commandExecution/requestApproval",
+        "codex/event/apply_patch_approval_request",
+        "item/fileChange/requestApproval",
+    ):
         params = payload.get("params", {})
         msg = params.get("msg")
         event_turn_id = None
 
         if msg:
-            # Shape A: codex/event/exec_approval_request
-            call_id = msg.get("call_id")
-            command = msg.get("command")
-            reason = msg.get("reason")
-            cwd = msg.get("cwd")
-            proposed_execpolicy_amendment = msg.get("proposed_execpolicy_amendment")
-            available_decisions = msg.get("available_decisions")
-            event_turn_id = msg.get("turn_id") or params.get("id")
+            if method == "codex/event/apply_patch_approval_request":
+                # Shape A2: codex/event/apply_patch_approval_request
+                call_id = msg.get("call_id")
+                changes = msg.get("changes")
+                command = {"changes": changes} if isinstance(changes, dict) else "Apply file changes"
+                reason = msg.get("reason") or "Approve file changes"
+                cwd = msg.get("cwd")
+                proposed_execpolicy_amendment = None
+                available_decisions = msg.get("available_decisions") or ["accept", "cancel"]
+                event_turn_id = msg.get("turn_id") or params.get("id")
+            else:
+                # Shape A: codex/event/exec_approval_request
+                call_id = msg.get("call_id")
+                command = msg.get("command")
+                reason = msg.get("reason")
+                cwd = msg.get("cwd")
+                proposed_execpolicy_amendment = msg.get("proposed_execpolicy_amendment")
+                available_decisions = msg.get("available_decisions")
+                event_turn_id = msg.get("turn_id") or params.get("id")
         else:
-            # Shape B: item/commandExecution/requestApproval
-            call_id = params.get("itemId")
-            command = params.get("command")
-            reason = params.get("reason")
-            cwd = params.get("cwd")
-            proposed_execpolicy_amendment = params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
-            available_decisions = params.get("availableDecisions") or params.get("available_decisions")
-            event_turn_id = params.get("turnId")
+            if method == "item/fileChange/requestApproval":
+                # Shape B2: item/fileChange/requestApproval
+                call_id = params.get("itemId")
+                changes = params.get("changes")
+                command = {"changes": changes} if isinstance(changes, list) else "Apply file changes"
+                reason = params.get("reason") or "Approve file changes"
+                cwd = params.get("cwd")
+                proposed_execpolicy_amendment = None
+                available_decisions = (
+                    params.get("availableDecisions")
+                    or params.get("available_decisions")
+                    or ["accept", "cancel"]
+                )
+                event_turn_id = params.get("turnId")
+            else:
+                # Shape B: item/commandExecution/requestApproval
+                call_id = params.get("itemId")
+                command = params.get("command")
+                reason = params.get("reason")
+                cwd = params.get("cwd")
+                proposed_execpolicy_amendment = params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
+                available_decisions = params.get("availableDecisions") or params.get("available_decisions")
+                event_turn_id = params.get("turnId")
 
         rpc_id = payload.get("id")
         request_id_hint = None
@@ -1909,6 +1991,12 @@ def run_daemon(config, providers):
                     "swarms": SWARMS
                 })
 
+            elif command == "approvals_list":
+                emit_event("approvals_list", {
+                    "request_id": request_id,
+                    "approvals": _pending_approvals_snapshot()
+                })
+
             elif command == "providers_list":
                 emit_event("providers_list", {
                     "request_id": request_id,
@@ -2237,7 +2325,12 @@ def run_daemon(config, providers):
                         # codex/event/exec_approval_request with params.id but
                         # do not include top-level payload.id.
                         if (
-                            approval_method == "codex/event/exec_approval_request"
+                            approval_method in (
+                                "codex/event/exec_approval_request",
+                                "codex/event/apply_patch_approval_request",
+                                "item/commandExecution/requestApproval",
+                                "item/fileChange/requestApproval",
+                            )
                             and request_id_hint is not None
                         ):
                             if has_accept:

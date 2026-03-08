@@ -140,40 +140,15 @@ export default function Home() {
   const activeIsTerminating = (active?.status ?? '').toLowerCase() === 'terminating'
   const activePendingApprovals = active
     ? (() => {
-        const merged = new Map<string, { nodeId: number; approval: PendingApproval }>()
-
+        const pending = new Map<string, { nodeId: number; approval: PendingApproval }>()
         for (const [nodeIdRaw, approvals] of Object.entries(active.pending_approvals ?? {})) {
           const nodeId = Number(nodeIdRaw)
           for (const approval of approvals ?? []) {
             if (!approval?.call_id) continue
-            merged.set(`${nodeId}:${approval.call_id}`, { nodeId, approval })
+            pending.set(`${nodeId}:${approval.call_id}`, { nodeId, approval })
           }
         }
-
-        for (const [nodeIdRaw, node] of Object.entries(active.nodes ?? {})) {
-          const nodeId = Number(nodeIdRaw)
-          for (const turn of node.turns ?? []) {
-            const approval = turn.approval
-            if (!approval?.call_id) continue
-            const key = `${nodeId}:${approval.call_id}`
-            if (merged.has(key)) continue
-            merged.set(key, {
-              nodeId,
-              approval: {
-                call_id: approval.call_id,
-                injection_id: turn.injection_id,
-                created_at_ms: 0,
-                command: approval.command,
-                reason: approval.reason,
-                cwd: approval.cwd,
-                proposed_execpolicy_amendment: approval.proposed_execpolicy_amendment,
-                available_decisions: approval.available_decisions
-              }
-            })
-          }
-        }
-
-        return Array.from(merged.values()).sort((a, b) => {
+        return Array.from(pending.values()).sort((a, b) => {
           const ta = Number(a.approval.created_at_ms ?? 0)
           const tb = Number(b.approval.created_at_ms ?? 0)
           if (ta !== tb) return ta - tb
@@ -189,9 +164,7 @@ export default function Home() {
     const node = swarm.nodes[nodeId]
     if (!node || node.turns.length === 0) return { attention: false, working: false, ready: true }
 
-    const hasApproval =
-      node.turns.some((t) => t.phase === 'awaiting_approval' && !!t.approval) ||
-      ((swarm.pending_approvals?.[nodeId]?.length ?? 0) > 0)
+    const hasApproval = (swarm.pending_approvals?.[nodeId]?.length ?? 0) > 0
     if (hasApproval) {
       return { attention: true, working: false, ready: false }
     }
@@ -449,25 +422,12 @@ export default function Home() {
     const activeNode = active.nodes[activeNodeId]
     if (!activeNode) return
 
-    const pendingTurn = activeNode.turns.find((t) => t.phase === 'awaiting_approval' && !!t.approval)
-    const turnCallIds = new Set(
-      activeNode.turns
-        .map((t) => t.approval?.call_id)
-        .filter((v): v is string => typeof v === 'string' && v.length > 0)
-    )
-    const fallbackApproval = (active.pending_approvals?.[activeNodeId] ?? []).find(
-      (a) => !turnCallIds.has(a.call_id)
-    )
-
-    if (!pendingTurn && !fallbackApproval) {
+    const pendingApproval = (active.pending_approvals?.[activeNodeId] ?? [])[0]
+    if (!pendingApproval) {
       scrolledApprovalKeyRef.current = ''
       return
     }
-    const approvalIdentity =
-      pendingTurn?.approval?.call_id ??
-      fallbackApproval?.call_id ??
-      pendingTurn?.injection_id ??
-      ''
+    const approvalIdentity = pendingApproval.call_id || pendingApproval.injection_id || ''
     const approvalKey = `${active.swarm_id}:${activeNodeId}:${approvalIdentity}`
     if (scrolledApprovalKeyRef.current === approvalKey) return
 
@@ -619,7 +579,36 @@ export default function Home() {
   }
 
   function approvalIsBusy(approval: PendingApproval) {
-    return approval.status === 'submitted' || approval.status === 'acknowledged'
+    return (
+      approval.status === 'submitted' ||
+      approval.status === 'acknowledged' ||
+      approval.status === 'started' ||
+      approval.status === 'resolved' ||
+      approval.status === 'rejected' ||
+      approval.status === 'timeout'
+    )
+  }
+
+  function formatApprovalCommand(command: PendingApproval['command']) {
+    if (Array.isArray(command)) return command.join(' ')
+    if (typeof command === 'string') return command
+    if (command && typeof command === 'object') {
+      const anyCmd = command as Record<string, any>
+      if (anyCmd.type === 'file_changes' || anyCmd.type === 'file_changes_apply') {
+        const changes = anyCmd.changes
+        if (Array.isArray(changes)) return `apply ${changes.length} file change(s)`
+        if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+        return 'apply file changes'
+      }
+      const changes = anyCmd.changes
+      if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+      try {
+        return JSON.stringify(command)
+      } catch {
+        return '[object command]'
+      }
+    }
+    return String(command ?? '')
   }
 
   function renderFallbackApprovals(
@@ -638,7 +627,7 @@ export default function Home() {
           <div key={`fallback-${approval.call_id}`} data-awaiting-approval="true" className="text-xs bg-amber-900 border border-amber-500 rounded p-2">
             <div className="text-amber-300 mb-1">Execution approval required</div>
             <div className="text-slate-200">
-              $ {Array.isArray(approval.command) ? approval.command.join(' ') : approval.command}
+              $ {formatApprovalCommand(approval.command)}
             </div>
             <div className="mt-1 text-slate-300">{approval.reason}</div>
             {approval.status && (
@@ -741,12 +730,7 @@ export default function Home() {
     nodeId: number,
     knownExecPolicies: string[][] | undefined
   ) {
-    const turnCallIds = new Set(
-      turns
-        .filter((t) => t.phase === 'awaiting_approval' && !!t.approval)
-        .map((t) => t.approval?.call_id)
-        .filter((v): v is string => typeof v === 'string' && v.length > 0)
-    )
+    const turnCallIds = new Set<string>()
     return (
       <div className="space-y-4">
         {turns.map((turn) => {
@@ -786,130 +770,6 @@ export default function Home() {
                       {turn.reasoning}
                     </div>
                   </details>
-                )}
-
-                {turn.phase === 'awaiting_approval' && turn.approval && (
-                  <div data-awaiting-approval="true" className="text-xs bg-amber-900 border border-amber-500 rounded p-2">
-                    <div className="text-amber-300 mb-1">Execution approval required</div>
-                    <div className="text-slate-200">
-                      $ {Array.isArray(turn.approval.command)
-                        ? turn.approval.command.join(' ')
-                        : turn.approval.command}
-                    </div>
-                    <div className="mt-1 text-slate-300">{turn.approval.reason}</div>
-
-                    <div className="mt-2 space-y-1 text-slate-200">
-                      <div className="font-medium text-amber-200">Approval choices</div>
-                      <div>
-                        <span className="text-emerald-300">Approve once:</span> run this command now only.
-                      </div>
-                      {approvalHasPolicyOption(turn.approval.available_decisions) && (
-                        <div>
-                          <span className="text-teal-300">Approve + save policy:</span> run now and allow similar commands later.
-                        </div>
-                      )}
-                      <div>
-                        <span className="text-rose-300">Deny:</span> reject this command.
-                      </div>
-                    </div>
-
-                    {Array.isArray(turn.approval.proposed_execpolicy_amendment) &&
-                      turn.approval.proposed_execpolicy_amendment.length > 0 && (
-                        <div className="mt-2 bg-slate-900 border border-slate-700 rounded p-2">
-                          <div className="text-slate-400">Proposed policy rule</div>
-                          <div className="mt-1 font-mono text-[11px] text-slate-200 break-words">
-                            {formatPolicyRule(turn.approval.proposed_execpolicy_amendment)}
-                          </div>
-                        </div>
-                      )}
-
-                    <div className="mt-2 bg-slate-900 border border-slate-700 rounded p-2">
-                      <div className="text-slate-400">Current policy rules (known in this session)</div>
-                      {Array.isArray(knownExecPolicies) && knownExecPolicies.length > 0 ? (
-                        <div className="mt-1 space-y-1">
-                          {knownExecPolicies.map((rule, ruleIdx) => (
-                            <div key={`${ruleIdx}-${rule.join(' ')}`} className="font-mono text-[11px] text-slate-200 break-words">
-                              {formatPolicyRule(rule)}
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="mt-1 text-slate-500">No saved policy rules recorded yet.</div>
-                      )}
-                    </div>
-
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        disabled={!!(turn.approval && approvalSubmitting[turn.approval.call_id])}
-                        className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                        onClick={async () => {
-                          const approval = turn.approval
-                          if (!approval) return
-                          await withApprovalSubmit(approval.call_id, () =>
-                            sendApproval(
-                              jobId,
-                              approval.call_id,
-                              true,
-                              approveToken(approval.available_decisions),
-                              nodeId,
-                              turn.injection_id
-                            )
-                          )
-                        }}
-                      >
-                        Approve once
-                      </button>
-
-                      {Array.isArray(turn.approval.proposed_execpolicy_amendment) &&
-                        turn.approval.proposed_execpolicy_amendment.length > 0 &&
-                        approvalHasPolicyOption(turn.approval.available_decisions) && (
-                          <button
-                            disabled={!!(turn.approval && approvalSubmitting[turn.approval.call_id])}
-                            className="px-2 py-1 bg-teal-600 rounded text-xs hover:bg-teal-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                            onClick={async () => {
-                              const approval = turn.approval
-                              if (!approval?.proposed_execpolicy_amendment) return
-                              await withApprovalSubmit(approval.call_id, () =>
-                                sendApproval(
-                                  jobId,
-                                  approval.call_id,
-                                  true,
-                                  buildPolicyDecision(
-                                    approval.available_decisions,
-                                    approval.proposed_execpolicy_amendment as string[]
-                                  ),
-                                  nodeId,
-                                  turn.injection_id
-                                )
-                              )
-                            }}
-                          >
-                            Approve + save policy
-                          </button>
-                        )}
-
-                      <button
-                        disabled={!!(turn.approval && approvalSubmitting[turn.approval.call_id])}
-                        className="px-2 py-1 bg-rose-600 rounded text-xs hover:bg-rose-500 disabled:opacity-60 disabled:cursor-not-allowed"
-                        onClick={async () => {
-                          const approval = turn.approval
-                          if (!approval) return
-                          await withApprovalSubmit(approval.call_id, () =>
-                            sendApproval(
-                              jobId,
-                              approval.call_id,
-                              false,
-                              denyToken(approval.available_decisions),
-                              nodeId,
-                              turn.injection_id
-                            )
-                          )
-                        }}
-                      >
-                        Deny
-                      </button>
-                    </div>
-                  </div>
                 )}
 
                 {turn.execution && (
@@ -1240,7 +1100,7 @@ export default function Home() {
                     <div key={`pending-${nodeId}-${approval.call_id}`} className="rounded border border-amber-700 bg-slate-900 p-2 text-xs">
                       <div className="text-amber-300 mb-1">Agent {nodeId}</div>
                       <div className="text-slate-200 break-words">
-                        $ {Array.isArray(approval.command) ? approval.command.join(' ') : approval.command}
+                        $ {formatApprovalCommand(approval.command)}
                       </div>
                       <div className="mt-1 text-slate-300">{approval.reason}</div>
                       {approval.status && (

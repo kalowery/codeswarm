@@ -46,7 +46,7 @@ export function useWebSocket() {
             .then((res) => res.json())
             .then((data) => handleMessage({ type: 'approvals_snapshot', payload: data }))
             .catch(() => {})
-        }, 2000)
+        }, 1000)
       }
 
       ws.onmessage = (event) => {
