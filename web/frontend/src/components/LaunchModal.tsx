@@ -59,7 +59,7 @@ export default function LaunchModal({ onClose }: Props) {
   const [selectedProvider, setSelectedProvider] = useState('')
   const [providerValues, setProviderValues] = useState<Record<string, string>>({})
   const [activeTab, setActiveTab] = useState<'general' | 'provider'>('general')
-  const [personaPickerOpen, setPersonaPickerOpen] = useState(false)
+  const [personaPickerMode, setPersonaPickerMode] = useState<'file' | 'directory'>('file')
   const [loading, setLoading] = useState(false)
   const [loadingProviders, setLoadingProviders] = useState(true)
   const [providersError, setProvidersError] = useState<string | null>(null)
@@ -500,37 +500,37 @@ export default function LaunchModal({ onClose }: Props) {
                   className="hidden"
                 />
                 <div className="relative">
+                  <div className="mb-2 inline-flex rounded border border-slate-700 overflow-hidden text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setPersonaPickerMode('file')}
+                      className={`px-3 py-1 ${personaPickerMode === 'file' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+                    >
+                      File
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPersonaPickerMode('directory')}
+                      className={`px-3 py-1 ${personaPickerMode === 'directory' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+                    >
+                      Directory
+                    </button>
+                  </div>
                   <button
                     type="button"
-                    onClick={() => setPersonaPickerOpen((v) => !v)}
+                    onClick={() => {
+                      if (personaPickerMode === 'directory') {
+                        agentsDirInputRef.current?.click()
+                      } else {
+                        agentsFileInputRef.current?.click()
+                      }
+                    }}
                     className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-left"
                   >
-                    Choose Persona / AGENTS…
+                    {personaPickerMode === 'directory'
+                      ? 'Choose Persona Directory…'
+                      : 'Choose AGENTS File…'}
                   </button>
-                  {personaPickerOpen && (
-                    <div className="absolute z-10 mt-1 w-full rounded border border-slate-700 bg-slate-900 shadow-lg">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPersonaPickerOpen(false)
-                          agentsFileInputRef.current?.click()
-                        }}
-                        className="block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
-                      >
-                        Select single file (copied as AGENTS.md)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setPersonaPickerOpen(false)
-                          agentsDirInputRef.current?.click()
-                        }}
-                        className="block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
-                      >
-                        Select persona directory (AGENTS.md + optional skills/)
-                      </button>
-                    </div>
-                  )}
                 </div>
                 {agentsMdName ? (
                   <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
