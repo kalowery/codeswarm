@@ -41,6 +41,7 @@ FINAL_ANSWER_SEEN = set()
 INTER_SWARM_QUEUE = defaultdict(deque)
 SCHEDULER_LOCK = threading.Lock()
 TERMINATION_IN_PROGRESS = set()
+FORCE_TERMINATION_REQUESTED = set()
 
 # Retention policy
 TERMINATED_TTL_SECONDS = 900  # 15 minutes
@@ -661,6 +662,13 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
     if not isinstance(poll_s, (int, float)) or poll_s <= 0:
         poll_s = GRACEFUL_TERMINATE_POLL_SECONDS
 
+    force_now = False
+    if isinstance(terminate_overrides, dict):
+        force_now = bool(terminate_overrides.get("force", False))
+    with SCHEDULER_LOCK:
+        if str(swarm_id) in FORCE_TERMINATION_REQUESTED:
+            force_now = True
+
     # If no nodes are currently active, stale outstanding counters should not
     # block shutdown. Clear them once at terminate start.
     node_count = int(swarm.get("node_count") or 0)
@@ -699,12 +707,18 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
 
     deadline = time.time() + float(timeout_s)
     timed_out = False
-    while time.time() < deadline:
-        if _is_swarm_quiescent_for_termination(swarm_id):
-            break
-        time.sleep(float(poll_s))
-    else:
-        timed_out = True
+    if not force_now:
+        while time.time() < deadline:
+            with SCHEDULER_LOCK:
+                if str(swarm_id) in FORCE_TERMINATION_REQUESTED:
+                    force_now = True
+            if force_now:
+                break
+            if _is_swarm_quiescent_for_termination(swarm_id):
+                break
+            time.sleep(float(poll_s))
+        else:
+            timed_out = True
 
     terminate_params = swarm.get("provider_params") if isinstance(swarm, dict) else None
     if not isinstance(terminate_params, dict):
@@ -736,6 +750,7 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
             "message": f"graceful terminate timed out for swarm {swarm_id}; forced termination"
         })
     with SCHEDULER_LOCK:
+        FORCE_TERMINATION_REQUESTED.discard(str(swarm_id))
         TERMINATION_IN_PROGRESS.discard(str(swarm_id))
 
 
@@ -2479,6 +2494,8 @@ def run_daemon(config, providers):
 
                 with SCHEDULER_LOCK:
                     if str(swarm_id) in TERMINATION_IN_PROGRESS:
+                        # Repeated terminate requests escalate to forced termination.
+                        FORCE_TERMINATION_REQUESTED.add(str(swarm_id))
                         # Treat repeated terminate requests as idempotent while
                         # termination is already underway.
                         emit_event("swarm_status", {

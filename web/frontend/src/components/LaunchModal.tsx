@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 interface Props {
   onClose: () => void
@@ -59,9 +59,12 @@ export default function LaunchModal({ onClose }: Props) {
   const [selectedProvider, setSelectedProvider] = useState('')
   const [providerValues, setProviderValues] = useState<Record<string, string>>({})
   const [activeTab, setActiveTab] = useState<'general' | 'provider'>('general')
+  const [personaPickerOpen, setPersonaPickerOpen] = useState(false)
   const [loading, setLoading] = useState(false)
   const [loadingProviders, setLoadingProviders] = useState(true)
   const [providersError, setProvidersError] = useState<string | null>(null)
+  const agentsFileInputRef = useRef<HTMLInputElement | null>(null)
+  const agentsDirInputRef = useRef<HTMLInputElement | null>(null)
 
   useEffect(() => {
     const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
@@ -271,6 +274,7 @@ export default function LaunchModal({ onClose }: Props) {
     const selected = e.target.files
     if (!selected || selected.length === 0) {
       clearAgentsSelection()
+      e.target.value = ''
       return
     }
 
@@ -290,6 +294,7 @@ export default function LaunchModal({ onClose }: Props) {
         agents_md_content: text,
         skills_files: []
       })
+      e.target.value = ''
       return
     }
 
@@ -298,6 +303,7 @@ export default function LaunchModal({ onClose }: Props) {
     if (!rootName) {
       alert('Unable to resolve selected directory.')
       clearAgentsSelection()
+      e.target.value = ''
       return
     }
 
@@ -306,6 +312,7 @@ export default function LaunchModal({ onClose }: Props) {
     if (!agentsFile) {
       alert('Selected directory must contain AGENTS.md at its root.')
       clearAgentsSelection()
+      e.target.value = ''
       return
     }
 
@@ -335,6 +342,7 @@ export default function LaunchModal({ onClose }: Props) {
       agents_md_content: agentsText,
       skills_files: skillsFiles
     })
+    e.target.value = ''
   }
 
   const renderProviderFields = () => {
@@ -477,12 +485,53 @@ export default function LaunchModal({ onClose }: Props) {
               <div>
                 <label className="block text-sm text-slate-400 mb-1">Agent Persona or AGENTS file (optional)</label>
                 <input
+                  ref={agentsFileInputRef}
+                  type="file"
+                  multiple
+                  onChange={handleAgentsSelection}
+                  className="hidden"
+                />
+                <input
+                  ref={agentsDirInputRef}
                   type="file"
                   multiple
                   onChange={handleAgentsSelection}
                   {...({ webkitdirectory: 'true', directory: '' } as any)}
-                  className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 file:mr-3 file:rounded file:border-0 file:bg-slate-700 file:px-3 file:py-1 file:text-slate-100"
+                  className="hidden"
                 />
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => setPersonaPickerOpen((v) => !v)}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-left"
+                  >
+                    Choose Persona / AGENTS…
+                  </button>
+                  {personaPickerOpen && (
+                    <div className="absolute z-10 mt-1 w-full rounded border border-slate-700 bg-slate-900 shadow-lg">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPersonaPickerOpen(false)
+                          agentsFileInputRef.current?.click()
+                        }}
+                        className="block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+                      >
+                        Select single file (copied as AGENTS.md)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPersonaPickerOpen(false)
+                          agentsDirInputRef.current?.click()
+                        }}
+                        className="block w-full px-3 py-2 text-left text-sm text-slate-200 hover:bg-slate-800"
+                      >
+                        Select persona directory (AGENTS.md + optional skills/)
+                      </button>
+                    </div>
+                  )}
+                </div>
                 {agentsMdName ? (
                   <p className="mt-1 text-xs text-slate-500">Selected: {agentsMdName}</p>
                 ) : (

@@ -262,13 +262,28 @@ rm -rf "$TMP"
         from ..router import start_remote_follower
         return start_remote_follower(self.config)
 
+    def _resolve_slurm_mailbox_base(self) -> str:
+        cluster_cfg = self.config.get("cluster", {})
+        slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+
+        workspace_root = str(
+            slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root") or ""
+        ).rstrip("/")
+        cluster_subdir = str(
+            slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir") or ""
+        ).strip("/")
+
+        if not workspace_root or not cluster_subdir:
+            raise RuntimeError("Missing Slurm workspace_root/cluster_subdir")
+
+        return f"{workspace_root}/{cluster_subdir}"
+
     def inject(self, job_id, node_id, content, injection_id):
         login_alias = self.config["ssh"]["login_alias"]
-        workspace_root = self.config["cluster"]["workspace_root"]
-        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+        base = self._resolve_slurm_mailbox_base()
 
         inbox_path = (
-            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
+            f"{base}/mailbox/inbox/"
             f"{job_id}_{int(node_id):02d}.jsonl"
         )
 
@@ -296,11 +311,10 @@ rm -rf "$TMP"
         via SSH, mirroring the inject() path.
         """
         login_alias = self.config["ssh"]["login_alias"]
-        workspace_root = self.config["cluster"]["workspace_root"]
-        cluster_subdir = self.config["cluster"]["cluster_subdir"]
+        base = self._resolve_slurm_mailbox_base()
 
         inbox_path = (
-            f"{workspace_root}/{cluster_subdir}/mailbox/inbox/"
+            f"{base}/mailbox/inbox/"
             f"{job_id}_{int(node_id):02d}.jsonl"
         )
 

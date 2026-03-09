@@ -6,6 +6,8 @@ import time
 import base64
 import shlex
 import json
+import os
+import shutil
 from pathlib import Path
 from pathlib import PurePosixPath
 
@@ -13,6 +15,37 @@ from pathlib import PurePosixPath
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from common.config import load_config
+
+MIN_PYTHON = (3, 10)
+if sys.version_info < MIN_PYTHON and os.environ.get("CODESWARM_PY_REEXEC") != "1":
+    candidates = ["python3.13", "python3.12", "python3.11", "python3.10", "python3", "python"]
+    for candidate in candidates:
+        candidate_path = shutil.which(candidate)
+        if not candidate_path:
+            continue
+        probe = subprocess.run(
+            [candidate_path, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            continue
+        try:
+            major, minor = [int(part) for part in probe.stdout.strip().split(".")[:2]]
+        except Exception:
+            continue
+        if (major, minor) >= MIN_PYTHON:
+            os.environ["CODESWARM_PY_REEXEC"] = "1"
+            os.execv(candidate_path, [candidate_path, *sys.argv])
+
+if sys.version_info < MIN_PYTHON:
+    print(
+        f"ERROR: slurm/allocate_and_prepare.py requires Python "
+        f"{MIN_PYTHON[0]}.{MIN_PYTHON[1]}+; found "
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}. "
+        f"No suitable python3.10+ interpreter was auto-discovered."
+    )
+    sys.exit(1)
 
 
 def run(cmd, input_text=None):
