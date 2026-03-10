@@ -558,6 +558,39 @@ async function runWebStack(opts: any) {
 
   const children: any[] = [];
 
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function checkHttpReady(url: string, timeoutMs: number): Promise<boolean> {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      return response.status < 500;
+    } catch {
+      return false;
+    }
+  }
+
+  async function waitForWebReady(timeoutMs: number): Promise<boolean> {
+    const start = Date.now();
+    const frontendUrl = "http://localhost:3000";
+    const backendUrl = "http://localhost:4000/swarms";
+
+    while (Date.now() - start < timeoutMs) {
+      const [frontendReady, backendReady] = await Promise.all([
+        checkHttpReady(frontendUrl, 1500),
+        checkHttpReady(backendUrl, 1500),
+      ]);
+      if (frontendReady && backendReady) {
+        return true;
+      }
+      await sleep(500);
+    }
+
+    return false;
+  }
+
   function spawnWithPrefix(name: string, cmd: string, args: string[], cwd?: string) {
     const child = spawn(cmd, args, {
       cwd,
@@ -594,24 +627,32 @@ async function runWebStack(opts: any) {
   // Frontend (dev mode)
   spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
 
-  // Attempt to open browser (best-effort, fully safe)
+  // Attempt to open browser (best-effort) once services are actually reachable.
   if (!opts.noOpen) {
-    try {
-      const url = "http://localhost:3000";
-      const opener = process.platform === "darwin" ? "open" : "xdg-open";
+    const ready = await waitForWebReady(120000);
 
-      const browser = spawn(opener, [url], {
-        detached: true,
-        stdio: "ignore",
-      });
+    if (!ready) {
+      console.warn(
+        "[web] Warning: Services did not become ready within 120s; skipping automatic browser launch."
+      );
+    } else {
+      try {
+        const url = "http://localhost:3000";
+        const opener = process.platform === "darwin" ? "open" : "xdg-open";
 
-      browser.on("error", () => {
+        const browser = spawn(opener, [url], {
+          detached: true,
+          stdio: "ignore",
+        });
+
+        browser.on("error", () => {
+          console.warn("[web] Warning: Could not open browser automatically.");
+        });
+
+        browser.unref();
+      } catch {
         console.warn("[web] Warning: Could not open browser automatically.");
-      });
-
-      browser.unref();
-    } catch {
-      console.warn("[web] Warning: Could not open browser automatically.");
+      }
     }
   }
 
