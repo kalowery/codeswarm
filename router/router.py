@@ -48,9 +48,34 @@ TERMINATED_TTL_SECONDS = 900  # 15 minutes
 MAX_TERMINATED = 100
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
+DEFAULT_AGENTS_FILE = Path(__file__).resolve().parents[1] / "AGENTS.md"
 GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
 GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
 RESOLVED_APPROVAL_TTL_SECONDS = 180
+
+
+def _normalize_agents_text(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text if text else None
+
+
+def _load_default_agents_md():
+    try:
+        return _normalize_agents_text(DEFAULT_AGENTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _merge_agents_md(default_md, user_md):
+    base = _normalize_agents_text(default_md)
+    user = _normalize_agents_text(user_md)
+    if not base:
+        return user
+    if not user:
+        return base
+    return f"{base}\n\n{user}"
 
 
 def _normalize_node_id(value):
@@ -1766,18 +1791,17 @@ def run_daemon(config, providers):
                 system_prompt = payload.get("system_prompt", "")
                 agents_md_content = payload.get("agents_md_content")
                 agents_bundle = payload.get("agents_bundle")
+                default_agents_md = _load_default_agents_md()
                 provider_id = payload.get("provider")
                 provider_params = payload.get("provider_params")
-                if not isinstance(agents_md_content, str) or not agents_md_content.strip():
-                    agents_md_content = None
+                agents_md_content = _normalize_agents_text(agents_md_content)
                 if not isinstance(agents_bundle, dict):
                     agents_bundle = None
                 else:
                     bundle_md = agents_bundle.get("agents_md_content")
                     mode = agents_bundle.get("mode")
                     raw_skills = agents_bundle.get("skills_files")
-                    if not isinstance(bundle_md, str) or not bundle_md.strip():
-                        bundle_md = None
+                    bundle_md = _normalize_agents_text(bundle_md)
                     if mode not in ("file", "directory"):
                         mode = "file"
                     skills_files = []
@@ -1803,6 +1827,13 @@ def run_daemon(config, providers):
                     }
                     if bundle_md is None and not skills_files:
                         agents_bundle = None
+                if agents_bundle is not None:
+                    agents_bundle["agents_md_content"] = _merge_agents_md(
+                        default_agents_md,
+                        agents_bundle.get("agents_md_content"),
+                    )
+                else:
+                    agents_md_content = _merge_agents_md(default_agents_md, agents_md_content)
                 if not isinstance(provider_params, dict):
                     provider_params = {}
 

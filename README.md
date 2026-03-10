@@ -178,6 +178,8 @@ Launch UI behavior:
 - if a single file is selected, its content is copied into each worker workspace root as `AGENTS.md` (filename does not matter)
 - if a directory is selected, only root `AGENTS.md` and files under `skills/` are copied
 - persona skills are copied into each worker workspace root under `.agents/skills/...`
+- repo root `AGENTS.md` is always prepended as a default baseline
+- if no user file/directory AGENTS content is provided, the repo root `AGENTS.md` is used by itself
 
 Sample personas are provided under:
 

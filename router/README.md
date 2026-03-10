@@ -92,10 +92,12 @@ Payload:
 Behavior:
 1. Selects launch provider backend.
 2. Passes merged `defaults + provider_params` to provider launch.
-2. Extracts `job_id`.
-3. Registers new `swarm_id`.
-4. Emits `swarm_launched`.
-5. Injects `system_prompt` into all nodes asynchronously.
+3. Prepends repo-root `AGENTS.md` to any provided `agents_md_content` / `agents_bundle.agents_md_content`.
+4. If no AGENTS content is provided, repo-root `AGENTS.md` is used as default.
+5. Extracts `job_id`.
+6. Registers new `swarm_id`.
+7. Emits `swarm_launched`.
+8. Injects `system_prompt` into all nodes asynchronously.
 
 ---
 

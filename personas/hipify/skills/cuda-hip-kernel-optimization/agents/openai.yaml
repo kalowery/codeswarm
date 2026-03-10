@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUDA HIP Kernel Optimization"
+  short_description: "Map CUDA tuning patterns to ROCm/CK equivalents."
+  default_prompt: "Given a CUDA kernel, produce a HIP optimization plan covering tiling, wave/warp mapping, LDS usage, and vectorization constraints."

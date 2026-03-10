@@ -77,6 +77,7 @@ In UI:
 - optionally select an Agent Persona input:
   - single file: copied as `AGENTS.md`
   - persona directory: must contain root `AGENTS.md`; `skills/` is optional
+- baseline `AGENTS.md` from repo root is prepended automatically
 - launch
 
 Router emits `swarm_launched`, then injects the system prompt to all nodes.
@@ -87,6 +88,7 @@ When a persona directory is selected, each worker workspace receives:
 
 - `AGENTS.md` in workspace root
 - `.agents/skills/...` (only files under persona `skills/`)
+- the final `AGENTS.md` content always starts with repo root `AGENTS.md`, then selected persona/file content
 
 Files outside persona `AGENTS.md` and `skills/` are ignored.
 

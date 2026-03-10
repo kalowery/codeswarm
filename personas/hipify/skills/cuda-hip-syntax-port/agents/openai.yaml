@@ -1,0 +1,4 @@
+interface:
+  display_name: "CUDA to HIP Syntax Port"
+  short_description: "Convert CUDA APIs and kernels to HIP safely."
+  default_prompt: "Port CUDA code to HIP with minimal behavioral drift, then report unsupported intrinsics and required manual rewrites."
