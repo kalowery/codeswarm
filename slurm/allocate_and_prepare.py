@@ -52,8 +52,20 @@ def run(cmd, input_text=None):
     return subprocess.run(cmd, input=input_text, capture_output=True, text=True)
 
 
-def ssh_login(login_alias, cmd, input_text=None):
-    return run(["ssh", login_alias, cmd], input_text=input_text)
+def ssh_login(login_host, cmd, input_text=None):
+    return run(["ssh", login_host, cmd], input_text=input_text)
+
+
+def resolve_login_host(config):
+    cluster_cfg = config.get("cluster", {})
+    slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+    host = slurm_cfg.get("login_host")
+    if isinstance(host, str) and host.strip():
+        return host.strip()
+    legacy = slurm_cfg.get("login_alias")
+    if isinstance(legacy, str) and legacy.strip():
+        return legacy.strip()
+    raise RuntimeError("Slurm login_host not configured in cluster.slurm")
 
 
 def resolve_slurm_paths(config):
@@ -152,7 +164,7 @@ def build_sbatch_script(args, config):
 
 
 def ensure_codex_ready(config):
-    login_alias = config["ssh"]["login_alias"]
+    login_host = resolve_login_host(config)
     workspace_root, cluster_subdir = resolve_slurm_paths(config)
 
     tools_dir = f"{workspace_root}/{cluster_subdir}/tools"
@@ -163,7 +175,7 @@ def ensure_codex_ready(config):
     beads_bin = f"{npm_prefix}/bin/beads"
 
     # Ensure Node/npm exist in workspace
-    if ssh_login(login_alias, f'test -x "{npm_bin}"').returncode != 0:
+    if ssh_login(login_host, f'test -x "{npm_bin}"').returncode != 0:
         print("ERROR: Node/npm not found in workspace tools directory.")
         print(f"Expected npm at: {npm_bin}")
         sys.exit(1)
@@ -171,13 +183,13 @@ def ensure_codex_ready(config):
     # Ensure codex installed in workspace (version pinned)
     CODEX_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
 
-    if ssh_login(login_alias, f'test -x "{codex_bin}"').returncode != 0:
+    if ssh_login(login_host, f'test -x "{codex_bin}"').returncode != 0:
         print("Codex not found in workspace. Installing...")
         install_cmd = (
             f'NPM_CONFIG_PREFIX="{npm_prefix}" '
             f'"{npm_bin}" install -g @openai/codex@{CODEX_VERSION}'
         )
-        result = ssh_login(login_alias, install_cmd)
+        result = ssh_login(login_host, install_cmd)
         if result.returncode != 0:
             print("Codex installation failed:")
             print(result.stderr)
@@ -187,27 +199,27 @@ def ensure_codex_ready(config):
     # by host-specific npm/nvm settings.
     BEADS_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
 
-    if ssh_login(login_alias, f'test -x "{beads_bin}"').returncode != 0:
+    if ssh_login(login_host, f'test -x "{beads_bin}"').returncode != 0:
         print("beads not found in workspace. Installing (optional)...")
         install_cmd = (
             f'NPM_CONFIG_PREFIX="{npm_prefix}" '
             f'"{npm_bin}" install -g beads@{BEADS_VERSION}'
         )
-        result = ssh_login(login_alias, install_cmd)
+        result = ssh_login(login_host, install_cmd)
         if result.returncode != 0:
             print("WARNING: beads installation failed; continuing without beads.")
             if result.stderr:
                 print(result.stderr)
 
     # Verify installed codex version (defensive check)
-    version_check = ssh_login(login_alias, f'"{codex_bin}" --version')
+    version_check = ssh_login(login_host, f'"{codex_bin}" --version')
     if version_check.returncode != 0:
         print("ERROR: Codex binary exists but failed to execute --version.")
         print(version_check.stderr)
         sys.exit(1)
 
-    if ssh_login(login_alias, f'test -x "{beads_bin}"').returncode == 0:
-        beads_version_check = ssh_login(login_alias, f'"{beads_bin}" --version')
+    if ssh_login(login_host, f'test -x "{beads_bin}"').returncode == 0:
+        beads_version_check = ssh_login(login_host, f'"{beads_bin}" --version')
         if beads_version_check.returncode != 0:
             print("WARNING: beads binary exists but failed to execute --version; continuing.")
             if beads_version_check.stderr:
@@ -215,7 +227,7 @@ def ensure_codex_ready(config):
 
     # Check for existing Codex home configuration
     codex_home_check = ssh_login(
-        login_alias,
+        login_host,
         'test -d "$HOME/.codex"'
     )
 
@@ -226,7 +238,7 @@ def ensure_codex_ready(config):
     print("No ~/.codex directory found. Codex not authenticated.")
 
     # Ensure OPENAI_API_KEY exists on login node
-    key_check = ssh_login(login_alias, 'test -n "$OPENAI_API_KEY"')
+    key_check = ssh_login(login_host, 'test -n "$OPENAI_API_KEY"')
 
     if key_check.returncode != 0:
         print("\nERROR:")
@@ -238,7 +250,7 @@ def ensure_codex_ready(config):
 
     print("Authenticating Codex using OPENAI_API_KEY...")
     login_result = ssh_login(
-        login_alias,
+        login_host,
         f'printf "%s" "$OPENAI_API_KEY" | "{codex_bin}" login --with-api-key'
     )
 
@@ -249,7 +261,7 @@ def ensure_codex_ready(config):
 
     # Verify ~/.codex now exists
     verify_home = ssh_login(
-        login_alias,
+        login_host,
         'test -d "$HOME/.codex"'
     )
 
@@ -261,7 +273,7 @@ def ensure_codex_ready(config):
 
 
 def ensure_partition_capacity(args, config):
-    login_alias = config["ssh"]["login_alias"]
+    login_host = resolve_login_host(config)
 
     slurm_cfg = config.get("cluster", {}).get("slurm", {})
 
@@ -275,7 +287,7 @@ def ensure_partition_capacity(args, config):
         sys.exit(1)
 
     result = ssh_login(
-        login_alias,
+        login_host,
         f'sinfo -h -p {partition} -o "%D %t"'
     )
 
@@ -310,7 +322,7 @@ def ensure_partition_capacity(args, config):
 
 
 def submit_job(args, config):
-    login_alias = config["ssh"]["login_alias"]
+    login_host = resolve_login_host(config)
 
     script = build_sbatch_script(args, config)
 
@@ -318,7 +330,7 @@ def submit_job(args, config):
     print(script)
     print("----- SBATCH SCRIPT END -----")
 
-    result = ssh_login(login_alias, "sbatch", input_text=script)
+    result = ssh_login(login_host, "sbatch", input_text=script)
 
     if result.returncode != 0:
         print(result.stderr)
@@ -332,10 +344,10 @@ def submit_job(args, config):
 
 
 def wait_running(job_id, config):
-    login_alias = config["ssh"]["login_alias"]
+    login_host = resolve_login_host(config)
 
     while True:
-        result = ssh_login(login_alias, f"squeue -j {job_id} -h -o %T")
+        result = ssh_login(login_host, f"squeue -j {job_id} -h -o %T")
         state = result.stdout.strip()
 
         if state == "RUNNING":
@@ -372,7 +384,7 @@ if __name__ == "__main__":
 
     workspace_root, cluster_subdir = resolve_slurm_paths(config)
     hpc_base = f"{workspace_root}/{cluster_subdir}"
-    login_alias = config["ssh"]["login_alias"]
+    login_host = resolve_login_host(config)
 
     # ✅ DEPLOY AGENT DIRECTORY (worker + follower) BEFORE SUBMISSION
     if args.launch_codex_run:
@@ -380,7 +392,7 @@ if __name__ == "__main__":
         agent_remote_dir = f"{hpc_base}/agent"
 
         # Ensure remote directory exists
-        ssh_login(login_alias, f"mkdir -p {agent_remote_dir}")
+        ssh_login(login_host, f"mkdir -p {agent_remote_dir}")
 
         # Rsync entire agent directory (codex_worker.py, outbox_follower.py, future utilities)
         subprocess.run(
@@ -388,7 +400,7 @@ if __name__ == "__main__":
                 "rsync",
                 "-az",
                 str(agent_local_dir) + "/",
-                f"{login_alias}:{agent_remote_dir}/",
+                f"{login_host}:{agent_remote_dir}/",
             ],
             check=True,
         )
@@ -407,7 +419,7 @@ if __name__ == "__main__":
     # ✅ CREATE RUN DIRECTORIES AFTER JOB ID EXISTS
     if args.launch_codex_run:
         run_base = f"{hpc_base}/runs/{job_id}"
-        ssh_login(login_alias, f"mkdir -p {run_base}")
+        ssh_login(login_host, f"mkdir -p {run_base}")
         agents_md_content = None
         agents_bundle = None
         if args.agents_md_b64:
@@ -445,23 +457,23 @@ if __name__ == "__main__":
 
         for i in range(args.nodes):
             agent_dir = f"{run_base}/agent_{i:02d}"
-            ssh_login(login_alias, f"mkdir -p {agent_dir}")
+            ssh_login(login_host, f"mkdir -p {agent_dir}")
             ssh_login(
-                login_alias,
+                login_host,
                 f'echo "Agent {i}: Say hello in one short sentence." > {agent_dir}/PROMPT.txt'
             )
             if agents_md_content is not None:
                 ssh_login(
-                    login_alias,
+                    login_host,
                     f"cat > {shlex.quote(agent_dir + '/AGENTS.md')}",
                     input_text=agents_md_content,
                 )
             for rel_path, content in skill_files:
                 remote_file = f"{agent_dir}/.agents/skills/{rel_path}"
                 remote_dir = str(PurePosixPath(remote_file).parent)
-                ssh_login(login_alias, f"mkdir -p {shlex.quote(remote_dir)}")
+                ssh_login(login_host, f"mkdir -p {shlex.quote(remote_dir)}")
                 ssh_login(
-                    login_alias,
+                    login_host,
                     f"cat > {shlex.quote(remote_file)}",
                     input_text=content,
                 )

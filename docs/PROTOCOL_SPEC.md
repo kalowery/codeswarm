@@ -426,6 +426,7 @@ Backend now inspects `task_complete` final assistant output and auto-submits any
 line-level directives matching:
 
 - `/swarm[alias]/idle ...`
+- `/swarm[alias]/idle/reply ...`
 - `/swarm[alias]/first-idle ...`
 - `/swarm[alias]/all ...`
 - `/swarm[alias]/node[0,2-4] ...`
@@ -436,5 +437,6 @@ Behavior:
 - processing is deduplicated per `injection_id` to avoid duplicate dispatch on repeated events
 - unknown target aliases are ignored and emitted to clients as `auto_route_ignored`
 - successful submissions are emitted as `auto_route_submitted`
+- when `/reply` is present, backend tracks request/injection correlation and emits a return inject to the originating node on destination `task_complete` (`auto_reply_submitted` / `auto_reply_ignored`)
 
 These are backend-emitted UI events, not router-native protocol events.

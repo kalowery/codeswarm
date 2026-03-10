@@ -93,6 +93,8 @@ These events are emitted by backend orchestration logic (not direct router norma
 
 - `auto_route_submitted`
 - `auto_route_ignored`
+- `auto_reply_submitted`
+- `auto_reply_ignored`
 
 Forward compatibility rule:
 

@@ -1,7 +1,5 @@
-import { WebSocketServer } from 'ws';
-
 export class WebSocketHub {
-  constructor(private wss: WebSocketServer) {}
+  constructor(private wss: any) {}
 
   broadcast(message: any) {
     const data = JSON.stringify(message);

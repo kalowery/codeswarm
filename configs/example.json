@@ -1,34 +1,62 @@
 {
-  "ssh": {
-    "login_alias": "your-slurm-login-alias"
-  },
   "cluster": {
     "local": {
       "workspace_root": "runs",
       "archive_root": "/tmp/codeswarm-archives"
     },
     "slurm": {
-      "workspace_root": "/path/to/slurm/shared/workspace",
-      "cluster_subdir": "codeswarm",
-      "partition": "compute",
-      "time_limit": "00:30:00",
-      "account": "your-slurm-account",
-      "qos": "normal"
+      "profiles": {
+        "default": {
+          "login_host": "your-slurm-login-host",
+          "workspace_root": "/path/to/slurm/shared/workspace",
+          "cluster_subdir": "codeswarm",
+          "partition": "compute",
+          "time_limit": "00:30:00",
+          "account": "your-slurm-account",
+          "qos": "normal"
+        },
+        "secondary": {
+          "login_host": "your-other-slurm-login-host",
+          "workspace_root": "/path/to/other/slurm/workspace",
+          "cluster_subdir": "codeswarm",
+          "partition": "compute",
+          "time_limit": "00:30:00"
+        }
+      }
     },
     "aws": {
-      "workspace_root": "/workspace",
-      "cluster_subdir": "codeswarm",
-      "region": "us-east-1",
-      "ami_id": "ami-0123456789abcdef0",
-      "subnet_id": "subnet-0123456789abcdef0",
-      "security_group_id": "sg-0123456789abcdef0",
-      "key_name": "codeswarm-keypair",
-      "ssh_user": "ubuntu",
-      "ssh_private_key_path": "~/.ssh/codeswarm-keypair.pem",
-      "instance_type": "c7i.4xlarge",
-      "workers_per_node": 2,
-      "ebs_volume_size_gb": 200,
-      "delete_ebs_on_shutdown": false
+      "profiles": {
+        "default": {
+          "workspace_root": "/workspace",
+          "cluster_subdir": "codeswarm",
+          "region": "us-east-1",
+          "ami_id": "ami-0123456789abcdef0",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "security_group_id": "sg-0123456789abcdef0",
+          "key_name": "codeswarm-keypair",
+          "ssh_user": "ubuntu",
+          "ssh_private_key_path": "~/.ssh/codeswarm-keypair.pem",
+          "instance_type": "c7i.4xlarge",
+          "workers_per_node": 2,
+          "ebs_volume_size_gb": 200,
+          "delete_ebs_on_shutdown": false
+        },
+        "gpu": {
+          "workspace_root": "/workspace",
+          "cluster_subdir": "codeswarm",
+          "region": "us-east-1",
+          "ami_id": "ami-0123456789abcdef0",
+          "subnet_id": "subnet-0123456789abcdef0",
+          "security_group_id": "sg-0123456789abcdef0",
+          "key_name": "codeswarm-keypair",
+          "ssh_user": "ubuntu",
+          "ssh_private_key_path": "~/.ssh/codeswarm-keypair.pem",
+          "instance_type": "g6.4xlarge",
+          "workers_per_node": 1,
+          "ebs_volume_size_gb": 300,
+          "delete_ebs_on_shutdown": false
+        }
+      }
     }
   },
   "router": {
@@ -43,12 +71,26 @@
     {
       "id": "slurm-default",
       "label": "Slurm Cluster",
-      "backend": "slurm"
+      "backend": "slurm",
+      "cluster_profile": "default"
+    },
+    {
+      "id": "slurm-secondary",
+      "label": "Slurm Secondary",
+      "backend": "slurm",
+      "cluster_profile": "secondary"
     },
     {
       "id": "aws-default",
       "label": "AWS EC2",
-      "backend": "aws"
+      "backend": "aws",
+      "cluster_profile": "default"
+    },
+    {
+      "id": "aws-gpu",
+      "label": "AWS GPU",
+      "backend": "aws",
+      "cluster_profile": "gpu"
     }
   ]
 }

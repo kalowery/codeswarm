@@ -1535,7 +1535,7 @@ export default function Home() {
                 }}
               />
               <div className="text-xs text-slate-500 mt-1">
-                Enter to send. Supported prefixes: <code>/all</code>, <code>/agent[0,2-4]</code>, <code>/swarm[alias]/idle</code>, <code>/swarm[alias]/all</code>, <code>/swarm[alias]/agent[...]</code>.
+                Enter to send. Supported prefixes: <code>/all</code>, <code>/agent[0,2-4]</code>, <code>/swarm[alias]/idle</code>, <code>/swarm[alias]/idle/reply</code>, <code>/swarm[alias]/all</code>, <code>/swarm[alias]/agent[...]</code>.
               </div>
             </div>
           </div>

@@ -47,7 +47,7 @@ npm --prefix web/frontend run dev
 ### Slurm mode
 
 - backend: `cluster.backend = "slurm"`
-- requires `ssh.login_alias` and `cluster.slurm.*`
+- requires `cluster.slurm.login_host` (or profile-specific `cluster.slurm.profiles.<name>.login_host`) and `cluster.slurm.*`
 - mailbox under `<workspace_root>/<cluster_subdir>/mailbox`
 
 ### AWS mode
@@ -63,7 +63,10 @@ npm --prefix web/frontend run dev
 
 - optional config key: `launch_providers`
 - each entry declares a launch preset: `id`, `label`, `backend` (`local`/`slurm`/`aws`)
+- optional `cluster_profile` (or legacy `cluster_config`) binds a preset to a named backend profile
 - optional `defaults` and `launch_fields` let providers expose custom launch UI inputs
+- backend profiles live under `cluster.<backend>.profiles.<name>`
+  - useful for multiple AWS variants (cpu/gpu) and multiple Slurm login nodes/partitions
 
 ## 3. Launch a swarm
 
@@ -101,6 +104,7 @@ UI supports:
 - specific node: `/node[3] your prompt`
 - multiple nodes/ranges: `/node[0,2-4] your prompt`
 - cross-swarm idle queue: `/swarm[target-alias]/idle your prompt`
+- cross-swarm idle queue with return routing: `/swarm[target-alias]/idle/reply your prompt`
 - cross-swarm first idle alias: `/swarm[target-alias]/first-idle your prompt`
 - cross-swarm all nodes: `/swarm[target-alias]/all your prompt`
 - cross-swarm specific nodes: `/swarm[target-alias]/node[0,2-4] your prompt`
@@ -141,6 +145,7 @@ Backend forwards to router `/approval`, and router sends normalized control mess
 - reasoning: `reasoning_delta`, `reasoning`
 - inter-swarm queue/routing: `queue_updated`, `inter_swarm_enqueued`, `inter_swarm_dispatched`, `inter_swarm_blocked`, `inter_swarm_dropped`
 - auto-routing outcomes: `auto_route_submitted`, `auto_route_ignored`
+- reply-routing outcomes: `auto_reply_submitted`, `auto_reply_ignored`
 - command execution: `command_started`, `command_completed`
 - approvals: `exec_approval_required`, `exec_approval_resolved`
 - token usage: `usage`
@@ -151,11 +156,13 @@ Backend forwards to router `/approval`, and router sends normalized control mess
 When a node finishes a task, backend inspects final assistant output (`task_complete`) for line-level directives:
 
 - `/swarm[alias]/idle ...`
+- `/swarm[alias]/idle/reply ...`
 - `/swarm[alias]/first-idle ...`
 - `/swarm[alias]/all ...`
 - `/swarm[alias]/node[...] ...`
 
 Matching lines are auto-submitted as new routes, enabling chained multi-swarm execution.
+When `/reply` is used, backend correlates destination completion and injects the result back to the original sender node as a follow-up prompt.
 
 ## 9. Terminate a swarm
 

@@ -13,7 +13,7 @@ This document reflects the configuration keys currently used by router and provi
 }
 ```
 
-`ssh` is required for `slurm` backend and optional for `local`/`aws` backend.
+`ssh` is optional. Slurm login routing is configured via `cluster.slurm.login_host` (or profile-specific `cluster.slurm.profiles.<name>.login_host`).
 
 ## `cluster`
 
@@ -47,9 +47,9 @@ Required:
 
 - `cluster.workspace_root` or `cluster.slurm.workspace_root`
 - `cluster.cluster_subdir` or `cluster.slurm.cluster_subdir`
+- `cluster.slurm.login_host` (or `cluster.slurm.profiles.<name>.login_host`)
 - `cluster.slurm.partition`
 - `cluster.slurm.time_limit`
-- `ssh.login_alias`
 
 Optional:
 
@@ -65,6 +65,7 @@ Example:
     "workspace_root": "/path/to/workspace",
     "cluster_subdir": "codeswarm",
     "slurm": {
+      "login_host": "my-cluster",
       "partition": "compute",
       "time_limit": "00:20:00",
       "account": null,
@@ -72,9 +73,6 @@ Example:
       "workspace_root": "/path/to/slurm/workspace",
       "cluster_subdir": "codeswarm"
     }
-  },
-  "ssh": {
-    "login_alias": "my-cluster"
   }
 }
 ```
@@ -98,21 +96,45 @@ Optional but recommended for mixed environments. Each preset includes:
 - `id`: UI/provider id (string)
 - `label`: UI label (string)
 - `backend`: `local` | `slurm` | `aws`
+- `cluster_profile` (optional): selects a named backend profile under `cluster.<backend>.profiles`
+  - legacy alias: `cluster_config`
 - `defaults` (optional): default provider params
 - `launch_fields` / `launch_panels` (optional): UI form metadata
+
+### Backend profiles (optional)
+
+Each backend config can define multiple named profiles under `profiles`:
+
+```json
+{
+  "cluster": {
+    "aws": {
+      "profiles": {
+        "default": { "region": "us-east-1", "instance_type": "c7i.4xlarge", "...": "..." },
+        "gpu": { "region": "us-east-1", "instance_type": "g6.4xlarge", "...": "..." }
+      }
+    },
+    "slurm": {
+      "profiles": {
+        "hpcfund": { "login_host": "hpcfund", "partition": "mi2508x", "...": "..." },
+        "lab2": { "login_host": "lab2", "partition": "compute", "...": "..." }
+      }
+    }
+  },
+  "launch_providers": [
+    { "id": "aws-cpu", "label": "AWS CPU", "backend": "aws", "cluster_profile": "default" },
+    { "id": "aws-gpu", "label": "AWS GPU", "backend": "aws", "cluster_profile": "gpu" },
+    { "id": "slurm-hpcfund", "label": "Slurm HPCFund", "backend": "slurm", "cluster_profile": "hpcfund" }
+  ]
+}
+```
 
 ## `ssh`
 
 ### `ssh.login_alias`
 
-Required for slurm backend. Used for:
-
-- `squeue` state checks
-- `scancel` termination
-- remote inbox writes
-- remote outbox follower launch
-
-Other `ssh.*` keys may exist (for operator use), but current router/provider code only consumes `login_alias`.
+Legacy/deprecated alias for `cluster.slurm.login_host` in older configs.
+New configs should use `login_host` under `cluster.slurm` or `cluster.slurm.profiles.<name>`.
 
 ## `router`
 

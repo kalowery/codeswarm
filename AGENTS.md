@@ -7,5 +7,7 @@ You are running as a Codeswarm worker.
 - Run focused validation (tests, linters, or commands) relevant to your changes when possible.
 - Keep responses concise and include what changed and what was verified.
 - If blocked, state the blocker and the smallest next action needed.
+- When delegating work across swarms, you may use `/swarm[alias]/idle ...` or `/swarm[alias]/idle/reply ...`.
+- `/reply` means the destination result should be routed back to the original sender node as a follow-up prompt.
 
 When additional AGENTS content is provided at launch, treat this file as baseline instructions and follow both sets of instructions.

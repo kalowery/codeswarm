@@ -133,7 +133,7 @@ Core principles:
 ### Slurm
 
 - Submits jobs through `slurm/allocate_and_prepare.py`.
-- Uses SSH (`ssh.login_alias`) for `squeue`, `scancel`, inbox writes, and outbox follower.
+- Uses SSH (`cluster.slurm.login_host`, or profile-specific `cluster.slurm.profiles.<name>.login_host`) for `squeue`, `scancel`, inbox writes, and outbox follower.
 - Mailbox under `<workspace_root>/<cluster_subdir>/mailbox`.
 
 ## Control Commands
@@ -156,6 +156,7 @@ UI prompt syntax supports both intra-swarm and cross-swarm targeting:
 - `/all ...`
 - `/node[0,2-4] ...`
 - `/swarm[alias]/idle ...`
+- `/swarm[alias]/idle/reply ...`
 - `/swarm[alias]/first-idle ...`
 - `/swarm[alias]/all ...`
 - `/swarm[alias]/node[0,2-4] ...`
@@ -192,6 +193,7 @@ Sample personas are provided under:
 Backend inspects `task_complete` final assistant output and auto-submits any line that matches cross-swarm syntax:
 
 - `/swarm[alias]/idle ...`
+- `/swarm[alias]/idle/reply ...`
 - `/swarm[alias]/first-idle ...`
 - `/swarm[alias]/all ...`
 - `/swarm[alias]/node[...] ...`

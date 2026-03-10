@@ -18,6 +18,7 @@ class AwsProvider(ClusterProvider):
         self.config = config
         self.cluster_cfg = config.get("cluster", {})
         self.aws_cfg = self.cluster_cfg.get("aws", {})
+        self._provider_ref = str(config.get("_provider_ref") or "aws")
 
         self.region = str(self.aws_cfg.get("region") or "").strip()
         self.ami_id = str(self.aws_cfg.get("ami_id") or "").strip()
@@ -26,14 +27,19 @@ class AwsProvider(ClusterProvider):
         self.ssh_user = str(self.aws_cfg.get("ssh_user") or "ubuntu").strip()
         raw_key_path = str(self.aws_cfg.get("ssh_private_key_path") or "").strip()
         self.ssh_private_key_path = str(Path(raw_key_path).expanduser()) if raw_key_path else ""
-        self.workspace_root = str(self.cluster_cfg.get("workspace_root") or "").rstrip("/")
-        self.cluster_subdir = str(self.cluster_cfg.get("cluster_subdir") or "").strip("/")
+        self.workspace_root = str(
+            self.aws_cfg.get("workspace_root") or self.cluster_cfg.get("workspace_root") or ""
+        ).rstrip("/")
+        self.cluster_subdir = str(
+            self.aws_cfg.get("cluster_subdir") or self.cluster_cfg.get("cluster_subdir") or ""
+        ).strip("/")
         self.base_path = f"{self.workspace_root}/{self.cluster_subdir}"
 
         if not self.region:
             raise RuntimeError("Missing AWS region in cluster.aws.region")
 
-        self.state_file = Path(__file__).resolve().parents[1] / "aws_provider_state.json"
+        safe_ref = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in self._provider_ref)
+        self.state_file = Path(__file__).resolve().parents[1] / f"aws_provider_state_{safe_ref}.json"
         self._state_cache = self._load_state()
 
     def _load_state(self) -> dict:

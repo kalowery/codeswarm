@@ -275,25 +275,25 @@ def load_state():
 
 def reconcile(providers):
     global JOB_TO_SWARM
-    running_jobs_by_backend = {}
-    for backend, provider in providers.items():
+    running_jobs_by_provider = {}
+    for provider_ref, provider in providers.items():
         try:
-            running_jobs_by_backend[backend] = provider.list_active_jobs()
+            running_jobs_by_provider[provider_ref] = provider.list_active_jobs()
         except Exception:
-            running_jobs_by_backend[backend] = {}
+            running_jobs_by_provider[provider_ref] = {}
 
     JOB_TO_SWARM.clear()
 
     to_remove = []
 
     for swarm_id, swarm in SWARMS.items():
-        backend = swarm.get("provider") or swarm.get("backend")
-        if not backend and providers:
-            backend = next(iter(providers.keys()))
-            swarm["provider"] = backend
+        provider_ref = swarm.get("provider") or swarm.get("backend")
+        if not provider_ref and providers:
+            provider_ref = next(iter(providers.keys()))
+            swarm["provider"] = provider_ref
 
         job_id = swarm.get("job_id")
-        running_jobs = running_jobs_by_backend.get(str(backend), {})
+        running_jobs = running_jobs_by_provider.get(str(provider_ref), {})
         if job_id in running_jobs:
             swarm["status"] = "running"
             JOB_TO_SWARM[job_id] = swarm_id
@@ -706,10 +706,19 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
             for node_id in range(node_count):
                 NODE_OUTSTANDING[_node_key(swarm_id, node_id)] = 0
 
-    provider_backend = str(swarm.get("provider") or "").strip().lower()
+    provider_backend = str(swarm.get("provider_backend") or "").strip().lower()
     if not provider_backend:
         provider_backend = str(swarm.get("backend") or "").strip().lower()
-    if provider_backend and provider_backend not in PROVIDERS:
+    if not provider_backend:
+        provider_ref = str(swarm.get("provider") or "").strip().lower()
+        if provider_ref in PROVIDERS:
+            resolved = next(
+                (item for item in PROVIDER_SPECS if str(item.get("provider_ref", "")).strip().lower() == provider_ref),
+                None,
+            )
+            if isinstance(resolved, dict):
+                provider_backend = str(resolved.get("backend") or "").strip().lower()
+    if provider_backend and provider_backend not in {str(item.get("backend") or "").strip().lower() for item in PROVIDER_SPECS}:
         # Some persisted states may store provider_id here; resolve to backend.
         spec = next(
             (item for item in PROVIDER_SPECS if str(item.get("id", "")).strip().lower() == provider_backend),
@@ -1007,9 +1016,14 @@ def execute_synthetic_approved_command(meta, job_id, call_id):
 # ================================
 
 def start_remote_follower(config):
-    login_alias = config["ssh"]["login_alias"]
     cluster_cfg = config.get("cluster", {})
     slurm_cfg = cluster_cfg.get("slurm", {}) if isinstance(cluster_cfg, dict) else {}
+    login_host = slurm_cfg.get("login_host")
+    if not isinstance(login_host, str) or not login_host.strip():
+        login_host = slurm_cfg.get("login_alias")
+    if not isinstance(login_host, str) or not login_host.strip():
+        raise RuntimeError("Slurm login_host not configured in cluster.slurm")
+    login_host = login_host.strip()
     workspace_root = slurm_cfg.get("workspace_root") or cluster_cfg.get("workspace_root")
     cluster_subdir = slurm_cfg.get("cluster_subdir") or cluster_cfg.get("cluster_subdir")
 
@@ -1021,7 +1035,7 @@ def start_remote_follower(config):
     )
 
     return subprocess.Popen(
-        ["ssh", login_alias, remote_cmd],
+        ["ssh", login_host, remote_cmd],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0
@@ -1848,7 +1862,8 @@ def run_daemon(config, providers):
                     })
                     continue
                 provider_backend = provider_spec.get("backend")
-                launch_provider = _provider_for_id(provider_backend)
+                provider_ref = provider_spec.get("provider_ref") or provider_backend
+                launch_provider = _provider_for_id(provider_ref)
                 if not launch_provider:
                     emit_event("command_rejected", {
                         "request_id": request_id,
@@ -1900,7 +1915,8 @@ def run_daemon(config, providers):
                     "node_count": nodes,
                     "system_prompt": system_prompt,
                     "status": "running",
-                    "provider": provider_backend,
+                    "provider": provider_ref,
+                    "provider_backend": provider_backend,
                     "provider_id": provider_id,
                     "provider_params": effective_launch_params,
                 }
@@ -2606,15 +2622,21 @@ def main():
     load_state()
 
     # Migration: ensure terminated swarms have terminated_at and provider binding.
-    default_backend = PROVIDER_SPECS[0]["backend"] if PROVIDER_SPECS else None
+    default_provider_ref = PROVIDER_SPECS[0].get("provider_ref") if PROVIDER_SPECS else None
+    default_provider_backend = PROVIDER_SPECS[0].get("backend") if PROVIDER_SPECS else None
     for swarm in SWARMS.values():
         if swarm.get("status") == "terminated" and "terminated_at" not in swarm:
             swarm["terminated_at"] = time.time()
         if "provider" not in swarm:
             if swarm.get("backend"):
                 swarm["provider"] = swarm.get("backend")
-            elif default_backend:
-                swarm["provider"] = default_backend
+            elif default_provider_ref:
+                swarm["provider"] = default_provider_ref
+        if "provider_backend" not in swarm:
+            if swarm.get("backend"):
+                swarm["provider_backend"] = swarm.get("backend")
+            elif default_provider_backend:
+                swarm["provider_backend"] = default_provider_backend
     save_state()
 
     reconcile(PROVIDERS)

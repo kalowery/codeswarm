@@ -27,7 +27,7 @@ state.clearAll();
 const hub = new WebSocketHub(wss);
 let routerReconnectInProgress = false;
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws: any) => {
   try {
     ws.send(
       JSON.stringify({
@@ -50,6 +50,30 @@ let interSwarmQueueItems: any[] = [];
 const requestPromptMap = new Map<string, string>();
 const injectionPromptMap = new Map<string, string>();
 const processedAutoRoutes = new Set<string>();
+const pendingReplyRoutesByRequestId = new Map<
+  string,
+  {
+    sourceSwarmId: string;
+    sourceAlias: string;
+    sourceNodeId: number;
+    targetSwarmId: string;
+    targetAlias: string;
+    sourceInjectionId: string;
+  }
+>();
+const replyRoutesByInjectionId = new Map<
+  string,
+  {
+    sourceSwarmId: string;
+    sourceAlias: string;
+    sourceNodeId: number;
+    targetSwarmId: string;
+    targetAlias: string;
+    targetNodeId: number;
+    sourceInjectionId: string;
+  }
+>();
+const processedReplyRoutes = new Set<string>();
 const workspaceDownloads = new Map<string, { archivePath: string; archiveName: string; createdAt: number }>();
 let launchProviders: any[] = [];
 const pendingProvidersRequests = new Map<
@@ -322,7 +346,7 @@ function findApprovalRecord(jobId: string, callId: string, nodeId?: number) {
         (a) => String(a.call_id) === String(callId) && String(a.job_id || '') === String(jobId || '')
       );
       if (idx >= 0) {
-        return { swarmId, nodeId: currentNodeId, byNode, approvals, idx, approval: approvals[idx] };
+        return { swarmId, nodeId: currentNodeId, byNode, approvals, idx, approval: approvals[idx]! };
       }
     }
   }
@@ -340,6 +364,8 @@ function transitionApprovalStatus(
   const updated: ApprovalRecord = {
     ...found.approval,
     ...patch,
+    call_id: found.approval.call_id,
+    created_at_ms: Number(found.approval.created_at_ms ?? now),
     status,
     updated_at_ms: now,
     approval_seq: nextApprovalSeq()
@@ -384,10 +410,25 @@ function clearPendingApprovalsForSwarm(swarmId: string) {
   approvalKeyByRequestId.clear();
 }
 
+function clearReplyRoutesForSwarm(swarmId: string) {
+  if (!swarmId) return;
+  for (const [requestId, route] of pendingReplyRoutesByRequestId.entries()) {
+    if (route.sourceSwarmId === swarmId || route.targetSwarmId === swarmId) {
+      pendingReplyRoutesByRequestId.delete(requestId);
+    }
+  }
+  for (const [injectionId, route] of replyRoutesByInjectionId.entries()) {
+    if (route.sourceSwarmId === swarmId || route.targetSwarmId === swarmId) {
+      replyRoutesByInjectionId.delete(injectionId);
+      processedReplyRoutes.delete(injectionId);
+    }
+  }
+}
+
 type AutoRouteDirective =
-  | { targetAlias?: string; mode: 'idle'; prompt: string }
-  | { targetAlias?: string; mode: 'all'; prompt: string }
-  | { targetAlias?: string; mode: 'nodes'; prompt: string; nodes: number[] };
+  | { targetAlias?: string; mode: 'idle'; prompt: string; replyToSender?: boolean }
+  | { targetAlias?: string; mode: 'all'; prompt: string; replyToSender?: boolean }
+  | { targetAlias?: string; mode: 'nodes'; prompt: string; nodes: number[]; replyToSender?: boolean };
 
 function parseNodeSpec(expr: string): number[] {
   const resolved = new Set<number>();
@@ -429,7 +470,7 @@ function extractText(value: any): string {
 
 function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
   const directives: AutoRouteDirective[] = [];
-  const startRegex = /^(?:\s*(?:[-*+]|\d+\.)\s+|\s*>\s+)?(\/(?:swarm\[[^\]\r\n]+\]\/(?:all|idle|first-idle|(?:agent|node)\[[^\]\r\n]+\])|all|(?:agent|node)\[[^\]\r\n]+\]))(?:\s+|$)/gm;
+  const startRegex = /^(?:\s*(?:[-*+]|\d+\.)\s+|\s*>\s+)?(\/(?:swarm\[[^\]\r\n]+\]\/(?:all|idle|first-idle|(?:agent|node)\[[^\]\r\n]+\])(?:\/reply)?|all|(?:agent|node)\[[^\]\r\n]+\]))(?:\s+|$)/gm;
   const commands: Array<{ command: string; lineStart: number; bodyStart: number }> = [];
 
   for (const match of text.matchAll(startRegex)) {
@@ -445,6 +486,7 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
 
   for (let i = 0; i < commands.length; i += 1) {
     const current = commands[i];
+    if (!current) continue;
     const next = commands[i + 1];
     const prompt = text
       .slice(current.bodyStart, next ? next.lineStart : text.length)
@@ -454,27 +496,47 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
     const command = current.command;
 
     if (command.startsWith('/swarm[')) {
-      const crossAllMatch = command.match(/^\/swarm\[(.+?)\]\/all$/);
+      const crossAllMatch = command.match(/^\/swarm\[(.+?)\]\/all(?:\/reply)?$/);
       if (crossAllMatch) {
         const targetAlias = (crossAllMatch[1] ?? '').trim();
-        if (targetAlias) directives.push({ targetAlias, mode: 'all', prompt });
+        if (targetAlias) {
+          directives.push({
+            targetAlias,
+            mode: 'all',
+            prompt,
+            replyToSender: command.endsWith('/reply')
+          });
+        }
         continue;
       }
 
-      const crossIdleMatch = command.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)$/);
+      const crossIdleMatch = command.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)(?:\/reply)?$/);
       if (crossIdleMatch) {
         const targetAlias = (crossIdleMatch[1] ?? '').trim();
-        if (targetAlias) directives.push({ targetAlias, mode: 'idle', prompt });
+        if (targetAlias) {
+          directives.push({
+            targetAlias,
+            mode: 'idle',
+            prompt,
+            replyToSender: command.endsWith('/reply')
+          });
+        }
         continue;
       }
 
-      const crossAgentMatch = command.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\]$/);
+      const crossAgentMatch = command.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\](?:\/reply)?$/);
       if (crossAgentMatch) {
         const targetAlias = (crossAgentMatch[1] ?? '').trim();
         const expr = (crossAgentMatch[2] ?? '').trim();
         const nodes = parseNodeSpec(expr);
         if (targetAlias && nodes.length > 0) {
-          directives.push({ targetAlias, mode: 'nodes', prompt, nodes });
+          directives.push({
+            targetAlias,
+            mode: 'nodes',
+            prompt,
+            nodes,
+            replyToSender: command.endsWith('/reply')
+          });
         }
       }
       continue;
@@ -498,6 +560,97 @@ function parseAutoRouteDirectives(text: string): AutoRouteDirective[] {
   return directives;
 }
 
+function registerReplyRouteRequest(
+  requestId: string,
+  sourceSwarm: any,
+  targetSwarm: any,
+  sourceNodeId: number | undefined,
+  sourceInjectionId: string
+) {
+  if (!requestId || !sourceSwarm || !targetSwarm) return;
+  if (!Number.isFinite(sourceNodeId)) return;
+  pendingReplyRoutesByRequestId.set(requestId, {
+    sourceSwarmId: String(sourceSwarm.swarm_id),
+    sourceAlias: String(sourceSwarm.alias),
+    sourceNodeId: Number(sourceNodeId),
+    targetSwarmId: String(targetSwarm.swarm_id),
+    targetAlias: String(targetSwarm.alias),
+    sourceInjectionId
+  });
+}
+
+function tryFinalizeReplyRouteOnInjectAck(data: any) {
+  const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
+  if (!requestId) return;
+  const pending = pendingReplyRoutesByRequestId.get(requestId);
+  if (!pending) return;
+
+  const injectionId = typeof data?.injection_id === 'string' ? data.injection_id : '';
+  const targetNodeId = normalizeNodeId(data?.node_id);
+  const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
+  if (!injectionId || !Number.isFinite(targetNodeId) || !swarmId) return;
+  if (swarmId !== pending.targetSwarmId) return;
+
+  replyRoutesByInjectionId.set(injectionId, {
+    ...pending,
+    targetNodeId: Number(targetNodeId)
+  });
+}
+
+function handleReplyRouteFromTaskComplete(data: any) {
+  const injectionId = typeof data?.injection_id === 'string' ? data.injection_id : '';
+  if (!injectionId || processedReplyRoutes.has(injectionId)) return;
+  const route = replyRoutesByInjectionId.get(injectionId);
+  if (!route) return;
+  processedReplyRoutes.add(injectionId);
+
+  const finalText = extractText(data?.last_agent_message).trim();
+  if (!finalText) return;
+
+  const returnPrompt =
+    `[Reply from /swarm[${route.targetAlias}]/node[${route.targetNodeId}] ` +
+    `for request ${route.sourceInjectionId}]\n${finalText}`;
+
+  try {
+    const request_id = sendRouterCommand('inject', {
+      swarm_id: route.sourceSwarmId,
+      nodes: [route.sourceNodeId],
+      content: returnPrompt
+    });
+    requestSwarmMap[request_id] = route.sourceSwarmId;
+    requestPromptMap.set(request_id, returnPrompt);
+    hub.broadcast({
+      type: 'auto_reply_submitted',
+      payload: {
+        request_id,
+        source_swarm_id: route.sourceSwarmId,
+        source_alias: route.sourceAlias,
+        source_node_id: route.sourceNodeId,
+        target_swarm_id: route.targetSwarmId,
+        target_alias: route.targetAlias,
+        target_node_id: route.targetNodeId,
+        source_injection_id: route.sourceInjectionId,
+        target_injection_id: injectionId
+      }
+    });
+  } catch {
+    hub.broadcast({
+      type: 'auto_reply_ignored',
+      payload: {
+        source_swarm_id: route.sourceSwarmId,
+        source_alias: route.sourceAlias,
+        source_node_id: route.sourceNodeId,
+        target_swarm_id: route.targetSwarmId,
+        target_alias: route.targetAlias,
+        target_node_id: route.targetNodeId,
+        source_injection_id: route.sourceInjectionId,
+        target_injection_id: injectionId,
+        reason: 'router unavailable'
+      }
+    });
+  }
+}
+
 function handleAutoRoutingFromFinalText(data: any, finalText: string) {
   const injectionId = typeof data?.injection_id === 'string' ? data.injection_id : '';
   if (!injectionId || processedAutoRoutes.has(injectionId)) return;
@@ -507,6 +660,7 @@ function handleAutoRoutingFromFinalText(data: any, finalText: string) {
 
   const sourceSwarm = state.getById(sourceSwarmId);
   if (!sourceSwarm) return;
+  const sourceNodeId = normalizeNodeId(data?.node_id);
 
   const normalizedText = finalText.trim();
   if (!normalizedText) return;
@@ -544,6 +698,15 @@ function handleAutoRoutingFromFinalText(data: any, finalText: string) {
       });
       requestSwarmMap[request_id] = targetSwarm.swarm_id;
       requestPromptMap.set(request_id, directive.prompt);
+      if (directive.replyToSender) {
+        registerReplyRouteRequest(
+          request_id,
+          sourceSwarm,
+          targetSwarm,
+          sourceNodeId,
+          injectionId
+        );
+      }
       hub.broadcast({
         type: 'auto_route_submitted',
         payload: {
@@ -554,7 +717,8 @@ function handleAutoRoutingFromFinalText(data: any, finalText: string) {
           target_alias: targetSwarm.alias,
           selector: directive.mode,
           nodes: directive.mode === 'nodes' ? directive.nodes : undefined,
-          injection_id: injectionId
+          injection_id: injectionId,
+          reply_to_sender: Boolean(directive.replyToSender)
         }
       });
     } catch {
@@ -567,7 +731,8 @@ function handleAutoRoutingFromFinalText(data: any, finalText: string) {
           target_alias: targetSwarm.alias,
           reason: 'router unavailable',
           injection_id: injectionId,
-          mode: directive.mode
+          mode: directive.mode,
+          reply_to_sender: Boolean(directive.replyToSender)
         }
       });
     }
@@ -811,14 +976,17 @@ router.on('event', (msg: any) => {
       const key = approvalKeyByRequestId.get(requestId)!;
       approvalKeyByRequestId.delete(requestId);
       const [jobId, nodeIdRaw, callId] = key.split(':');
-      const parsedNode = Number(nodeIdRaw);
-      transitionApprovalStatus(
-        { jobId, callId, nodeId: Number.isFinite(parsedNode) ? parsedNode : undefined },
-        'rejected'
-      );
+      if (jobId && callId) {
+        const parsedNode = Number(nodeIdRaw);
+        transitionApprovalStatus(
+          { jobId, callId, nodeId: Number.isFinite(parsedNode) ? parsedNode : undefined },
+          'rejected'
+        );
+      }
       broadcastApprovalsSnapshot();
     }
     if (requestId) {
+      pendingReplyRoutesByRequestId.delete(requestId);
       resolveApprovalAckByRequestId(requestId, {
         type: 'rejected',
         reason: typeof data?.reason === 'string' ? data.reason : 'command rejected',
@@ -833,6 +1001,7 @@ router.on('event', (msg: any) => {
       data.prompt = prompt;
       injectionPromptMap.set(data.injection_id, prompt);
     }
+    tryFinalizeReplyRouteOnInjectAck(data);
   }
 
   if (event === 'swarm_launched') {
@@ -953,6 +1122,7 @@ router.on('event', (msg: any) => {
     if (typeof data?.injection_id === 'string') {
       injectionPromptMap.delete(data.injection_id);
     }
+    handleReplyRouteFromTaskComplete(data);
     handleAutoRoutingFromTaskComplete(data);
   }
 
@@ -1031,6 +1201,7 @@ router.on('event', (msg: any) => {
 
   if (event === 'swarm_terminated') {
     clearPendingApprovalsForSwarm(data.swarm_id);
+    clearReplyRoutesForSwarm(data.swarm_id);
     broadcastApprovalsSnapshot();
     state.remove(data.swarm_id);
     hub.broadcast({ type: 'swarm_removed', payload: data });
@@ -1040,6 +1211,7 @@ router.on('event', (msg: any) => {
   // Handle router-driven removal (TTL prune or other cleanup)
   if (event === 'swarm_removed') {
     clearPendingApprovalsForSwarm(data.swarm_id);
+    clearReplyRoutesForSwarm(data.swarm_id);
     broadcastApprovalsSnapshot();
     state.remove(data.swarm_id);
     hub.broadcast({ type: 'swarm_removed', payload: data });
