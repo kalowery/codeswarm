@@ -66,6 +66,82 @@ export default function LaunchModal({ onClose }: Props) {
   const agentsFileInputRef = useRef<HTMLInputElement | null>(null)
   const agentsDirInputRef = useRef<HTMLInputElement | null>(null)
 
+  const applyPersonaSelection = (
+    rootName: string,
+    agentsText: string,
+    skillsFiles: AgentsSkillFile[]
+  ) => {
+    setAgentsMdName(`${rootName}/ (persona directory)`)
+    setAgentsMdContent(agentsText)
+    setAgentsBundle({
+      mode: 'directory',
+      agents_md_content: agentsText,
+      skills_files: skillsFiles
+    })
+  }
+
+  const handlePersonaDirectoryPicker = async () => {
+    const showDirectoryPickerFn =
+      (globalThis as any).showDirectoryPicker ?? (window as any).showDirectoryPicker
+    if (typeof showDirectoryPickerFn !== 'function') {
+      // Legacy fallback for browsers/environments where showDirectoryPicker is unavailable.
+      // handleAgentsSelection still whitelists only AGENTS.md and skills/** payload content.
+      agentsDirInputRef.current?.click()
+      return
+    }
+
+    try {
+      const rootHandle = await showDirectoryPickerFn.call(window)
+      const rootName = String(rootHandle?.name || 'persona')
+      setAgentsMdName(`${rootName}/ (persona directory)`)
+
+      let agentsFileHandle: any
+      try {
+        agentsFileHandle = await rootHandle.getFileHandle('AGENTS.md')
+      } catch {
+        alert('Selected directory must contain AGENTS.md at its root.')
+        clearAgentsSelection()
+        return
+      }
+
+      const agentsText = await (await agentsFileHandle.getFile()).text()
+
+      const collectSkills = async (
+        dirHandle: any,
+        prefix = ''
+      ): Promise<AgentsSkillFile[]> => {
+        const out: AgentsSkillFile[] = []
+        for await (const entry of dirHandle.values()) {
+          const name = String(entry?.name || '')
+          if (!name) continue
+          const rel = prefix ? `${prefix}/${name}` : name
+          if (entry.kind === 'file') {
+            const content = await (await entry.getFile()).text()
+            out.push({ path: rel, content })
+          } else if (entry.kind === 'directory') {
+            out.push(...(await collectSkills(entry, rel)))
+          }
+        }
+        return out
+      }
+
+      let skillsFiles: AgentsSkillFile[] = []
+      try {
+        const skillsHandle = await rootHandle.getDirectoryHandle('skills')
+        skillsFiles = await collectSkills(skillsHandle)
+      } catch {
+        skillsFiles = []
+      }
+
+      applyPersonaSelection(rootName, agentsText, skillsFiles)
+    } catch (err: any) {
+      const name = String(err?.name || '')
+      if (name === 'AbortError') return
+      alert('Unable to read selected directory. Ensure AGENTS.md exists at root and try again.')
+      clearAgentsSelection()
+    }
+  }
+
   useEffect(() => {
     const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
     setLoadingProviders(true)
@@ -316,16 +392,17 @@ export default function LaunchModal({ onClose }: Props) {
       return
     }
 
+    const rootPrefix = `${rootName}/`
     const skillsPrefix = `${rootName}/skills/`
-    const skillEntries = files
-      .map((file) => {
-        const rel = String((file as any).webkitRelativePath || '')
-        if (!rel.startsWith(skillsPrefix)) return null
-        const skillRelPath = rel.slice(skillsPrefix.length)
-        if (!skillRelPath || skillRelPath.endsWith('/')) return null
-        return { file, skillRelPath }
-      })
-      .filter((entry): entry is { file: File; skillRelPath: string } => entry !== null)
+    const skillEntries: Array<{ file: File; skillRelPath: string }> = []
+    for (const file of files) {
+      const rel = String((file as any).webkitRelativePath || '')
+      if (!rel.startsWith(rootPrefix)) continue
+      if (!rel.startsWith(skillsPrefix)) continue
+      const skillRelPath = rel.slice(skillsPrefix.length)
+      if (!skillRelPath || skillRelPath.endsWith('/')) continue
+      skillEntries.push({ file, skillRelPath })
+    }
 
     const agentsText = await agentsFile.text()
     const skillsFiles: AgentsSkillFile[] = await Promise.all(
@@ -335,13 +412,7 @@ export default function LaunchModal({ onClose }: Props) {
       }))
     )
 
-    setAgentsMdName(`${rootName}/ (persona directory)`)
-    setAgentsMdContent(agentsText)
-    setAgentsBundle({
-      mode: 'directory',
-      agents_md_content: agentsText,
-      skills_files: skillsFiles
-    })
+    applyPersonaSelection(rootName, agentsText, skillsFiles)
     e.target.value = ''
   }
 
@@ -520,16 +591,18 @@ export default function LaunchModal({ onClose }: Props) {
                     type="button"
                     onClick={() => {
                       if (personaPickerMode === 'directory') {
-                        agentsDirInputRef.current?.click()
+                        void handlePersonaDirectoryPicker()
                       } else {
                         agentsFileInputRef.current?.click()
                       }
                     }}
                     className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 text-left"
                   >
-                    {personaPickerMode === 'directory'
-                      ? 'Choose Persona Directory…'
-                      : 'Choose AGENTS File…'}
+                    {agentsMdName
+                      ? `Selected: ${agentsMdName}`
+                      : personaPickerMode === 'directory'
+                        ? 'Choose Persona Directory…'
+                        : 'Choose AGENTS File…'}
                   </button>
                 </div>
                 {agentsMdName ? (

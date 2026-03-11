@@ -46,13 +46,17 @@ class SlurmProvider(ClusterProvider):
         config_path = None
         temp_config_path = None
         try:
+            runtime_config = dict(self.config)
+            # allocate_and_prepare consumes a resolved single-backend config;
+            # retaining launch_providers can force profile re-resolution and fail.
+            runtime_config.pop("launch_providers", None)
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 suffix=f".{self._provider_ref.replace(':', '_')}.json",
                 prefix="codeswarm-slurm-",
                 delete=False,
             ) as tf:
-                json.dump(self.config, tf)
+                json.dump(runtime_config, tf)
                 temp_config_path = tf.name
             config_path = temp_config_path
 
