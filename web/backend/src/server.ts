@@ -947,13 +947,10 @@ router.on('event', (msg: any) => {
       }
       resolveApprovalAcksByData(data, { type: 'started' });
     }
-    const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
-    const callId = typeof data?.call_id === 'string' ? data.call_id : '';
-    const nodeId = Number(data?.node_id);
-    if (swarmId && callId) {
-      removePendingApprovalByCallId(swarmId, callId, Number.isFinite(nodeId) ? nodeId : undefined);
-      broadcastApprovalsSnapshot();
-    }
+    // Do not eagerly clear pending approvals on command_started.
+    // Some runtimes emit exec_command_begin before/alongside approval-required
+    // for the same call_id, and removing here can make dialogs disappear until
+    // another user action triggers fresh state.
   }
 
   if (event === 'command_rejected') {
