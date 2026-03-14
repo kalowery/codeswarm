@@ -1395,27 +1395,31 @@ export default function Home() {
                       let targetNodes: number[] | 'all' = [activeNodeId]
                       let targetAlias: string | undefined
                       let selector: 'all' | 'nodes' | 'idle' | undefined
+                      let replyToSender = false
                       const nodeIdSet = new Set(Object.keys(swarm.nodes).map((id) => Number(id)))
 
-                      const crossAllMatch = trimmed.match(/^\/swarm\[(.+?)\]\/all\s+([\s\S]+)$/)
-                      const crossIdleMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)\s+([\s\S]+)$/)
-                      const crossAgentMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\]\s*([\s\S]+)$/)
+                      const crossAllMatch = trimmed.match(/^\/swarm\[(.+?)\]\/all(\/reply)?\s+([\s\S]+)$/)
+                      const crossIdleMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(idle|first-idle)(\/reply)?\s+([\s\S]+)$/)
+                      const crossAgentMatch = trimmed.match(/^\/swarm\[(.+?)\]\/(?:agent|node)\[(.+?)\](\/reply)?\s*([\s\S]+)$/)
 
                       if (crossAllMatch) {
                         targetAlias = crossAllMatch[1].trim()
-                        promptText = crossAllMatch[2].trim()
+                        replyToSender = Boolean(crossAllMatch[2])
+                        promptText = crossAllMatch[3].trim()
                         if (!targetAlias || !promptText) return
                         selector = 'all'
                         targetNodes = 'all'
                       } else if (crossIdleMatch) {
                         targetAlias = crossIdleMatch[1].trim()
-                        promptText = crossIdleMatch[3].trim()
+                        replyToSender = Boolean(crossIdleMatch[3])
+                        promptText = crossIdleMatch[4].trim()
                         if (!targetAlias || !promptText) return
                         selector = 'idle'
                       } else if (crossAgentMatch) {
                         targetAlias = crossAgentMatch[1].trim()
                         const expr = crossAgentMatch[2].trim()
-                        promptText = crossAgentMatch[3].trim()
+                        replyToSender = Boolean(crossAgentMatch[3])
+                        promptText = crossAgentMatch[4].trim()
                         if (!targetAlias || !promptText) return
                         selector = 'nodes'
                         const resolved = new Set<number>()
@@ -1513,6 +1517,8 @@ export default function Home() {
                         ? {
                             prompt: promptText,
                             target_alias: targetAlias,
+                            reply_to_sender: replyToSender,
+                            source_node_id: activeNodeId,
                             selector: selector ?? (targetNodes === 'all' ? 'all' : 'nodes'),
                             ...(targetNodes === 'all' ? {} : { nodes: targetNodes })
                           }

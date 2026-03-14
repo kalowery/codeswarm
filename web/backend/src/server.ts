@@ -1277,7 +1277,7 @@ app.post('/inject/:alias', (req, res) => {
   const swarm = state.getByAlias(req.params.alias);
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
 
-  const { prompt, nodes, target_alias, selector } = req.body;
+  const { prompt, nodes, target_alias, selector, reply_to_sender, source_node_id } = req.body;
 
   if (!prompt || typeof prompt !== 'string') {
     return res.status(400).json({ error: 'Invalid prompt' });
@@ -1288,6 +1288,9 @@ app.post('/inject/:alias', (req, res) => {
   if (typeof target_alias === 'string' && target_alias.trim()) {
     const targetSwarm = state.getByAlias(target_alias);
     if (!targetSwarm) return res.status(404).json({ error: 'Unknown target swarm' });
+    const shouldReplyToSender = Boolean(reply_to_sender);
+    const sourceNodeId = normalizeNodeId(source_node_id);
+    const canRegisterReply = shouldReplyToSender && Number.isFinite(sourceNodeId);
 
     const mode = typeof selector === 'string' ? selector : 'idle';
 
@@ -1305,6 +1308,15 @@ app.post('/inject/:alias', (req, res) => {
       }
       requestSwarmMap[request_id] = targetSwarm.swarm_id;
       requestPromptMap.set(request_id, prompt);
+      if (canRegisterReply) {
+        registerReplyRouteRequest(
+          request_id,
+          swarm,
+          targetSwarm,
+          sourceNodeId,
+          request_id
+        );
+      }
       return res.json({ request_id });
     }
 
@@ -1329,6 +1341,15 @@ app.post('/inject/:alias', (req, res) => {
     }
     requestSwarmMap[request_id] = targetSwarm.swarm_id;
     requestPromptMap.set(request_id, prompt);
+    if (canRegisterReply) {
+      registerReplyRouteRequest(
+        request_id,
+        swarm,
+        targetSwarm,
+        sourceNodeId,
+        request_id
+      );
+    }
     return res.json({ request_id });
   }
 
