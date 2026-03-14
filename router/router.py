@@ -1874,10 +1874,21 @@ def run_daemon(config, providers):
                 launch_defaults = launch_defaults if isinstance(launch_defaults, dict) else {}
                 effective_launch_params = {**launch_defaults, **provider_params}
 
+                launch_request_id = request_id
+                launch_nodes = nodes
+                launch_system_prompt = system_prompt
+                launch_provider_backend = provider_backend
+                launch_provider_id = provider_id
+                launch_provider_ref = provider_ref
+                launch_effective_params = dict(effective_launch_params)
+                launch_agents_md_content = agents_md_content
+                launch_agents_bundle = agents_bundle
+                launch_provider_obj = launch_provider
+
                 emit_event("swarm_launch_progress", {
-                    "request_id": request_id,
-                    "provider": provider_backend,
-                    "provider_id": provider_id,
+                    "request_id": launch_request_id,
+                    "provider": launch_provider_backend,
+                    "provider_id": launch_provider_id,
                     "stage": "queued",
                     "message": "Launch request queued",
                     "timestamp": time.time(),
@@ -1885,64 +1896,76 @@ def run_daemon(config, providers):
 
                 def _launch_progress(stage, message):
                     emit_event("swarm_launch_progress", {
-                        "request_id": request_id,
-                        "provider": provider_backend,
-                        "provider_id": provider_id,
+                        "request_id": launch_request_id,
+                        "provider": launch_provider_backend,
+                        "provider_id": launch_provider_id,
                         "stage": str(stage),
                         "message": str(message),
                         "timestamp": time.time(),
                     })
 
-                try:
-                    job_id = launch_provider.launch(
-                        nodes,
-                        agents_md_content=agents_md_content,
-                        agents_bundle=agents_bundle,
-                        launch_params=effective_launch_params,
-                        progress_cb=_launch_progress,
-                    )
-                except Exception as e:
-                    emit_event("command_rejected", {
-                        "request_id": request_id,
-                        "reason": str(e)
+                def _run_launch():
+                    try:
+                        job_id = launch_provider_obj.launch(
+                            launch_nodes,
+                            agents_md_content=launch_agents_md_content,
+                            agents_bundle=launch_agents_bundle,
+                            launch_params=launch_effective_params,
+                            progress_cb=_launch_progress,
+                        )
+                    except Exception as e:
+                        emit_event("command_rejected", {
+                            "request_id": launch_request_id,
+                            "reason": str(e)
+                        })
+                        return
+
+                    swarm_id = str(uuid.uuid4())
+
+                    SWARMS[swarm_id] = {
+                        "job_id": job_id,
+                        "node_count": launch_nodes,
+                        "system_prompt": launch_system_prompt,
+                        "status": "running",
+                        "provider": launch_provider_ref,
+                        "provider_backend": launch_provider_backend,
+                        "provider_id": launch_provider_id,
+                        "provider_params": launch_effective_params,
+                    }
+
+                    JOB_TO_SWARM[job_id] = swarm_id
+                    with SCHEDULER_LOCK:
+                        for node_id in range(launch_nodes):
+                            NODE_THREAD_ACTIVE[_node_key(swarm_id, node_id)] = False
+                    save_state()
+
+                    emit_event("swarm_launched", {
+                        "request_id": launch_request_id,
+                        "swarm_id": swarm_id,
+                        "job_id": job_id,
+                        "node_count": launch_nodes,
+                        "provider": launch_provider_backend,
+                        "provider_id": launch_provider_id,
                     })
-                    continue
 
-                swarm_id = str(uuid.uuid4())
+                    for node_id in range(launch_nodes):
+                        threading.Thread(
+                            target=perform_injection,
+                            args=(
+                                config,
+                                launch_provider_obj,
+                                launch_request_id,
+                                swarm_id,
+                                job_id,
+                                node_id,
+                                launch_system_prompt,
+                            ),
+                            daemon=True
+                        ).start()
+                    _dispatch_inter_swarm_queue(config)
 
-                SWARMS[swarm_id] = {
-                    "job_id": job_id,
-                    "node_count": nodes,
-                    "system_prompt": system_prompt,
-                    "status": "running",
-                    "provider": provider_ref,
-                    "provider_backend": provider_backend,
-                    "provider_id": provider_id,
-                    "provider_params": effective_launch_params,
-                }
-
-                JOB_TO_SWARM[job_id] = swarm_id
-                with SCHEDULER_LOCK:
-                    for node_id in range(nodes):
-                        NODE_THREAD_ACTIVE[_node_key(swarm_id, node_id)] = False
-                save_state()
-
-                emit_event("swarm_launched", {
-                    "request_id": request_id,
-                    "swarm_id": swarm_id,
-                    "job_id": job_id,
-                    "node_count": nodes,
-                    "provider": provider_backend,
-                    "provider_id": provider_id,
-                })
-
-                for node_id in range(nodes):
-                    threading.Thread(
-                        target=perform_injection,
-                        args=(config, launch_provider, request_id, swarm_id, job_id, node_id, system_prompt),
-                        daemon=True
-                    ).start()
-                _dispatch_inter_swarm_queue(config)
+                threading.Thread(target=_run_launch, daemon=True).start()
+                continue
 
             elif command == "inject":
                 swarm_id = payload.get("swarm_id")
