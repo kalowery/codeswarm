@@ -65,6 +65,7 @@ npm --prefix web/frontend run dev
 - each entry declares a launch preset: `id`, `label`, `backend` (`local`/`slurm`/`aws`)
 - optional `cluster_profile` (or legacy `cluster_config`) binds a preset to a named backend profile
 - optional `defaults` and `launch_fields` let providers expose custom launch UI inputs
+- optional `launch_soft_timeout_seconds` and `launch_hard_timeout_seconds` control launch timeout behavior per preset
 - backend profiles live under `cluster.<backend>.profiles.<name>`
   - useful for multiple AWS variants (cpu/gpu) and multiple Slurm login nodes/partitions
 

@@ -121,6 +121,14 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
     return []
 
 
+def _coerce_positive_int(value):
+    try:
+        n = int(value)
+    except Exception:
+        return None
+    return n if n > 0 else None
+
+
 def get_provider_specs(config: dict):
     specs = []
     launch_providers = config.get("launch_providers")
@@ -146,6 +154,8 @@ def get_provider_specs(config: dict):
                     "defaults": value.get("defaults", {}),
                     "launch_fields": value.get("launch_fields"),
                     "launch_panels": value.get("launch_panels"),
+                    "launch_soft_timeout_seconds": value.get("launch_soft_timeout_seconds"),
+                    "launch_hard_timeout_seconds": value.get("launch_hard_timeout_seconds"),
                 }
             )
     elif isinstance(launch_providers, list):
@@ -168,6 +178,8 @@ def get_provider_specs(config: dict):
                     "defaults": value.get("defaults", {}),
                     "launch_fields": value.get("launch_fields"),
                     "launch_panels": value.get("launch_panels"),
+                    "launch_soft_timeout_seconds": value.get("launch_soft_timeout_seconds"),
+                    "launch_hard_timeout_seconds": value.get("launch_hard_timeout_seconds"),
                 }
             )
 
@@ -182,6 +194,8 @@ def get_provider_specs(config: dict):
                 "cluster_profile": None,
                 "defaults": {},
                 "launch_fields": None,
+                "launch_soft_timeout_seconds": None,
+                "launch_hard_timeout_seconds": None,
             }
         ]
 
@@ -210,6 +224,16 @@ def get_provider_specs(config: dict):
         defaults = spec.get("defaults")
         if not isinstance(defaults, dict):
             defaults = {}
+        launch_soft_timeout_seconds = _coerce_positive_int(
+            spec.get("launch_soft_timeout_seconds")
+            if spec.get("launch_soft_timeout_seconds") is not None
+            else backend_cfg.get("launch_soft_timeout_seconds")
+        )
+        launch_hard_timeout_seconds = _coerce_positive_int(
+            spec.get("launch_hard_timeout_seconds")
+            if spec.get("launch_hard_timeout_seconds") is not None
+            else backend_cfg.get("launch_hard_timeout_seconds")
+        )
         normalized.append(
             {
                 "id": provider_id,
@@ -220,6 +244,8 @@ def get_provider_specs(config: dict):
                 "defaults": defaults,
                 "launch_fields": launch_fields,
                 "launch_panels": launch_panels,
+                "launch_soft_timeout_seconds": launch_soft_timeout_seconds,
+                "launch_hard_timeout_seconds": launch_hard_timeout_seconds,
             }
         )
     return normalized

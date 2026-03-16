@@ -42,7 +42,11 @@ wss.on('connection', (ws: any) => {
 
 // Track pending aliases keyed by launch request_id
 const pendingAliases: Record<string, string | undefined> = {};
-const pendingLaunchTimers = new Map<string, NodeJS.Timeout>();
+const pendingLaunchTimers = new Map<
+  string,
+  { soft: NodeJS.Timeout; hard: NodeJS.Timeout; startedAt: number; softTimeoutMs: number; hardTimeoutMs: number }
+>();
+const abandonedLaunchRequests = new Set<string>();
 
 // Track request_id -> swarm_id for status/inject/terminate
 const requestSwarmMap: Record<string, string> = {};
@@ -835,25 +839,79 @@ function requestStatus(swarm_id: string) {
 function clearPendingLaunchTimer(requestId: string) {
   const timer = pendingLaunchTimers.get(requestId);
   if (!timer) return;
-  clearTimeout(timer);
+  clearTimeout(timer.soft);
+  clearTimeout(timer.hard);
   pendingLaunchTimers.delete(requestId);
+  abandonedLaunchRequests.delete(requestId);
 }
 
-function startPendingLaunchTimer(requestId: string, timeoutMs = 120000) {
+function isSlowLaunchProvider(providerBackend?: string, providerId?: string) {
+  const backend = String(providerBackend || '').toLowerCase();
+  const id = String(providerId || '').toLowerCase();
+  return backend === 'aws' || backend === 'slurm' || id.includes('aws') || id.includes('slurm');
+}
+
+function startPendingLaunchTimer(
+  requestId: string,
+  opts?: { provider?: string; providerBackend?: string; softTimeoutMs?: number; hardTimeoutMs?: number }
+) {
+  const providerId = typeof opts?.provider === 'string' ? opts.provider : '';
+  const providerBackend = typeof opts?.providerBackend === 'string' ? opts.providerBackend : '';
+  const slowProvider = isSlowLaunchProvider(providerBackend, providerId);
+  const softTimeoutMs = Number.isFinite(opts?.softTimeoutMs as number)
+    ? Number(opts?.softTimeoutMs)
+    : (slowProvider ? 15 * 60 * 1000 : 120000);
+  const hardTimeoutMs = Number.isFinite(opts?.hardTimeoutMs as number)
+    ? Number(opts?.hardTimeoutMs)
+    : (slowProvider ? 45 * 60 * 1000 : 8 * 60 * 1000);
+
   clearPendingLaunchTimer(requestId);
-  const timer = setTimeout(() => {
+  const startedAt = Date.now();
+
+  const softTimer = setTimeout(() => {
+    if (!pendingLaunchTimers.has(requestId)) return;
+    const elapsedSec = Math.max(1, Math.floor((Date.now() - startedAt) / 1000));
+    hub.broadcast({
+      type: 'swarm_launch_progress',
+      payload: {
+        request_id: requestId,
+        provider: providerBackend || undefined,
+        provider_id: providerId || undefined,
+        stage: 'delayed',
+        message: `Launch is still in progress after ${elapsedSec}s`,
+        timestamp: Date.now() / 1000
+      }
+    });
+  }, softTimeoutMs);
+
+  const hardTimer = setTimeout(() => {
+    if (!pendingLaunchTimers.has(requestId)) return;
     pendingLaunchTimers.delete(requestId);
-    delete pendingAliases[requestId];
-    delete requestSwarmMap[requestId];
+    abandonedLaunchRequests.add(requestId);
     hub.broadcast({
       type: 'command_rejected',
       payload: {
         request_id: requestId,
-        reason: `launch timed out after ${Math.floor(timeoutMs / 1000)}s`
+        reason:
+          `launch exceeded hard timeout after ${Math.floor(hardTimeoutMs / 1000)}s; ` +
+          'if resources appear later they will be auto-terminated'
       }
     });
-  }, timeoutMs);
-  pendingLaunchTimers.set(requestId, timer);
+  }, hardTimeoutMs);
+
+  pendingLaunchTimers.set(requestId, {
+    soft: softTimer,
+    hard: hardTimer,
+    startedAt,
+    softTimeoutMs,
+    hardTimeoutMs
+  });
+}
+
+function parsePositiveTimeoutSeconds(value: any): number | undefined {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
 }
 
 // --- Router Event Handling ---
@@ -1017,6 +1075,29 @@ router.on('event', (msg: any) => {
     state.updateStatus(swarm_id, 'pending');
 
     hub.broadcast({ type: 'swarm_added', payload: record });
+
+    if (typeof request_id === 'string' && request_id && abandonedLaunchRequests.has(request_id)) {
+      abandonedLaunchRequests.delete(request_id);
+      // Best-effort safety net: if launch exceeded hard timeout, terminate as soon as
+      // it materializes to prevent orphaned cost-bearing resources.
+      try {
+        const terminateRequestId = sendRouterCommand('swarm_terminate', { swarm_id });
+        requestSwarmMap[terminateRequestId] = swarm_id;
+        hub.broadcast({
+          type: 'swarm_launch_progress',
+          payload: {
+            request_id,
+            provider: provider || undefined,
+            provider_id: provider_id || undefined,
+            stage: 'cleanup',
+            message: 'Launch exceeded hard timeout; auto-terminating resources',
+            timestamp: Date.now() / 1000
+          }
+        });
+      } catch {
+        // Leave swarm visible; user can still terminate manually.
+      }
+    }
 
     // Immediately request real Slurm status
     requestStatus(swarm_id);
@@ -1265,7 +1346,25 @@ app.post('/launch', (req, res) => {
 
   // Store alias temporarily until swarm_launched event arrives
   pendingAliases[request_id] = alias;
-  startPendingLaunchTimer(request_id);
+  const matchedProvider = launchProviders.find(
+    (p) => p && typeof p.id === 'string' && p.id === normalizedProvider
+  );
+  const providerBackend =
+    typeof matchedProvider?.backend === 'string'
+      ? matchedProvider.backend
+      : (typeof normalizedProvider === 'string' ? normalizedProvider : undefined);
+  const softTimeoutSeconds =
+    parsePositiveTimeoutSeconds(matchedProvider?.launch_soft_timeout_seconds) ??
+    parsePositiveTimeoutSeconds(matchedProvider?.defaults?.launch_soft_timeout_seconds);
+  const hardTimeoutSeconds =
+    parsePositiveTimeoutSeconds(matchedProvider?.launch_hard_timeout_seconds) ??
+    parsePositiveTimeoutSeconds(matchedProvider?.defaults?.launch_hard_timeout_seconds);
+  startPendingLaunchTimer(request_id, {
+    provider: normalizedProvider,
+    providerBackend,
+    softTimeoutMs: softTimeoutSeconds ? softTimeoutSeconds * 1000 : undefined,
+    hardTimeoutMs: hardTimeoutSeconds ? hardTimeoutSeconds * 1000 : undefined
+  });
 
   res.json({ request_id });
 });

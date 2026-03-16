@@ -72,7 +72,9 @@
       "id": "slurm-default",
       "label": "Slurm Cluster",
       "backend": "slurm",
-      "cluster_profile": "default"
+      "cluster_profile": "default",
+      "launch_soft_timeout_seconds": 900,
+      "launch_hard_timeout_seconds": 2700
     },
     {
       "id": "slurm-secondary",
@@ -84,7 +86,9 @@
       "id": "aws-default",
       "label": "AWS EC2",
       "backend": "aws",
-      "cluster_profile": "default"
+      "cluster_profile": "default",
+      "launch_soft_timeout_seconds": 900,
+      "launch_hard_timeout_seconds": 2700
     },
     {
       "id": "aws-gpu",

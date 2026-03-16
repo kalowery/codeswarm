@@ -104,6 +104,8 @@ Data:
         "partition": "a100",
         "time_limit": "01:00:00"
       },
+      "launch_soft_timeout_seconds": 900,
+      "launch_hard_timeout_seconds": 2700,
       "launch_fields": [
         {
           "key": "partition",

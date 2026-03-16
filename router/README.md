@@ -73,6 +73,8 @@ Provider presets for launch can be configured via `launch_providers` in config.
 Each preset selects a backend (`slurm`, `local`, or `aws`) and can include defaults and
 UI field definitions for provider-specific launch parameters.
 Optional `cluster_profile` (alias `cluster_config`) selects `cluster.<backend>.profiles.<name>`.
+Optional `launch_soft_timeout_seconds` and `launch_hard_timeout_seconds` define per-provider
+launch timeout behavior.
 
 ### `swarm_launch`
 
@@ -104,7 +106,7 @@ Behavior:
 
 ### `providers_list`
 
-Returns launch provider catalog (id/label/backend/cluster_profile/defaults/launch_fields) so UI can
+Returns launch provider catalog (id/label/backend/cluster_profile/defaults/launch_fields/launch timeout overrides) so UI can
 render provider picker and provider-specific parameter forms.
 
 ---

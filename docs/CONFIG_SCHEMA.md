@@ -100,6 +100,8 @@ Optional but recommended for mixed environments. Each preset includes:
   - legacy alias: `cluster_config`
 - `defaults` (optional): default provider params
 - `launch_fields` / `launch_panels` (optional): UI form metadata
+- `launch_soft_timeout_seconds` (optional): how long launch can run before UI marks it delayed
+- `launch_hard_timeout_seconds` (optional): hard timeout after which launch is marked failed and late materialization is auto-terminated
 
 ### Backend profiles (optional)
 
@@ -122,7 +124,14 @@ Each backend config can define multiple named profiles under `profiles`:
     }
   },
   "launch_providers": [
-    { "id": "aws-cpu", "label": "AWS CPU", "backend": "aws", "cluster_profile": "default" },
+    {
+      "id": "aws-cpu",
+      "label": "AWS CPU",
+      "backend": "aws",
+      "cluster_profile": "default",
+      "launch_soft_timeout_seconds": 900,
+      "launch_hard_timeout_seconds": 2700
+    },
     { "id": "aws-gpu", "label": "AWS GPU", "backend": "aws", "cluster_profile": "gpu" },
     { "id": "slurm-hpcfund", "label": "Slurm HPCFund", "backend": "slurm", "cluster_profile": "hpcfund" }
   ]

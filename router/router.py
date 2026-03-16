@@ -1489,18 +1489,36 @@ def translate_event(event):
                 else:
                     rpc_decision = "accept" if approved_flag else "cancel"
 
+                primary_rpc_payload = {
+                    "type": "rpc_response",
+                    "rpc_id": merged_rpc_id,
+                    "result": {
+                        "decision": rpc_decision,
+                        "approved": approved_flag,
+                    },
+                }
                 ACTIVE_PROVIDER.send_control(
                     job_id,
                     node_id,
-                    {
-                        "type": "rpc_response",
-                        "rpc_id": merged_rpc_id,
-                        "result": {
-                            "decision": rpc_decision,
-                            "approved": approved_flag,
-                        },
-                    },
+                    primary_rpc_payload,
                 )
+                existing_request_id_hint = existing.get("request_id_hint")
+                if (
+                    existing_request_id_hint is not None
+                    and str(existing_request_id_hint) != str(merged_rpc_id)
+                ):
+                    ACTIVE_PROVIDER.send_control(
+                        job_id,
+                        node_id,
+                        {
+                            "type": "rpc_response",
+                            "rpc_id": existing_request_id_hint,
+                            "result": {
+                                "decision": rpc_decision,
+                                "approved": approved_flag,
+                            },
+                        },
+                    )
                 approval_trace(
                     "required_autoreplay_sent",
                     job_id=str(job_id),
@@ -2370,6 +2388,12 @@ def run_daemon(config, providers):
                             "result": result_payload
                         }
                         route_mode = "rpc_response"
+                        if request_id_hint is not None and str(request_id_hint) != str(rpc_id):
+                            compat_rpc_payload = {
+                                "type": "rpc_response",
+                                "rpc_id": request_id_hint,
+                                "result": result_payload
+                            }
                     else:
                         # Notification-style approval
                         normalized = _normalize_decision_for_available(
