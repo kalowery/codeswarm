@@ -2,6 +2,7 @@
   "cluster": {
     "backend": "slurm",
     "slurm": {
+      "login_host": "your-slurm-login-host",
       "partition": "debug",
       "time_limit": "00:30:00",
       "account": "example_account",
