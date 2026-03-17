@@ -78,6 +78,21 @@ npm --prefix web/backend run dev
 npm --prefix web/frontend run dev
 ```
 
+If you only want terminal-based swarm launch, you do not need the web stack:
+
+```bash
+codeswarm providers --config configs/local.json
+codeswarm launch --nodes 2 --prompt "You are a focused autonomous agent." --provider local --config configs/local.json
+codeswarm stop-all --config configs/local.json
+```
+
+Optional web-launch parity flags:
+
+- `--agents <path>` accepts either a single `AGENTS.md` file or a persona directory containing `AGENTS.md` and optional `skills/`
+- `--provider-param key=value` can be repeated for provider-specific launch fields
+- `--provider-params-json '{"key":"value"}'` passes provider overrides as JSON
+- `--detach` exits after launch; otherwise the CLI follows INFO activity logs by default
+
 ## Codex Sandbox and Approval
 
 Codeswarm handles execution approval in its own UI/router flow (`exec_approval_required` -> `/approval` -> router `approve_execution`).

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import threading
 import re
 import time
+import atexit
 from collections import defaultdict, deque
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -48,6 +49,7 @@ TERMINATED_TTL_SECONDS = 900  # 15 minutes
 MAX_TERMINATED = 100
 
 STATE_FILE = Path(__file__).resolve().parents[1] / "router_state.json"
+PID_FILE = Path(__file__).resolve().parents[1] / "router.pid"
 DEFAULT_AGENTS_FILE = Path(__file__).resolve().parents[1] / "AGENTS.md"
 GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
 GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
@@ -271,6 +273,23 @@ def load_state():
     except Exception:
         SWARMS = {}
         INTER_SWARM_QUEUE = defaultdict(deque)
+
+
+def write_pid_file():
+    try:
+        PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def remove_pid_file():
+    try:
+        if PID_FILE.exists():
+            raw = PID_FILE.read_text(encoding="utf-8").strip()
+            if raw == str(os.getpid()):
+                PID_FILE.unlink()
+    except Exception:
+        pass
 
 
 def reconcile(providers):
@@ -1955,6 +1974,10 @@ def run_daemon(config, providers):
                     with SCHEDULER_LOCK:
                         for node_id in range(launch_nodes):
                             NODE_THREAD_ACTIVE[_node_key(swarm_id, node_id)] = False
+                    try:
+                        launch_provider_obj.bind_swarm(job_id, swarm_id, SWARMS[swarm_id])
+                    except Exception:
+                        pass
                     save_state()
 
                     emit_event("swarm_launched", {
@@ -2655,6 +2678,10 @@ def main():
     global DEBUG
     DEBUG = args.debug
 
+    if args.daemon:
+        write_pid_file()
+        atexit.register(remove_pid_file)
+
     config = load_config(args.config)
 
     # Store absolute config path so swarm_launch uses the same config
@@ -2667,6 +2694,26 @@ def main():
 
     # Load persisted state and reconcile with cluster backends
     load_state()
+
+    for provider in PROVIDERS.values():
+        try:
+            recovered = provider.recover_swarms()
+        except Exception:
+            recovered = {}
+        if not isinstance(recovered, dict):
+            continue
+        for swarm_id, swarm in recovered.items():
+            if not isinstance(swarm_id, str) or not swarm_id:
+                continue
+            if not isinstance(swarm, dict):
+                continue
+            existing = SWARMS.get(swarm_id)
+            if existing:
+                merged = dict(swarm)
+                merged.update(existing)
+                SWARMS[swarm_id] = merged
+            else:
+                SWARMS[swarm_id] = dict(swarm)
 
     # Migration: ensure terminated swarms have terminated_at and provider binding.
     default_provider_ref = PROVIDER_SPECS[0].get("provider_ref") if PROVIDER_SPECS else None
@@ -2693,6 +2740,7 @@ def main():
 
     def graceful_shutdown(signum, frame):
         save_state()
+        remove_pid_file()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, graceful_shutdown)
