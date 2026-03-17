@@ -35,6 +35,7 @@ echo "🚀 Bootstrapping Codeswarm..."
 echo "[bootstrap] script version: 2026-03-17.2"
 
 NODE_VERSION="24.13.0"
+NODE_VERSION_TAG="v24.13.0"
 NODE_MAJOR_REQUIRED=24
 
 log() {
@@ -106,36 +107,46 @@ fi
 
 if command -v nvm >/dev/null 2>&1; then
   # --- Ensure Node via nvm ---
-  echo "📦 Ensuring Node $NODE_VERSION is installed in nvm..."
+  echo "📦 Ensuring Node $NODE_VERSION_TAG is installed in nvm..."
   set +e
-  nvm install "$NODE_VERSION"
+  nvm install "$NODE_VERSION_TAG"
   NVM_INSTALL_RC=$?
   set -e
   if [ "$NVM_INSTALL_RC" -ne 0 ]; then
-    echo "❌ nvm failed to install/use Node $NODE_VERSION."
-    echo "Try:"
-    echo "  nvm cache clear"
-    echo "  nvm install $NODE_VERSION"
-    exit 1
+    echo "⚠️ nvm failed to install $NODE_VERSION_TAG. Will try system Node fallback."
   fi
 
-  set +e
-  nvm use "$NODE_VERSION"
-  NVM_USE_RC=$?
-  set -e
-
-  if [ "$NVM_USE_RC" -ne 0 ]; then
-    echo "⚠️ nvm use failed; retrying with --delete-prefix (common npm prefix conflict fix)..."
+  NVM_OK=0
+  if [ "$NVM_INSTALL_RC" -eq 0 ]; then
     set +e
-    nvm use --delete-prefix "$NODE_VERSION"
-    NVM_USE_DELETE_PREFIX_RC=$?
+    nvm use "$NODE_VERSION_TAG"
+    NVM_USE_RC=$?
     set -e
 
-    if [ "$NVM_USE_DELETE_PREFIX_RC" -ne 0 ]; then
-      echo "❌ nvm could not activate Node $NODE_VERSION."
-      echo "If you have npm prefix settings, remove them from ~/.npmrc and retry."
-      echo "Typical fix:"
-      echo "  nvm use --delete-prefix v$NODE_VERSION --silent"
+    if [ "$NVM_USE_RC" -ne 0 ]; then
+      echo "⚠️ nvm use failed; retrying with --delete-prefix (common npm prefix conflict fix)..."
+      set +e
+      nvm use --delete-prefix "$NODE_VERSION_TAG"
+      NVM_USE_DELETE_PREFIX_RC=$?
+      set -e
+
+      if [ "$NVM_USE_DELETE_PREFIX_RC" -eq 0 ]; then
+        NVM_OK=1
+      fi
+    else
+      NVM_OK=1
+    fi
+  fi
+
+  if [ "$NVM_OK" -ne 1 ]; then
+    if command -v node >/dev/null 2>&1; then
+      echo "⚠️ Falling back to system Node $(node -v)"
+    else
+      echo "❌ nvm could not activate Node $NODE_VERSION_TAG and no system Node is available."
+      echo "Try:"
+      echo "  nvm cache clear"
+      echo "  nvm install $NODE_VERSION_TAG"
+      echo "  nvm use --delete-prefix $NODE_VERSION_TAG --silent"
       exit 1
     fi
   fi
