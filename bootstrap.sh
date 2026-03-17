@@ -20,6 +20,7 @@ Options:
 
 Environment:
   CODESWARM_BOOTSTRAP_VERBOSE=1   Enable verbose mode.
+  CODESWARM_BOOTSTRAP_FORCE_NVM=1 Force nvm install/use path instead of system Node.
 USAGE
       exit 0
       ;;
@@ -36,7 +37,8 @@ echo "[bootstrap] script version: 2026-03-17.2"
 
 NODE_VERSION="24.13.0"
 NODE_VERSION_TAG="v24.13.0"
-NODE_MAJOR_REQUIRED=24
+NODE_MAJOR_REQUIRED=18
+FORCE_NVM="${CODESWARM_BOOTSTRAP_FORCE_NVM:-0}"
 
 log() {
   echo "[bootstrap] $*"
@@ -60,6 +62,15 @@ need_cmd() {
 
 node_major() {
   node -p 'process.versions.node.split(".")[0]'
+}
+
+has_compatible_system_node() {
+  if ! command -v node >/dev/null 2>&1; then
+    return 1
+  fi
+  local major
+  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+  [ "$major" -ge "$NODE_MAJOR_REQUIRED" ]
 }
 
 ensure_path_in_shell_startup() {
@@ -105,7 +116,9 @@ if ! command -v nvm >/dev/null 2>&1; then
   fi
 fi
 
-if command -v nvm >/dev/null 2>&1; then
+if [ "$FORCE_NVM" != "1" ] && has_compatible_system_node; then
+  echo "✅ Using system Node $(node -v) (nvm skipped)"
+elif command -v nvm >/dev/null 2>&1; then
   # --- Ensure Node via nvm ---
   echo "📦 Ensuring Node $NODE_VERSION_TAG is installed in nvm..."
   set +e
@@ -164,6 +177,7 @@ fi
 
 if [ "$(node_major)" -lt "$NODE_MAJOR_REQUIRED" ]; then
   echo "❌ Node.js $NODE_MAJOR_REQUIRED+ required. Found $(node -v)."
+  echo "   You can force nvm path with: CODESWARM_BOOTSTRAP_FORCE_NVM=1 ./bootstrap.sh"
   exit 1
 fi
 
