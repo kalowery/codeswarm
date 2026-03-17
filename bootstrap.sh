@@ -6,12 +6,19 @@ echo "🚀 Bootstrapping Codeswarm..."
 NODE_VERSION="24.13.0"
 
 # --- Ensure nvm ---
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  # Load nvm in non-interactive shells.
+  # shellcheck source=/dev/null
+  . "$NVM_DIR/nvm.sh"
+fi
+
 if ! command -v nvm >/dev/null 2>&1; then
   echo "📦 nvm not found. Installing nvm..."
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 
-  export NVM_DIR="$HOME/.nvm"
-  [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 fi
 
 # --- Ensure Node ---
@@ -23,6 +30,7 @@ fi
 nvm use "$NODE_VERSION"
 
 echo "✅ Using Node $(node -v)"
+echo "✅ Using npm $(npm -v)"
 
 # --- Ensure Python 3.10+ ---
 if ! command -v python3 >/dev/null 2>&1; then
@@ -61,16 +69,37 @@ echo "📦 Installing frontend..."
 cd web/frontend
 npm install
 npm run build
-npm link
 cd ../..
 
 # --- Install CLI ---
 echo "📦 Installing CLI..."
-cd cli
-npm install
-npm run build
-npm link
-cd ..
+npm --workspace=cli install
+npm --workspace=cli run build
+npm --workspace=cli link
+
+# Ensure global npm bin is on PATH for this shell.
+NPM_GLOBAL_PREFIX="$(npm prefix -g)"
+NPM_GLOBAL_BIN="$NPM_GLOBAL_PREFIX/bin"
+case ":$PATH:" in
+  *":$NPM_GLOBAL_BIN:"*) ;;
+  *) export PATH="$NPM_GLOBAL_BIN:$PATH" ;;
+esac
+
+# Verify link actually produced a runnable codeswarm binary.
+if ! command -v codeswarm >/dev/null 2>&1; then
+  echo ""
+  echo "❌ codeswarm CLI was linked but is not on PATH."
+  echo "npm global prefix: $NPM_GLOBAL_PREFIX"
+  echo "expected binary path: $NPM_GLOBAL_BIN/codeswarm"
+  echo "Current PATH: $PATH"
+  echo ""
+  echo "Add this to your shell profile and open a new shell:"
+  echo "  export PATH=\"$NPM_GLOBAL_BIN:\$PATH\""
+  echo ""
+  exit 1
+fi
+
+echo "✅ codeswarm linked at: $(command -v codeswarm)"
 
 # --- Ensure Homebrew paths (macOS) ---
 if [ -d "/opt/homebrew/bin" ]; then
