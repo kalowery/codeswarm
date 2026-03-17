@@ -40,8 +40,6 @@ log() {
 if [ "$VERBOSE" = "1" ]; then
   export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
   set -x
-  set -o errtrace
-  trap 'rc=$?; echo "❌ bootstrap error at line $LINENO while running: $BASH_COMMAND (exit $rc)" >&2' ERR
   log "Verbose mode enabled"
 fi
 
@@ -109,9 +107,19 @@ if command -v nvm >/dev/null 2>&1; then
     nvm install "$NODE_VERSION"
   fi
 
-  if ! nvm use "$NODE_VERSION"; then
+  set +e
+  nvm use "$NODE_VERSION"
+  NVM_USE_RC=$?
+  set -e
+
+  if [ "$NVM_USE_RC" -ne 0 ]; then
     echo "⚠️ nvm use failed; retrying with --delete-prefix (common npm prefix conflict fix)..."
-    if ! nvm use --delete-prefix "$NODE_VERSION"; then
+    set +e
+    nvm use --delete-prefix "$NODE_VERSION"
+    NVM_USE_DELETE_PREFIX_RC=$?
+    set -e
+
+    if [ "$NVM_USE_DELETE_PREFIX_RC" -ne 0 ]; then
       echo "❌ nvm could not activate Node $NODE_VERSION."
       echo "If you have npm prefix settings, remove them from ~/.npmrc and retry."
       echo "Typical fix:"
