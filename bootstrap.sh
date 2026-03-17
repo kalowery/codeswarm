@@ -27,8 +27,12 @@ USAGE
 done
 
 set -euo pipefail
+# Clear inherited ERR traps/errtrace from parent shells or previously sourced scripts.
+set +E
+trap - ERR
 
 echo "🚀 Bootstrapping Codeswarm..."
+echo "[bootstrap] script version: 2026-03-17.2"
 
 NODE_VERSION="24.13.0"
 NODE_MAJOR_REQUIRED=24
@@ -102,9 +106,17 @@ fi
 
 if command -v nvm >/dev/null 2>&1; then
   # --- Ensure Node via nvm ---
-  if ! command -v node >/dev/null 2>&1; then
-    echo "📦 Installing Node $NODE_VERSION..."
-    nvm install "$NODE_VERSION"
+  echo "📦 Ensuring Node $NODE_VERSION is installed in nvm..."
+  set +e
+  nvm install "$NODE_VERSION"
+  NVM_INSTALL_RC=$?
+  set -e
+  if [ "$NVM_INSTALL_RC" -ne 0 ]; then
+    echo "❌ nvm failed to install/use Node $NODE_VERSION."
+    echo "Try:"
+    echo "  nvm cache clear"
+    echo "  nvm install $NODE_VERSION"
+    exit 1
   fi
 
   set +e
