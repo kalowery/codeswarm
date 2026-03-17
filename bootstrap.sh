@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
-set -e
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "❌ bootstrap.sh must be run with bash (not sh)." >&2
+  exit 1
+fi
+
+set -Eeuo pipefail
+trap 'rc=$?; echo "❌ Bootstrap failed at line $LINENO while running: $BASH_COMMAND (exit $rc)" >&2' ERR
 
 echo "🚀 Bootstrapping Codeswarm..."
 
 NODE_VERSION="24.13.0"
+NODE_MAJOR_REQUIRED=24
+
+need_cmd() {
+  local cmd="$1"
+  local hint="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "❌ Required command not found: $cmd"
+    echo "   $hint"
+    exit 1
+  fi
+}
+
+node_major() {
+  node -p 'process.versions.node.split(".")[0]'
+}
 
 # --- Ensure nvm ---
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
@@ -15,26 +36,45 @@ fi
 
 if ! command -v nvm >/dev/null 2>&1; then
   echo "📦 nvm not found. Installing nvm..."
+  need_cmd curl "Install it first (RHEL/Fedora: sudo dnf install -y curl)."
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 
   export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
   [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 fi
 
-# --- Ensure Node ---
-if ! command -v node >/dev/null 2>&1; then
-  echo "📦 Installing Node $NODE_VERSION..."
-  nvm install "$NODE_VERSION"
+if command -v nvm >/dev/null 2>&1; then
+  # --- Ensure Node via nvm ---
+  if ! command -v node >/dev/null 2>&1; then
+    echo "📦 Installing Node $NODE_VERSION..."
+    nvm install "$NODE_VERSION"
+  fi
+
+  nvm use "$NODE_VERSION"
+else
+  # --- Fallback: system Node ---
+  if ! command -v node >/dev/null 2>&1; then
+    echo "❌ Node.js is not installed and nvm is unavailable."
+    echo "Install one of:"
+    echo "  1) nvm (recommended), then rerun bootstrap"
+    echo "  2) Node.js $NODE_MAJOR_REQUIRED+ via system package manager"
+    exit 1
+  fi
+  echo "⚠️ nvm unavailable; using system Node $(node -v)"
 fi
 
-nvm use "$NODE_VERSION"
+if [ "$(node_major)" -lt "$NODE_MAJOR_REQUIRED" ]; then
+  echo "❌ Node.js $NODE_MAJOR_REQUIRED+ required. Found $(node -v)."
+  exit 1
+fi
 
 echo "✅ Using Node $(node -v)"
 echo "✅ Using npm $(npm -v)"
 
 # --- Ensure Python 3.10+ ---
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "❌ python3 not found in PATH. Install Python 3.10+ (e.g., brew install python@3.11)."
+  echo "❌ python3 not found in PATH. Install Python 3.10+."
+  echo "   RHEL/Fedora example: sudo dnf install -y python3"
   exit 1
 fi
 
@@ -49,7 +89,7 @@ PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
 
 if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }; then
   echo "❌ Python 3.10+ required. Found $PY_VERSION."
-  echo "Install a modern Python (e.g., brew install python@3.11) and ensure it is first in PATH."
+  echo "Install a modern Python and ensure it is first in PATH."
   exit 1
 fi
 
