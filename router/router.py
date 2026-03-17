@@ -33,6 +33,7 @@ LAST_USAGE = {}
 PENDING_APPROVALS = {}
 PENDING_APPROVAL_DECISIONS = {}
 RESOLVED_APPROVALS = {}
+RECENT_APPROVAL_RESULTS = {}
 ACTIVE_PROVIDER = None
 PROVIDERS = {}
 PROVIDER_SPECS = []
@@ -143,6 +144,27 @@ def _mark_approval_resolved(job_id, call_id, node_id):
     RESOLVED_APPROVALS[key] = time.time()
 
 
+def _remember_recent_approval_result(job_id, call_id, node_id, approved, decision):
+    key = _approval_key(job_id, call_id, node_id)
+    RECENT_APPROVAL_RESULTS[key] = {
+        "approved": bool(approved),
+        "decision": decision,
+        "ts": time.time(),
+    }
+
+
+def _get_recent_approval_result(job_id, call_id, node_id):
+    now = time.time()
+    expired = [
+        key
+        for key, meta in RECENT_APPROVAL_RESULTS.items()
+        if (now - float(meta.get("ts", 0))) > RESOLVED_APPROVAL_TTL_SECONDS
+    ]
+    for key in expired:
+        RECENT_APPROVAL_RESULTS.pop(key, None)
+    return RECENT_APPROVAL_RESULTS.get(_approval_key(job_id, call_id, node_id))
+
+
 def _is_recently_resolved_approval(job_id, call_id, node_id):
     now = time.time()
     expired = [
@@ -157,6 +179,65 @@ def _is_recently_resolved_approval(job_id, call_id, node_id):
     if ts is None:
         return False
     return (now - float(ts)) <= RESOLVED_APPROVAL_TTL_SECONDS
+
+
+def _send_duplicate_approval_replay(provider, job_id, node_id, call_id, rpc_id, request_id_hint, approved, decision):
+    # Retry both response dialects for robustness across codex/app-server variants.
+    try:
+        accept_decision = decision
+        if not isinstance(accept_decision, (str, dict)):
+            accept_decision = "accept" if bool(approved) else "cancel"
+        if isinstance(accept_decision, str):
+            if accept_decision == "approved":
+                accept_decision = "accept"
+            elif accept_decision == "abort":
+                accept_decision = "cancel"
+            elif accept_decision not in ("accept", "cancel"):
+                accept_decision = "accept" if bool(approved) else "cancel"
+
+        if rpc_id is not None:
+            provider.send_control(
+                job_id,
+                node_id,
+                {
+                    "type": "rpc_response",
+                    "rpc_id": rpc_id,
+                    "result": {
+                        "decision": accept_decision,
+                        "approved": bool(approved),
+                    },
+                },
+            )
+        if request_id_hint is not None and str(request_id_hint) != str(rpc_id):
+            provider.send_control(
+                job_id,
+                node_id,
+                {
+                    "type": "rpc_response",
+                    "rpc_id": request_id_hint,
+                    "result": {
+                        "decision": accept_decision,
+                        "approved": bool(approved),
+                    },
+                },
+            )
+
+        provider.send_control(
+            job_id,
+            node_id,
+            {
+                "method": "exec/approvalResponse",
+                "params": {
+                    "call_id": call_id,
+                    "callId": call_id,
+                    "approved": bool(approved),
+                    "decision": "approved" if bool(approved) else "abort",
+                },
+            },
+        )
+    except Exception:
+        return False
+    return True
 
 
 def _pending_approvals_snapshot():
@@ -623,6 +704,15 @@ def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
     SWARMS.pop(str(swarm_id), None)
     if job_id:
         JOB_TO_SWARM.pop(str(job_id), None)
+        stale_approvals = [
+            key for key in list(PENDING_APPROVALS.keys())
+            if isinstance(key, tuple) and len(key) == 3 and str(key[0]) == str(job_id)
+        ]
+        for key in stale_approvals:
+            PENDING_APPROVALS.pop(key, None)
+            PENDING_APPROVAL_DECISIONS.pop(key, None)
+            RESOLVED_APPROVALS.pop(key, None)
+            RECENT_APPROVAL_RESULTS.pop(key, None)
     save_state()
 
 
@@ -706,6 +796,17 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
     if not isinstance(poll_s, (int, float)) or poll_s <= 0:
         poll_s = GRACEFUL_TERMINATE_POLL_SECONDS
 
+    def _emit_terminate_progress(stage, message):
+        emit_event("swarm_terminate_progress", {
+            "request_id": request_id,
+            "swarm_id": str(swarm_id),
+            "job_id": job_id,
+            "provider_backend": provider_backend,
+            "stage": str(stage),
+            "message": str(message),
+            "timestamp": time.time(),
+        })
+
     force_now = False
     if isinstance(terminate_overrides, dict):
         force_now = bool(terminate_overrides.get("force", False))
@@ -757,21 +858,45 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
         if not isinstance(local_timeout_s, (int, float)) or local_timeout_s <= 0:
             local_timeout_s = 20
         timeout_s = min(float(timeout_s), float(local_timeout_s))
+    elif provider_backend == "aws":
+        # Cloud instance termination can be expensive when delayed by stale
+        # node-active state; use a shorter grace window before force terminate.
+        aws_timeout_s = (
+            config.get("router", {}).get("aws_graceful_terminate_timeout_seconds")
+            if isinstance(config.get("router"), dict)
+            else None
+        )
+        if not isinstance(aws_timeout_s, (int, float)) or aws_timeout_s <= 0:
+            aws_timeout_s = 45
+        timeout_s = min(float(timeout_s), float(aws_timeout_s))
 
     deadline = time.time() + float(timeout_s)
     timed_out = False
+    _emit_terminate_progress("graceful_wait", f"Waiting for swarm quiescence (up to {int(float(timeout_s))}s)")
     if not force_now:
+        next_progress_at = time.time() + 5.0
         while time.time() < deadline:
             with SCHEDULER_LOCK:
                 if str(swarm_id) in FORCE_TERMINATION_REQUESTED:
                     force_now = True
             if force_now:
+                _emit_terminate_progress("force_requested", "Force termination requested")
                 break
             if _is_swarm_quiescent_for_termination(swarm_id):
+                _emit_terminate_progress("quiescent", "Swarm is quiescent; proceeding with provider termination")
                 break
+            now = time.time()
+            if now >= next_progress_at:
+                remaining = max(0, int(deadline - now))
+                _emit_terminate_progress(
+                    "graceful_wait",
+                    f"Still waiting for quiescence ({remaining}s remaining before force terminate)",
+                )
+                next_progress_at = now + 5.0
             time.sleep(float(poll_s))
         else:
             timed_out = True
+            _emit_terminate_progress("graceful_timeout", "Graceful wait timed out; forcing provider termination")
 
     terminate_params = swarm.get("provider_params") if isinstance(swarm, dict) else None
     if not isinstance(terminate_params, dict):
@@ -781,7 +906,9 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
     _maybe_export_workspace_archive(config, provider, request_id, swarm_id, job_id, terminate_params)
 
     try:
+        _emit_terminate_progress("provider_terminate", "Sending terminate request to provider")
         provider.terminate(job_id, terminate_params=terminate_params)
+        _emit_terminate_progress("provider_terminate", "Provider terminate request completed")
     except Exception as e:
         swarm = SWARMS.get(str(swarm_id))
         if swarm and swarm.get("status") == "terminating":
@@ -794,9 +921,11 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
             "request_id": request_id,
             "reason": str(e)
         })
+        _emit_terminate_progress("failed", f"Termination failed: {e}")
         return
 
     _finalize_swarm_termination(provider, request_id, swarm_id, job_id)
+    _emit_terminate_progress("completed", "Swarm termination complete")
     if timed_out:
         emit_event("debug", {
             "source": "router",
@@ -1199,6 +1328,31 @@ def translate_event(event):
         "injection_id": injection_id
     }
 
+    def _collect_text_parts(value):
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list):
+            parts = []
+            for item in value:
+                parts.extend(_collect_text_parts(item))
+            return parts
+        if isinstance(value, dict):
+            parts = []
+            for key in ("text", "delta", "content", "raw_content", "summary", "summary_text"):
+                if key in value:
+                    parts.extend(_collect_text_parts(value.get(key)))
+            return parts
+        return []
+
+    def _extract_reasoning_text(item):
+        if not isinstance(item, dict):
+            return ""
+        chunks = []
+        for key in ("summary_text", "summary", "raw_content", "content", "text"):
+            chunks.extend(_collect_text_parts(item.get(key)))
+        text = "".join(str(chunk) for chunk in chunks if isinstance(chunk, str))
+        return text.strip()
+
     if method == "turn/started":
         return ("turn_started", base)
 
@@ -1218,7 +1372,7 @@ def translate_event(event):
             "final_answer": str(msg_obj.get("phase") or "").lower() == "final_answer",
         })
 
-    if method in ("codex/event/item_completed", "item/completed"):
+    if method in ("codex/event/item_started", "item/started", "codex/event/item_completed", "item/completed"):
         params = payload.get("params", {})
         item = params.get("item")
         if item is None:
@@ -1227,6 +1381,14 @@ def translate_event(event):
         if isinstance(item, dict):
             item_type_raw = item.get("type")
             item_type = re.sub(r"[^a-z]", "", str(item_type_raw).lower())
+            if item_type == "reasoning":
+                reasoning_text = _extract_reasoning_text(item)
+                if reasoning_text:
+                    return ("reasoning", {
+                        **base,
+                        "content": reasoning_text,
+                        "raw": payload,
+                    })
             if item_type == "agentmessage":
                 # Some runtimes deliver final assistant text on item_completed
                 # without a separate codex/event/agent_message snapshot.
@@ -1418,6 +1580,42 @@ def translate_event(event):
         if call_id:
             key = _approval_key(job_id, call_id, node_id)
             existing = PENDING_APPROVALS.get(key, {})
+            resolved_recently = _is_recently_resolved_approval(job_id, call_id, node_id)
+
+            if resolved_recently:
+                recent = _get_recent_approval_result(job_id, call_id, node_id)
+                if recent:
+                    approval_provider = _provider_for_swarm(swarm_id)
+                    replay_ok = False
+                    if approval_provider is not None:
+                        replay_ok = _send_duplicate_approval_replay(
+                            approval_provider,
+                            job_id,
+                            node_id,
+                            str(call_id),
+                            rpc_id if rpc_id is not None else existing.get("rpc_id"),
+                            request_id_hint if request_id_hint is not None else existing.get("request_id_hint"),
+                            bool(recent.get("approved")),
+                            recent.get("decision"),
+                        )
+                    approval_trace(
+                        "required_ignored_recently_resolved",
+                        job_id=str(job_id),
+                        swarm_id=str(swarm_id),
+                        node_id=_normalize_node_id(node_id),
+                        call_id=str(call_id),
+                        replayed=bool(replay_ok),
+                    )
+                else:
+                    approval_trace(
+                        "required_ignored_recently_resolved",
+                        job_id=str(job_id),
+                        swarm_id=str(swarm_id),
+                        node_id=_normalize_node_id(node_id),
+                        call_id=str(call_id),
+                        replayed=False,
+                    )
+                return None
 
             # Keep the strongest request shape when both legacy and request-style
             # approval events are emitted for the same call_id.
@@ -1434,17 +1632,68 @@ def translate_event(event):
                     for d in (decisions or [])
                 )
 
-            merged_available = (
-                new_available
-                if _has_accept_decisions(new_available) or not existing_available
-                else existing_available
-            )
+            def _has_policy_amendment_option(decisions):
+                return any(
+                    (isinstance(d, dict) and (
+                        "acceptWithExecpolicyAmendment" in d
+                        or "approved_execpolicy_amendment" in d
+                    ))
+                    for d in (decisions or [])
+                )
+
+            def _decision_key(decision):
+                if isinstance(decision, str):
+                    return f"s:{decision}"
+                if isinstance(decision, dict):
+                    try:
+                        return "j:" + json.dumps(decision, sort_keys=True)
+                    except Exception:
+                        return "o:" + str(decision)
+                return "x:" + str(decision)
+
+            if not existing_available:
+                merged_available = list(new_available)
+            elif not new_available:
+                merged_available = list(existing_available)
+            else:
+                # Merge decisions from both event shapes so UI options do not
+                # oscillate (e.g., "Approve + Remember" disappearing mid-turn).
+                merged_available = []
+                seen_keys = set()
+                for decision in list(existing_available) + list(new_available):
+                    key_token = _decision_key(decision)
+                    if key_token in seen_keys:
+                        continue
+                    seen_keys.add(key_token)
+                    merged_available.append(decision)
+
+                # Preserve policy-amendment option once seen for this call_id.
+                if (
+                    _has_policy_amendment_option(existing_available)
+                    and not _has_policy_amendment_option(merged_available)
+                ):
+                    merged_available = list(existing_available)
+                elif (
+                    _has_accept_decisions(new_available)
+                    and not _has_accept_decisions(merged_available)
+                ):
+                    merged_available = list(new_available)
+
+            # Some runtimes emit duplicate approval events where one shape has
+            # no turn_id and/or stale injection_id. Preserve existing
+            # correlation fields unless the new event has stronger identifiers.
+            existing_injection_id = existing.get("injection_id")
+            existing_turn_id = existing.get("turn_id")
+            merged_injection_id = injection_id
+            if existing_injection_id and (not event_turn_id or not injection_id):
+                merged_injection_id = existing_injection_id
+            merged_turn_id = event_turn_id if event_turn_id else existing_turn_id
 
             PENDING_APPROVALS[key] = {
                 "swarm_id": swarm_id,
                 "node_id": node_id,
-                "injection_id": injection_id,
-                "turn_id": event_turn_id,
+                "injection_id": merged_injection_id,
+                "turn_id": merged_turn_id,
                 "rpc_id": merged_rpc_id,
                 "request_id_hint": existing.get("request_id_hint") or request_id_hint,
                 "approval_method": method,
@@ -2575,6 +2824,13 @@ def run_daemon(config, providers):
                     })
                     continue
 
+                _remember_recent_approval_result(
+                    job_id,
+                    call_id,
+                    meta.get("node_id"),
+                    approved,
+                    decision,
+                )
                 del PENDING_APPROVALS[key]
                 _mark_approval_resolved(job_id, call_id, meta.get("node_id"))
 

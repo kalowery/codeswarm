@@ -95,6 +95,7 @@ export interface SwarmRecord {
   node_count: number
   status: string
   slurm_state?: string
+  termination_message?: string
   provider?: string
   provider_id?: string
   known_exec_policies?: string[][]
@@ -635,7 +636,23 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         get().addOrUpdateSwarm({
           ...swarm,
           status: payload.status,
-          slurm_state: payload.slurm_state
+          slurm_state: payload.slurm_state,
+          termination_message:
+            String(payload.status || '').toLowerCase() === 'terminating'
+              ? swarm.termination_message
+              : undefined
+        })
+      }
+
+      if (type === 'swarm_terminate_progress') {
+        const swarmId = typeof payload?.swarm_id === 'string' ? payload.swarm_id : ''
+        const message = typeof payload?.message === 'string' ? payload.message : ''
+        if (!swarmId) return
+        const swarm = get().swarms[swarmId]
+        if (!swarm) return
+        get().addOrUpdateSwarm({
+          ...swarm,
+          termination_message: message || swarm.termination_message
         })
       }
 

@@ -946,8 +946,13 @@ export default function Home() {
                   )}
                   <div className="font-medium">{swarm.alias}</div>
                   <div className="text-sm text-slate-400">
-                    {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
-                  </div>
+                  {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
+                </div>
+                  {swarmIsTerminating && swarm.termination_message && (
+                    <div className="text-xs text-amber-300 mt-1 whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
+                      {swarm.termination_message}
+                    </div>
+                  )}
                   {(swarm.provider_id || swarm.provider) && (
                     <div className="text-xs text-slate-500 mt-1">
                       Provider: {swarm.provider_id || swarm.provider}
@@ -1029,7 +1034,7 @@ export default function Home() {
                 {activeIsTerminating && (
                   <div className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs">
                     <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                    Swarm shutdown in progress
+                    {active.termination_message || 'Swarm shutdown in progress'}
                   </div>
                 )}
               </div>

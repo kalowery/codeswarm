@@ -212,6 +212,122 @@ class AwsProvider(ClusterProvider):
         waiter = "instance-running" if target_state == "running" else "instance-terminated"
         self._aws(["ec2", "wait", waiter, "--instance-ids", *instance_ids])
 
+    def _describe_instances_by_ids_tolerant(self, instance_ids: list[str]) -> list[dict]:
+        if not instance_ids:
+            return []
+        try:
+            payload = self._aws(
+                ["ec2", "describe-instances", "--instance-ids", *instance_ids],
+                expect_json=True,
+            )
+        except RuntimeError as e:
+            msg = str(e)
+            if "InvalidInstanceID.NotFound" in msg:
+                return []
+            raise
+        instances: list[dict] = []
+        for reservation in payload.get("Reservations", []):
+            if not isinstance(reservation, dict):
+                continue
+            for instance in reservation.get("Instances", []):
+                if isinstance(instance, dict):
+                    instances.append(instance)
+        return instances
+
+    def _wait_instances_terminated(self, instance_ids: list[str], timeout_s: int = 420) -> tuple[bool, dict[str, str]]:
+        deadline = time.time() + max(30, int(timeout_s))
+        last_states: dict[str, str] = {}
+        while time.time() < deadline:
+            instances = self._describe_instances_by_ids_tolerant(instance_ids)
+            if not instances:
+                return True, {}
+            last_states = {}
+            all_terminated = True
+            for inst in instances:
+                iid = str(inst.get("InstanceId") or "").strip()
+                if not iid:
+                    continue
+                state = str((inst.get("State") or {}).get("Name") or "").strip().lower()
+                last_states[iid] = state
+                if state != "terminated":
+                    all_terminated = False
+            if all_terminated:
+                return True, last_states
+            time.sleep(5)
+        return False, last_states
+
+    def _describe_volume_state(self, volume_id: str) -> tuple[str, list[dict]]:
+        payload = self._aws(
+            ["ec2", "describe-volumes", "--volume-ids", str(volume_id)],
+            expect_json=True,
+        )
+        volumes = payload.get("Volumes") or []
+        if not volumes or not isinstance(volumes[0], dict):
+            return "", []
+        vol = volumes[0]
+        state = str(vol.get("State") or "").strip().lower()
+        attachments = vol.get("Attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
+        return state, [a for a in attachments if isinstance(a, dict)]
+
+    def _wait_volume_available(self, volume_id: str, timeout_s: int = 240) -> bool:
+        deadline = time.time() + max(30, int(timeout_s))
+        while time.time() < deadline:
+            try:
+                state, _ = self._describe_volume_state(volume_id)
+            except RuntimeError as e:
+                if "InvalidVolume.NotFound" in str(e):
+                    return True
+                raise
+            if state in ("available", "deleted"):
+                return True
+            time.sleep(5)
+        return False
+
+    def _detach_volume_force(self, volume_id: str) -> None:
+        try:
+            state, attachments = self._describe_volume_state(volume_id)
+        except RuntimeError as e:
+            if "InvalidVolume.NotFound" in str(e):
+                return
+            raise
+        if state != "in-use":
+            return
+        for att in attachments:
+            instance_id = str(att.get("InstanceId") or "").strip()
+            if not instance_id:
+                continue
+            args = [
+                "ec2",
+                "detach-volume",
+                "--volume-id",
+                str(volume_id),
+                "--instance-id",
+                instance_id,
+                "--force",
+            ]
+            self._aws(args)
+
+    def _list_job_volume_ids(self, job_id: str) -> list[str]:
+        payload = self._aws([
+            "ec2",
+            "describe-volumes",
+            "--filters",
+            json.dumps([
+                {"Name": "tag:codeswarm:backend", "Values": ["aws"]},
+                {"Name": "tag:codeswarm:job_id", "Values": [str(job_id)]},
+            ]),
+        ], expect_json=True)
+        ids: list[str] = []
+        for vol in payload.get("Volumes") or []:
+            if not isinstance(vol, dict):
+                continue
+            vid = str(vol.get("VolumeId") or "").strip()
+            if vid:
+                ids.append(vid)
+        return ids
+
     def _instance_map(self, instances: list[dict]) -> dict[str, dict]:
         return {
             str(inst.get("InstanceId")): inst
@@ -692,7 +808,12 @@ done
         _progress("config", f"Shared EBS size: {ebs_size_gb} GiB")
 
         volume_type = str(launch_params.get("ebs_volume_type") or self.aws_cfg.get("ebs_volume_type") or "gp3")
-        delete_on_shutdown = bool(launch_params.get("delete_ebs_on_shutdown", False))
+        delete_on_shutdown = bool(
+            launch_params.get(
+                "delete_ebs_on_shutdown",
+                self.aws_cfg.get("delete_ebs_on_shutdown", False),
+            )
+        )
         ebs_device = str(self.aws_cfg.get("ebs_device_name") or "/dev/sdf")
 
         job_id = f"aws_{uuid.uuid4().hex[:12]}"
@@ -872,38 +993,73 @@ done
         if isinstance(terminate_params, dict) and "delete_ebs_on_shutdown" in terminate_params:
             delete_on_shutdown = bool(terminate_params.get("delete_ebs_on_shutdown"))
 
+        terminate_soft_timeout_s = int(self.aws_cfg.get("terminate_soft_timeout_seconds") or 120)
+        terminate_force_timeout_s = int(self.aws_cfg.get("terminate_force_timeout_seconds") or 180)
+
+        volume_ids: set[str] = set()
+        meta_volume_id = str(meta.get("volume_id") or "").strip()
+        if meta_volume_id:
+            volume_ids.add(meta_volume_id)
+        try:
+            volume_ids.update(self._list_job_volume_ids(job_id))
+        except Exception:
+            # Continue best-effort with any volume id present in state metadata.
+            pass
+
         if instance_ids:
             self._aws(["ec2", "terminate-instances", "--instance-ids", *instance_ids])
-            self._wait_instances_state(instance_ids, "terminated")
+            terminated, states = self._wait_instances_terminated(
+                instance_ids,
+                timeout_s=terminate_soft_timeout_s,
+            )
+            if not terminated:
+                # When instances are stuck in shutting-down, detach shared data volume
+                # and escalate to force terminate.
+                if volume_ids:
+                    try:
+                        for vid in list(volume_ids):
+                            self._detach_volume_force(vid)
+                    except Exception:
+                        pass
+                self._aws([
+                    "ec2",
+                    "terminate-instances",
+                    "--instance-ids",
+                    *instance_ids,
+                    "--force",
+                    "--skip-os-shutdown",
+                ])
+                terminated, states = self._wait_instances_terminated(
+                    instance_ids,
+                    timeout_s=terminate_force_timeout_s,
+                )
+                if not terminated:
+                    state_text = ", ".join(f"{iid}:{st}" for iid, st in sorted(states.items()))
+                    raise RuntimeError(
+                        f"AWS instances did not terminate in time for job {job_id}. "
+                        f"Current states: {state_text or 'unknown'}"
+                    )
 
-        volume_id = str(meta.get("volume_id") or "").strip()
-        if not volume_id:
-            vols = self._aws([
-                "ec2",
-                "describe-volumes",
-                "--filters",
-                json.dumps([
-                    {"Name": "tag:codeswarm:backend", "Values": ["aws"]},
-                    {"Name": "tag:codeswarm:job_id", "Values": [str(job_id)]},
-                ]),
-            ], expect_json=True)
-            volumes = vols.get("Volumes") or []
-            if volumes and isinstance(volumes[0], dict):
-                volume_id = str(volumes[0].get("VolumeId") or "").strip()
-
-        if delete_on_shutdown and volume_id:
-            try:
-                self._aws(["ec2", "wait", "volume-available", "--volume-ids", volume_id])
-            except Exception:
+        if delete_on_shutdown and volume_ids:
+            delete_errors: list[str] = []
+            for vid in sorted(volume_ids):
                 try:
-                    self._aws(["ec2", "detach-volume", "--volume-id", volume_id, "--force"])
-                    self._aws(["ec2", "wait", "volume-available", "--volume-ids", volume_id])
+                    if not self._wait_volume_available(vid, timeout_s=120):
+                        self._detach_volume_force(vid)
+                        self._wait_volume_available(vid, timeout_s=240)
                 except Exception:
                     pass
-            try:
-                self._aws(["ec2", "delete-volume", "--volume-id", volume_id])
-            except Exception as e:
-                raise RuntimeError(f"Failed to delete EBS volume {volume_id}: {e}") from e
+                try:
+                    self._aws(["ec2", "delete-volume", "--volume-id", vid])
+                except Exception as e:
+                    msg = str(e)
+                    if "InvalidVolume.NotFound" in msg:
+                        continue
+                    delete_errors.append(f"{vid}: {msg}")
+            if delete_errors:
+                raise RuntimeError(
+                    "Failed to delete one or more EBS volumes: " + "; ".join(delete_errors)
+                )
 
         self._delete_job_meta(job_id)
 
