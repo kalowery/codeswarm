@@ -33,7 +33,7 @@ set +E
 trap - ERR
 
 echo "🚀 Bootstrapping Codeswarm..."
-echo "[bootstrap] script version: 2026-03-17.2"
+echo "[bootstrap] script version: 2026-03-17.3"
 
 NODE_VERSION="24.13.0"
 NODE_VERSION_TAG="v24.13.0"
@@ -213,20 +213,11 @@ echo "✅ Using Python $(python3 --version)"
 echo "📦 Installing root dependencies..."
 npm install
 
-echo "📦 Installing backend..."
-cd web/backend
-npm install
-cd ../..
-
-echo "📦 Installing frontend..."
-cd web/frontend
-npm install
-npm run build
-cd ../..
+echo "📦 Building frontend..."
+npm --workspace=frontend run build
 
 # --- Install CLI ---
 echo "📦 Installing CLI..."
-npm --workspace=cli install
 npm --workspace=cli run build
 npm --workspace=cli link
 
