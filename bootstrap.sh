@@ -11,6 +11,10 @@ echo "🚀 Bootstrapping Codeswarm..."
 NODE_VERSION="24.13.0"
 NODE_MAJOR_REQUIRED=24
 
+log() {
+  echo "[bootstrap] $*"
+}
+
 need_cmd() {
   local cmd="$1"
   local hint="$2"
@@ -24,6 +28,21 @@ need_cmd() {
 node_major() {
   node -p 'process.versions.node.split(".")[0]'
 }
+
+ensure_path_in_shell_startup() {
+  local bin_path="$1"
+  local line="export PATH=\"$bin_path:\$PATH\""
+  local profile
+  for profile in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+    [ -f "$profile" ] || touch "$profile"
+    if ! grep -F "$line" "$profile" >/dev/null 2>&1; then
+      printf "\n# Added by Codeswarm bootstrap\n%s\n" "$line" >> "$profile"
+      log "Added PATH update to $profile"
+    fi
+  done
+}
+
+log "Starting environment checks"
 
 # --- Ensure nvm ---
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
@@ -132,8 +151,21 @@ case ":$PATH:" in
   *":$NPM_GLOBAL_BIN:"*) ;;
   *) export PATH="$NPM_GLOBAL_BIN:$PATH" ;;
 esac
+ensure_path_in_shell_startup "$NPM_GLOBAL_BIN"
 
 # Verify link actually produced a runnable codeswarm binary.
+if ! command -v codeswarm >/dev/null 2>&1; then
+  # Fallback shim for environments where npm global bin is not respected.
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$(pwd)/cli/dist/index.js" "$HOME/.local/bin/codeswarm"
+  chmod +x "$(pwd)/cli/dist/index.js" || true
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) export PATH="$HOME/.local/bin:$PATH" ;;
+  esac
+  ensure_path_in_shell_startup "$HOME/.local/bin"
+fi
+
 if ! command -v codeswarm >/dev/null 2>&1; then
   echo ""
   echo "❌ codeswarm CLI was linked but is not on PATH."
