@@ -4,6 +4,28 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
+VERBOSE="${CODESWARM_BOOTSTRAP_VERBOSE:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --verbose|-v)
+      VERBOSE=1
+      ;;
+    --help|-h)
+      cat <<'USAGE'
+Usage: ./bootstrap.sh [--verbose]
+
+Options:
+  -v, --verbose   Enable debug tracing and extra diagnostics.
+  -h, --help      Show this help text.
+
+Environment:
+  CODESWARM_BOOTSTRAP_VERBOSE=1   Enable verbose mode.
+USAGE
+      exit 0
+      ;;
+  esac
+done
+
 set -euo pipefail
 
 echo "🚀 Bootstrapping Codeswarm..."
@@ -14,6 +36,14 @@ NODE_MAJOR_REQUIRED=24
 log() {
   echo "[bootstrap] $*"
 }
+
+if [ "$VERBOSE" = "1" ]; then
+  export PS4='+ [${BASH_SOURCE##*/}:${LINENO}] '
+  set -x
+  set -o errtrace
+  trap 'rc=$?; echo "❌ bootstrap error at line $LINENO while running: $BASH_COMMAND (exit $rc)" >&2' ERR
+  log "Verbose mode enabled"
+fi
 
 need_cmd() {
   local cmd="$1"
