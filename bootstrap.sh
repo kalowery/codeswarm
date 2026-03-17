@@ -4,8 +4,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-set -Eeuo pipefail
-trap 'rc=$?; echo "❌ Bootstrap failed at line $LINENO while running: $BASH_COMMAND (exit $rc)" >&2' ERR
+set -euo pipefail
 
 echo "🚀 Bootstrapping Codeswarm..."
 
@@ -50,7 +49,16 @@ if command -v nvm >/dev/null 2>&1; then
     nvm install "$NODE_VERSION"
   fi
 
-  nvm use "$NODE_VERSION"
+  if ! nvm use "$NODE_VERSION"; then
+    echo "⚠️ nvm use failed; retrying with --delete-prefix (common npm prefix conflict fix)..."
+    if ! nvm use --delete-prefix "$NODE_VERSION"; then
+      echo "❌ nvm could not activate Node $NODE_VERSION."
+      echo "If you have npm prefix settings, remove them from ~/.npmrc and retry."
+      echo "Typical fix:"
+      echo "  nvm use --delete-prefix v$NODE_VERSION --silent"
+      exit 1
+    fi
+  fi
 else
   # --- Fallback: system Node ---
   if ! command -v node >/dev/null 2>&1; then
