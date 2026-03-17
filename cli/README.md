@@ -88,6 +88,21 @@ codeswarm launch \
   --config ../configs/hpcfund.json
 ```
 
+By default, `codeswarm launch` now keeps the terminal attached with human-readable `INFO` activity logs after the swarm starts. Use `--detach` if you want the old fire-and-exit behavior.
+
+Launch with a persona directory and provider overrides:
+
+```bash
+codeswarm launch \
+  --nodes 2 \
+  --prompt "You are a full-stack debugging swarm." \
+  --provider local \
+  --agents ../personas/full-stack-web-developer \
+  --provider-param model=gpt-5-codex \
+  --provider-param temperature=0 \
+  --config ../configs/local.json
+```
+
 #### Required Flags
 
 | Flag | Description |
@@ -100,8 +115,13 @@ codeswarm launch \
 | Flag | Description |
 |------|------------|
 | `--provider` | Launch provider preset id (e.g. `slurm-default`, `aws-default`) |
+| `--agents` | Path to an `AGENTS.md` file or persona directory (`AGENTS.md` + optional `skills/`) |
+| `--provider-param key=value` | Provider-specific launch override; repeat for multiple values |
+| `--provider-params-json` | Provider-specific launch overrides as a JSON object |
+| `--detach` | Exit immediately after launch instead of following INFO activity logs |
 
 Backend-specific parameters (partition, time, account, etc.) are defined in the router configuration file.
+Use `codeswarm providers --config ...` to inspect configured provider ids and parameter keys.
 
 #### Output Example
 
@@ -123,6 +143,32 @@ codeswarm list --config ../configs/hpcfund.json
 ```
 
 Returns all known swarms from router state.
+
+### Stop Everything
+
+```bash
+codeswarm stop-all --config ../configs/local.json
+```
+
+This terminates all known swarms, then stops the local router. Add `--keep-router` to leave the router running.
+
+### List Launch Providers
+
+```bash
+codeswarm providers --config ../configs/local.json
+```
+
+Add `--json` to print the full provider catalog payload from the router.
+
+### Follow Activity Logs
+
+Attach to an existing swarm:
+
+```bash
+codeswarm attach <swarm_id> --config ../configs/local.json
+```
+
+Default attach output is a human-readable INFO stream with turn lifecycle, command execution, approvals, token totals, and assistant output. Use `--json` for raw event lines.
 
 ---
 

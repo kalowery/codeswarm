@@ -36,6 +36,23 @@ Frontend:
 npm --prefix web/frontend run dev
 ```
 
+### Option C: Launch directly from the terminal
+
+If you only need to create swarms and interact through the CLI, skip the backend/frontend:
+
+```bash
+codeswarm providers --config configs/local.json
+codeswarm launch --nodes 2 --prompt "You are a focused autonomous agent." --provider local --config configs/local.json
+codeswarm stop-all --config configs/local.json
+```
+
+CLI launch also supports the same launch-only payloads the web UI sends:
+
+- `--agents <path>` for a single `AGENTS.md` file or persona directory
+- repeated `--provider-param key=value`
+- `--provider-params-json '{"key":"value"}'`
+- `--detach` to exit immediately after launch; otherwise the CLI follows INFO activity logs by default
+
 ## 2. Modes
 
 ### Local mode
@@ -43,6 +60,8 @@ npm --prefix web/frontend run dev
 - backend: `cluster.backend = "local"`
 - workers run as local subprocesses
 - mailbox under `runs/mailbox` by default
+- active swarms survive router restart as long as the local worker processes are still alive
+- old local swarms launched before PID metadata existed cannot be reconstructed after their router state is lost
 
 ### Slurm mode
 

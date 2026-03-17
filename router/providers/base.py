@@ -59,3 +59,17 @@ class ClusterProvider(ABC):
         Return absolute archive path when created, else None.
         """
         return None
+
+    def bind_swarm(self, job_id: str, swarm_id: str, swarm_record: dict) -> None:
+        """
+        Optional hook invoked after the router assigns a swarm_id to a launched job.
+        Providers may persist enough metadata to recover active swarms after router restart.
+        """
+        return None
+
+    def recover_swarms(self) -> Dict[str, dict]:
+        """
+        Optional hook invoked during router startup.
+        Return recoverable active swarms keyed by swarm_id.
+        """
+        return {}

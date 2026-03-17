@@ -3,6 +3,7 @@ import uuid
 import shutil
 import json
 import os
+import signal
 import tarfile
 from pathlib import Path
 from pathlib import PurePosixPath
@@ -20,7 +21,7 @@ class LocalProvider(ClusterProvider):
 
     def __init__(self, config: dict):
         self.config = config or {}
-        self.jobs: Dict[str, List[subprocess.Popen]] = {}
+        self.jobs: Dict[str, List[dict]] = {}
 
         # Root directory for local runs
         self.workspace_root = Path(
@@ -29,6 +30,116 @@ class LocalProvider(ClusterProvider):
 
         # Archive root (optional)
         self.archive_root = self.config.get("archive_root")
+        self._load_persisted_jobs()
+
+    def _job_dir(self, job_id: str) -> Path:
+        return self.workspace_root / str(job_id)
+
+    def _job_metadata_path(self, job_id: str) -> Path:
+        return self._job_dir(job_id) / ".codeswarm-job.json"
+
+    def _read_job_metadata(self, job_id: str) -> dict | None:
+        path = self._job_metadata_path(job_id)
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    def _write_job_metadata(self, job_id: str, updates: dict) -> None:
+        path = self._job_metadata_path(job_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = self._read_job_metadata(job_id) or {}
+        current.update(updates)
+        path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+
+    def _load_persisted_jobs(self) -> None:
+        if not self.workspace_root.exists():
+            return
+        for path in sorted(self.workspace_root.glob("local_*/.codeswarm-job.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            job_id = str(data.get("job_id") or path.parent.name)
+            workers = self._normalize_worker_records(data.get("workers"))
+            if workers:
+                self.jobs[job_id] = workers
+
+    def _normalize_worker_records(self, raw_workers: object) -> List[dict]:
+        workers: List[dict] = []
+        if not isinstance(raw_workers, list):
+            return workers
+        for item in raw_workers:
+            if not isinstance(item, dict):
+                continue
+            pid = item.get("pid")
+            node_id = item.get("node_id")
+            start_ticks = item.get("start_ticks")
+            if not isinstance(pid, int) or pid <= 0:
+                continue
+            if not isinstance(node_id, int) or node_id < 0:
+                continue
+            if not isinstance(start_ticks, int) or start_ticks <= 0:
+                continue
+            workers.append({
+                "pid": pid,
+                "node_id": node_id,
+                "start_ticks": start_ticks,
+            })
+        workers.sort(key=lambda item: int(item["node_id"]))
+        return workers
+
+    def _read_proc_start_ticks(self, pid: int) -> int | None:
+        try:
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except Exception:
+            return None
+        try:
+            _, rest = stat_text.rsplit(")", 1)
+            fields = rest.strip().split()
+            return int(fields[19])
+        except Exception:
+            return None
+
+    def _read_proc_cmdline(self, pid: int) -> str:
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except Exception:
+            return ""
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+
+    def _is_worker_alive(self, worker: dict) -> bool:
+        pid = worker.get("pid")
+        start_ticks = worker.get("start_ticks")
+        if not isinstance(pid, int) or pid <= 0:
+            return False
+        if not isinstance(start_ticks, int) or start_ticks <= 0:
+            return False
+
+        current_ticks = self._read_proc_start_ticks(pid)
+        if current_ticks is None or current_ticks != start_ticks:
+            return False
+
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return False
+
+        cmdline = self._read_proc_cmdline(pid)
+        return "codex_worker.py" in cmdline
+
+    def _active_workers_for_job(self, job_id: str) -> List[dict]:
+        workers = self.jobs.get(job_id)
+        if not workers:
+            metadata = self._read_job_metadata(job_id) or {}
+            workers = self._normalize_worker_records(metadata.get("workers"))
+            if workers:
+                self.jobs[job_id] = workers
+        if not workers:
+            return []
+        return [worker for worker in workers if self._is_worker_alive(worker)]
 
     @staticmethod
     def _safe_skill_rel_path(path: str) -> str | None:
@@ -81,7 +192,7 @@ class LocalProvider(ClusterProvider):
         if callable(progress_cb):
             progress_cb("starting", f"Launching {nodes} local worker(s)")
         job_id = f"local_{uuid.uuid4().hex[:8]}"
-        procs: List[subprocess.Popen] = []
+        workers: List[dict] = []
 
         for i in range(nodes):
             agent_index = f"{i:02d}"
@@ -109,18 +220,38 @@ class LocalProvider(ClusterProvider):
                 env=env,
             )
 
-            procs.append(p)
+            start_ticks = self._read_proc_start_ticks(int(p.pid))
+            if not isinstance(start_ticks, int) or start_ticks <= 0:
+                raise RuntimeError(f"Unable to capture worker start time for pid {p.pid}")
 
-        self.jobs[job_id] = procs
+            workers.append({
+                "pid": int(p.pid),
+                "node_id": i,
+                "start_ticks": start_ticks,
+            })
+
+        self.jobs[job_id] = workers
+        self._write_job_metadata(job_id, {
+            "job_id": job_id,
+            "provider": "local",
+            "workers": workers,
+            "node_count": int(nodes),
+        })
         if callable(progress_cb):
             progress_cb("ready", f"Local swarm ready: {job_id}")
         return job_id
 
     def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
-        procs = self.jobs.get(job_id, [])
-        for p in procs:
+        workers = self.jobs.get(job_id)
+        if not workers:
+            metadata = self._read_job_metadata(job_id) or {}
+            workers = self._normalize_worker_records(metadata.get("workers"))
+        for worker in workers or []:
+            pid = worker.get("pid")
+            if not isinstance(pid, int) or pid <= 0:
+                continue
             try:
-                p.terminate()
+                os.kill(pid, signal.SIGTERM)
             except Exception:
                 pass
 
@@ -190,24 +321,59 @@ class LocalProvider(ClusterProvider):
         return str(archive_path.resolve())
 
     def get_job_state(self, job_id: str) -> Optional[str]:
-        procs = self.jobs.get(job_id)
-        if not procs:
-            return None
-
-        # If any process still running, treat as RUNNING
-        for p in procs:
-            if p.poll() is None:
-                return "RUNNING"
-
-        return "COMPLETED"
+        return "RUNNING" if self._active_workers_for_job(job_id) else None
 
     def list_active_jobs(self) -> Dict[str, str]:
         states = {}
-        for job_id in list(self.jobs.keys()):
-            state = self.get_job_state(job_id)
-            if state:
-                states[job_id] = state
+        job_ids = set(self.jobs.keys())
+        if self.workspace_root.exists():
+            for path in self.workspace_root.glob("local_*/.codeswarm-job.json"):
+                job_ids.add(path.parent.name)
+        for job_id in sorted(job_ids):
+            if self._active_workers_for_job(job_id):
+                states[job_id] = "RUNNING"
         return states
+
+    def bind_swarm(self, job_id: str, swarm_id: str, swarm_record: dict) -> None:
+        self._write_job_metadata(job_id, {
+            "job_id": job_id,
+            "swarm_id": str(swarm_id),
+            "node_count": int(swarm_record.get("node_count", 0) or 0),
+            "provider": str(swarm_record.get("provider") or "local"),
+            "provider_backend": str(swarm_record.get("provider_backend") or "local"),
+            "provider_id": swarm_record.get("provider_id"),
+            "system_prompt": swarm_record.get("system_prompt"),
+            "status": swarm_record.get("status") or "running",
+        })
+
+    def recover_swarms(self) -> Dict[str, dict]:
+        recovered: Dict[str, dict] = {}
+        if not self.workspace_root.exists():
+            return recovered
+        for path in sorted(self.workspace_root.glob("local_*/.codeswarm-job.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            job_id = str(data.get("job_id") or path.parent.name)
+            swarm_id = data.get("swarm_id")
+            if not isinstance(swarm_id, str) or not swarm_id.strip():
+                continue
+            if not self._active_workers_for_job(job_id):
+                continue
+            node_count = data.get("node_count")
+            if not isinstance(node_count, int) or node_count < 1:
+                node_count = len(self._normalize_worker_records(data.get("workers")))
+            recovered[swarm_id] = {
+                "job_id": job_id,
+                "node_count": int(node_count),
+                "system_prompt": data.get("system_prompt") or "",
+                "status": "running",
+                "provider": str(data.get("provider") or "local"),
+                "provider_backend": str(data.get("provider_backend") or "local"),
+                "provider_id": data.get("provider_id"),
+            }
+        return recovered
 
     def start_follower(self):
         follower_path = (

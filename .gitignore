@@ -5,6 +5,7 @@ cli/dist/
 
 # Router runtime state
 router_state.json
+router.pid
 
 # OS junk
 .DS_Store

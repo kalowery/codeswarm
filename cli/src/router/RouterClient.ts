@@ -18,17 +18,52 @@ export class RouterClient {
     return requestId;
   }
 
-  launch(nodes: number, systemPrompt: string, provider?: string) {
+  launch(
+    nodes: number,
+    systemPrompt: string,
+    opts?: {
+      provider?: string;
+      providerParams?: Record<string, string | number | boolean>;
+      agentsMdContent?: string;
+      agentsBundle?: {
+        mode: "file" | "directory";
+        agents_md_content: string;
+        skills_files: Array<{ path: string; content: string }>;
+      };
+    }
+  ) {
     const payload: any = {
       nodes,
       system_prompt: systemPrompt,
     };
 
-    if (typeof provider === "string" && provider.trim()) {
-      payload.provider = provider.trim();
+    if (typeof opts?.provider === "string" && opts.provider.trim()) {
+      payload.provider = opts.provider.trim();
+    }
+
+    if (
+      typeof opts?.agentsMdContent === "string" &&
+      opts.agentsMdContent.trim()
+    ) {
+      payload.agents_md_content = opts.agentsMdContent;
+    }
+
+    if (opts?.agentsBundle) {
+      payload.agents_bundle = opts.agentsBundle;
+    }
+
+    if (
+      opts?.providerParams &&
+      Object.keys(opts.providerParams).length > 0
+    ) {
+      payload.provider_params = opts.providerParams;
     }
 
     return this.sendCommand("swarm_launch", payload);
+  }
+
+  providers() {
+    return this.sendCommand("providers_list", {});
   }
 
   listSwarms() {

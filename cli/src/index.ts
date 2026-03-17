@@ -5,12 +5,216 @@ import { TcpTransport } from "./router/transport/TcpTransport.js";
 import { spawn, spawnSync } from "child_process";
 import { RouterClient } from "./router/RouterClient.js";
 import { EventFormatter } from "./formatter/EventFormatter.js";
+import fs from "fs/promises";
 import path from "path";
 import process from "process";
 import net from "net";
+import { fileURLToPath } from "url";
 import { runDoctor } from "./commands/doctor.js";
 
 const program = new Command();
+
+type ProviderParamValue = string | number | boolean;
+
+type AgentsSkillFile = {
+  path: string;
+  content: string;
+};
+
+type AgentsBundlePayload = {
+  mode: "file" | "directory";
+  agents_md_content: string;
+  skills_files: AgentsSkillFile[];
+};
+
+type LaunchCommandOptions = {
+  provider?: string;
+  providerParams?: Record<string, ProviderParamValue>;
+  agentsMdContent?: string;
+  agentsBundle?: AgentsBundlePayload;
+};
+
+type LaunchProvider = {
+  id: string;
+  label?: string;
+  backend?: string;
+  defaults?: Record<string, unknown>;
+  launch_fields?: Array<{ key?: string }>;
+  launch_panels?: Array<{ fields?: Array<{ key?: string }> }>;
+};
+
+const ROUTER_PID_FILENAME = "router.pid";
+
+function formatCommandForLog(command: unknown): string {
+  if (Array.isArray(command)) {
+    return command.map((part) => String(part)).join(" ");
+  }
+  if (typeof command === "string") {
+    return command;
+  }
+  if (command == null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(command);
+  } catch {
+    return String(command);
+  }
+}
+
+function formatDurationForLog(duration: any): string {
+  const secs = Number(duration?.secs);
+  const nanos = Number(duration?.nanos);
+  if (!Number.isFinite(secs) && !Number.isFinite(nanos)) {
+    return "";
+  }
+  const totalMs = (Number.isFinite(secs) ? secs : 0) * 1000 +
+    (Number.isFinite(nanos) ? nanos / 1_000_000 : 0);
+  return `${totalMs.toFixed(totalMs >= 1000 ? 0 : 1)}ms`;
+}
+
+function formatMultilinePreview(label: string, value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return `${label}:\n${trimmed}`;
+}
+
+class SwarmInfoLogger {
+  private activeAssistantNodes = new Set<number>();
+
+  constructor(private swarmId: string) {}
+
+  handle(event: any) {
+    if (event?.data?.swarm_id !== this.swarmId) {
+      return;
+    }
+
+    const data = event.data;
+    const node = Number.isFinite(Number(data?.node_id))
+      ? Number(data.node_id)
+      : undefined;
+    const nodeLabel = Number.isFinite(node) ? `node ${node}` : "node ?";
+
+    if (event.event === "turn_started") {
+      console.log(`\n[INFO] ${nodeLabel} turn started`);
+      return;
+    }
+
+    if (event.event === "assistant_delta") {
+      if (!Number.isFinite(node)) return;
+      const resolvedNode = Number(node);
+      if (!this.activeAssistantNodes.has(resolvedNode)) {
+        this.activeAssistantNodes.add(resolvedNode);
+        process.stdout.write(`\n[${nodeLabel}] assistant\n`);
+      }
+      process.stdout.write(String(data?.content ?? ""));
+      return;
+    }
+
+    if (event.event === "assistant") {
+      if (!Number.isFinite(node)) return;
+      const resolvedNode = Number(node);
+      if (!this.activeAssistantNodes.has(resolvedNode) && typeof data?.content === "string") {
+        process.stdout.write(`\n[${nodeLabel}] assistant\n${data.content}`);
+      }
+      return;
+    }
+
+    if (event.event === "turn_complete") {
+      if (Number.isFinite(node)) {
+        const resolvedNode = Number(node);
+        if (this.activeAssistantNodes.has(resolvedNode)) {
+          process.stdout.write("\n");
+          this.activeAssistantNodes.delete(resolvedNode);
+        }
+      }
+      console.log(`[INFO] ${nodeLabel} turn complete`);
+      return;
+    }
+
+    if (event.event === "task_started") {
+      console.log(`[INFO] ${nodeLabel} task started`);
+      return;
+    }
+
+    if (event.event === "task_complete") {
+      console.log(`[INFO] ${nodeLabel} task complete`);
+      return;
+    }
+
+    if (event.event === "thread_status") {
+      const status = String(data?.status?.type ?? "");
+      if (status) {
+        console.log(`[INFO] ${nodeLabel} status=${status}`);
+      }
+      return;
+    }
+
+    if (event.event === "command_started") {
+      const commandText = formatCommandForLog(data?.command);
+      const cwdSuffix =
+        typeof data?.cwd === "string" && data.cwd.trim()
+          ? ` (cwd: ${data.cwd})`
+          : "";
+      console.log(`[INFO] ${nodeLabel} command started: ${commandText}${cwdSuffix}`);
+      return;
+    }
+
+    if (event.event === "command_completed") {
+      const commandText = formatCommandForLog(data?.command);
+      const exitCode =
+        typeof data?.exit_code === "number" ? data.exit_code : "unknown";
+      const durationText = formatDurationForLog(data?.duration);
+      const durationSuffix = durationText ? ` in ${durationText}` : "";
+      console.log(
+        `[INFO] ${nodeLabel} command completed (exit ${exitCode})${durationSuffix}: ${commandText}`
+      );
+      const stderrPreview =
+        exitCode !== 0 ? formatMultilinePreview("stderr", data?.stderr) : null;
+      if (stderrPreview) {
+        console.log(stderrPreview);
+      }
+      return;
+    }
+
+    if (event.event === "exec_approval_required") {
+      const reason =
+        typeof data?.reason === "string" && data.reason.trim()
+          ? `: ${data.reason.trim()}`
+          : "";
+      console.log(`[INFO] ${nodeLabel} approval required${reason}`);
+      return;
+    }
+
+    if (event.event === "exec_approval_resolved") {
+      const approved =
+        typeof data?.approved === "boolean"
+          ? data.approved
+            ? "approved"
+            : "denied"
+          : "resolved";
+      console.log(`[INFO] ${nodeLabel} approval ${approved}`);
+      return;
+    }
+
+    if (event.event === "usage") {
+      if (typeof data?.total_tokens === "number") {
+        console.log(`[INFO] ${nodeLabel} total tokens=${data.total_tokens}`);
+      }
+      return;
+    }
+
+    if (event.event === "agent_error") {
+      const message = data?.message ? String(data.message) : "Unknown error";
+      console.error(`[ERROR] ${nodeLabel} agent error: ${message}`);
+    }
+  }
+}
 
 function isCompatiblePython(command: string): boolean {
   try {
@@ -48,6 +252,348 @@ function resolvePythonCommand(): string {
     "No compatible Python found (requires 3.10+). " +
     "Install Python 3.10+ or set CODESWARM_PYTHON to a compatible interpreter."
   );
+}
+
+function collectRepeatedOption(value: string, previous: string[] = []): string[] {
+  previous.push(value);
+  return previous;
+}
+
+function parseProviderParamValue(rawValue: string): ProviderParamValue {
+  const trimmed = rawValue.trim();
+  const lower = trimmed.toLowerCase();
+
+  if (lower === "true") return true;
+  if (lower === "false") return false;
+  if (/^-?(?:\d+|\d*\.\d+)$/.test(trimmed)) {
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+
+  return rawValue;
+}
+
+function assertPrimitiveProviderParams(
+  value: unknown,
+  sourceLabel: string
+): Record<string, ProviderParamValue> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${sourceLabel} must decode to a JSON object.`);
+  }
+
+  const out: Record<string, ProviderParamValue> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (
+      typeof entry !== "string" &&
+      typeof entry !== "number" &&
+      typeof entry !== "boolean"
+    ) {
+      throw new Error(
+        `${sourceLabel} values must be strings, numbers, or booleans (invalid key: ${key}).`
+      );
+    }
+    out[key] = entry;
+  }
+  return out;
+}
+
+function parseProviderParams(cmd: any): Record<string, ProviderParamValue> | undefined {
+  const params: Record<string, ProviderParamValue> = {};
+
+  if (typeof cmd.providerParamsJson === "string" && cmd.providerParamsJson.trim()) {
+    const parsed = JSON.parse(cmd.providerParamsJson);
+    Object.assign(
+      params,
+      assertPrimitiveProviderParams(parsed, "--provider-params-json")
+    );
+  }
+
+  const repeated = Array.isArray(cmd.providerParam)
+    ? (cmd.providerParam as string[])
+    : [];
+  for (const entry of repeated) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0) {
+      throw new Error(
+        `Invalid --provider-param '${entry}'. Expected key=value.`
+      );
+    }
+
+    const key = entry.slice(0, separator).trim();
+    const rawValue = entry.slice(separator + 1);
+    if (!key) {
+      throw new Error(
+        `Invalid --provider-param '${entry}'. Parameter key cannot be empty.`
+      );
+    }
+    params[key] = parseProviderParamValue(rawValue);
+  }
+
+  return Object.keys(params).length > 0 ? params : undefined;
+}
+
+async function readAgentsSkillsDir(
+  dirPath: string,
+  prefix = ""
+): Promise<AgentsSkillFile[]> {
+  const entries = await fs.readdir(dirPath, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
+
+  const out: AgentsSkillFile[] = [];
+  for (const entry of entries) {
+    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const absolutePath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...(await readAgentsSkillsDir(absolutePath, relPath)));
+      continue;
+    }
+    if (!entry.isFile()) {
+      continue;
+    }
+    out.push({
+      path: relPath,
+      content: await fs.readFile(absolutePath, "utf8"),
+    });
+  }
+  return out;
+}
+
+async function resolveAgentsLaunchOptions(
+  agentsPathInput?: string
+): Promise<Partial<LaunchCommandOptions>> {
+  if (!agentsPathInput || !agentsPathInput.trim()) {
+    return {};
+  }
+
+  const resolvedPath = path.resolve(process.cwd(), agentsPathInput);
+  const stats = await fs.stat(resolvedPath);
+
+  if (stats.isFile()) {
+    const content = await fs.readFile(resolvedPath, "utf8");
+    return {
+      agentsMdContent: content,
+      agentsBundle: {
+        mode: "file",
+        agents_md_content: content,
+        skills_files: [],
+      },
+    };
+  }
+
+  if (!stats.isDirectory()) {
+    throw new Error(
+      `Unsupported --agents path: ${agentsPathInput} (expected file or directory).`
+    );
+  }
+
+  const agentsMdPath = path.join(resolvedPath, "AGENTS.md");
+  let agentsMdContent: string;
+  try {
+    agentsMdContent = await fs.readFile(agentsMdPath, "utf8");
+  } catch (error: any) {
+    if (error?.code === "ENOENT") {
+      throw new Error(
+        `Persona directory ${agentsPathInput} must contain AGENTS.md at its root.`
+      );
+    }
+    throw error;
+  }
+
+  const skillsDir = path.join(resolvedPath, "skills");
+  let skillsFiles: AgentsSkillFile[] = [];
+  try {
+    const skillsStats = await fs.stat(skillsDir);
+    if (skillsStats.isDirectory()) {
+      skillsFiles = await readAgentsSkillsDir(skillsDir);
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+  }
+
+  return {
+    agentsMdContent,
+    agentsBundle: {
+      mode: "directory",
+      agents_md_content: agentsMdContent,
+      skills_files: skillsFiles,
+    },
+  };
+}
+
+function extractProviderFieldKeys(provider: LaunchProvider): string[] {
+  const keys = new Set<string>();
+
+  for (const field of provider.launch_fields ?? []) {
+    if (typeof field?.key === "string" && field.key.trim()) {
+      keys.add(field.key);
+    }
+  }
+
+  for (const panel of provider.launch_panels ?? []) {
+    for (const field of panel.fields ?? []) {
+      if (typeof field?.key === "string" && field.key.trim()) {
+        keys.add(field.key);
+      }
+    }
+  }
+
+  return Array.from(keys.values()).sort();
+}
+
+function printProviders(providers: LaunchProvider[]) {
+  if (providers.length === 0) {
+    console.log("No launch providers available.");
+    return;
+  }
+
+  console.log("\nLaunch Providers:");
+  console.log("------------------------------------------------------------");
+  for (const provider of providers) {
+    const header = [
+      provider.id,
+      provider.backend ? `backend=${provider.backend}` : undefined,
+      provider.label ? `label=${provider.label}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(" | ");
+    console.log(header);
+
+    const fieldKeys = extractProviderFieldKeys(provider);
+    if (fieldKeys.length > 0) {
+      console.log(`  params: ${fieldKeys.join(", ")}`);
+    }
+  }
+  console.log("------------------------------------------------------------\n");
+}
+
+function getRepoRoot(): string {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  return path.resolve(__dirname, "../../");
+}
+
+function getRouterPidFilePath(): string {
+  return path.join(getRepoRoot(), ROUTER_PID_FILENAME);
+}
+
+async function isRouterRunning(host: string, port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+
+    socket.setTimeout(300);
+
+    socket
+      .once("connect", () => {
+        socket.destroy();
+        resolve(true);
+      })
+      .once("error", () => {
+        resolve(false);
+      })
+      .once("timeout", () => {
+        socket.destroy();
+        resolve(false);
+      })
+      .connect(port, host);
+  });
+}
+
+function resolveRouterAddress(opts: any): { host: string; port: number } {
+  let host = "127.0.0.1";
+  let port = 8765;
+
+  if (opts.router) {
+    const [h, p] = String(opts.router).split(":");
+    host = h || host;
+    if (p) {
+      const parsed = parseInt(p, 10);
+      if (!isNaN(parsed)) {
+        port = parsed;
+      }
+    }
+  }
+
+  return { host, port };
+}
+
+async function stopRouterProcess(opts: any): Promise<boolean> {
+  const pidFile = getRouterPidFilePath();
+  try {
+    const raw = await fs.readFile(pidFile, "utf8");
+    const pid = parseInt(raw.trim(), 10);
+    if (!Number.isFinite(pid) || pid <= 0) {
+      return false;
+    }
+    process.kill(pid, "SIGTERM");
+    return true;
+  } catch {}
+
+  const configPath = opts.config ? path.resolve(process.cwd(), String(opts.config)) : null;
+  const configBasename = configPath ? path.basename(configPath) : null;
+  const probe = spawnSync("pgrep", ["-af", "router.router"], { encoding: "utf-8" });
+  if (probe.status !== 0) {
+    return false;
+  }
+
+  const pids = String(probe.stdout || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.includes("--daemon"))
+    .filter((line) => {
+      if (!configPath) return true;
+      return line.includes(configPath) || (configBasename ? line.includes(configBasename) : false);
+    })
+    .map((line) => parseInt(line.split(/\s+/, 1)[0] || "", 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  let stopped = false;
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGTERM");
+      stopped = true;
+    } catch {}
+  }
+  return stopped;
+}
+
+async function requestSwarms(client: RouterClient): Promise<Record<string, any>> {
+  return await new Promise<Record<string, any>>((resolve, reject) => {
+    const requestId = client.listSwarms();
+    client.onEvent((e) => {
+      if (e?.data?.request_id !== requestId) return;
+      if (e.event === "swarm_list") {
+        resolve((e.data?.swarms as Record<string, any>) || {});
+        return;
+      }
+      if (e.event === "command_rejected") {
+        reject(new Error(e.data?.reason || "Command rejected"));
+      }
+    });
+  });
+}
+
+async function terminateSwarmAndWait(
+  client: RouterClient,
+  swarmId: string
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const requestId = client.terminate(swarmId);
+    client.onEvent((e) => {
+      if (e?.data?.request_id !== requestId) return;
+      if (e.event === "swarm_terminated") {
+        resolve();
+        return;
+      }
+      if (e.event === "command_rejected") {
+        reject(new Error(e.data?.reason || "Command rejected"));
+      }
+    });
+  });
 }
 
 program
@@ -135,18 +681,59 @@ program
   .requiredOption("--nodes <number>", "Number of nodes")
   .requiredOption("--prompt <text>", "System prompt")
   .option("--provider <providerId>", "Launch provider preset id")
+  .option(
+    "--provider-param <key=value>",
+    "Provider parameter override; repeat for multiple values",
+    collectRepeatedOption,
+    []
+  )
+  .option(
+    "--provider-params-json <json>",
+    "Provider parameter overrides as a JSON object"
+  )
+  .option(
+    "--agents <path>",
+    "Path to AGENTS.md file or persona directory containing AGENTS.md and optional skills/"
+  )
+  .option("--detach", "Exit after swarm launch instead of following INFO activity logs", false)
   .option("--config <path>", "Path to router config")
   .option("--router <address>", "Router address override (host:port)")
   .option("--debug", "Print raw JSON messages from router", false)
   .action(async (cmd: any) => {
     const opts = cmd;
+    const parsedNodeCount = parseInt(String(cmd.nodes), 10);
+    if (Number.isNaN(parsedNodeCount) || parsedNodeCount < 1) {
+      throw new Error("--nodes must be a positive integer.");
+    }
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
+    const providerParams = parseProviderParams(cmd);
+    const agentsOptions = await resolveAgentsLaunchOptions(cmd.agents);
+    const launchOptions: LaunchCommandOptions = {
+      ...agentsOptions,
+    };
+    if (typeof cmd.provider === "string" && cmd.provider.trim()) {
+      launchOptions.provider = cmd.provider;
+    }
+    if (providerParams) {
+      launchOptions.providerParams = providerParams;
+    }
 
     let requestId: string | null = null;
+    let launchedSwarmId: string | null = null;
+    let infoLogger: SwarmInfoLogger | null = null;
 
     client.onEvent((e) => {
+      if (
+        launchedSwarmId &&
+        e?.data?.swarm_id === launchedSwarmId &&
+        infoLogger
+      ) {
+        infoLogger.handle(e);
+        return;
+      }
+
       if (!requestId || e?.data?.request_id !== requestId) return;
 
       switch (e.event) {
@@ -165,7 +752,18 @@ program
           Object.entries(e.data).forEach(([k, v]) => {
             console.log(`${k}: ${v}`);
           });
-          process.exit(0);
+          if (cmd.detach) {
+            process.exit(0);
+          }
+          launchedSwarmId =
+            typeof e.data?.swarm_id === "string" ? e.data.swarm_id : null;
+          if (!launchedSwarmId) {
+            console.error("Launch succeeded but swarm_id was missing from the response.");
+            process.exit(1);
+          }
+          infoLogger = new SwarmInfoLogger(launchedSwarmId);
+          console.log(`\n[INFO] Following activity logs for swarm ${launchedSwarmId}`);
+          console.log("[INFO] Press Ctrl+C to detach.\n");
           break;
         case "command_rejected":
           console.error("Launch failed:", e.data?.reason || "Command rejected");
@@ -177,11 +775,61 @@ program
       }
     });
 
-    requestId = client.launch(
-      parseInt(cmd.nodes),
-      cmd.prompt,
-      cmd.provider
-    );
+    requestId = client.launch(parsedNodeCount, cmd.prompt, launchOptions);
+
+    if (!cmd.detach) {
+      process.on("SIGINT", () => {
+        console.log("\nDetached.");
+        process.exit(0);
+      });
+      await new Promise<void>(() => {});
+    }
+  });
+
+program
+  .command("providers")
+  .description("List launch providers and accepted provider parameters")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .option("--json", "Print providers as JSON", false)
+  .action(async (cmd: any) => {
+    const opts = cmd;
+    const transport = await createTransport(opts);
+    const client = new RouterClient(transport);
+
+    let requestId: string | null = null;
+
+    client.onEvent((e) => {
+      if (!requestId || e?.data?.request_id !== requestId) return;
+
+      switch (e.event) {
+        case "providers_list": {
+          const providers = Array.isArray(e.data?.providers)
+            ? (e.data.providers as LaunchProvider[])
+            : [];
+          if (cmd.json) {
+            console.log(JSON.stringify(providers, null, 2));
+          } else {
+            printProviders(providers);
+          }
+          process.exit(0);
+          break;
+        }
+        case "command_rejected":
+          console.error(
+            "Provider lookup failed:",
+            e.data?.reason || "Command rejected"
+          );
+          process.exit(1);
+          break;
+        default:
+          console.error("Unexpected response:", e.event);
+          process.exit(1);
+      }
+    });
+
+    requestId = client.providers();
   });
 
 program
@@ -328,54 +976,22 @@ program
     }
   });
 
-async function createTransport(opts: any) {
-  const __dirname = path.dirname(new URL(import.meta.url).pathname);
+async function createTransport(opts: any, transportOpts?: { autoStartRouter?: boolean }) {
   const pythonCmd = resolvePythonCommand();
-
-  let host = "127.0.0.1";
-  let port = 8765;
-
-  if (opts.router) {
-    const [h, p] = String(opts.router).split(":");
-    host = h || host;
-    if (p) {
-      const parsed = parseInt(p, 10);
-      if (!isNaN(parsed)) {
-        port = parsed;
-      }
-    }
-  }
-
-  const isRouterRunning = (): Promise<boolean> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-
-      socket.setTimeout(300);
-
-      socket
-        .once("connect", () => {
-          socket.destroy();
-          resolve(true);
-        })
-        .once("error", () => {
-          resolve(false);
-        })
-        .once("timeout", () => {
-          socket.destroy();
-          resolve(false);
-        })
-        .connect(port, host);
-    });
-  };
+  const { host, port } = resolveRouterAddress(opts);
+  const autoStartRouter = transportOpts?.autoStartRouter !== false;
 
   if (!opts.router) {
-    const running = await isRouterRunning();
+    const running = await isRouterRunning(host, port);
 
     if (running) {
       if (!opts.json) {
         console.error("[codeswarm] Using existing router.");
       }
     } else {
+      if (!autoStartRouter) {
+        throw new Error("Router is not running.");
+      }
       if (!opts.config) {
         throw new Error(
           "No router running and no --config provided. Cannot start embedded router."
@@ -386,32 +1002,18 @@ async function createTransport(opts: any) {
         console.error("[codeswarm] Starting embedded router...");
       }
 
-      const repoRoot = path.resolve(__dirname, "../../");
+      const repoRoot = getRepoRoot();
 
       const routerProcess = spawn(
         pythonCmd,
         ["-u", "-m", "router.router", "--config", opts.config, "--daemon"],
         {
+          detached: true,
           stdio: "ignore",
           cwd: repoRoot
         }
       );
-
-      const shutdown = () => {
-        try {
-          routerProcess.kill();
-        } catch {}
-      };
-
-      process.on("exit", shutdown);
-      process.on("SIGINT", () => {
-        shutdown();
-        process.exit(0);
-      });
-      process.on("SIGTERM", () => {
-        shutdown();
-        process.exit(0);
-      });
+      routerProcess.unref();
     }
   }
 
@@ -455,6 +1057,58 @@ program
   });
 
 program
+  .command("stop-all")
+  .description("Terminate all known swarms and stop the local router")
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--keep-router", "Terminate all swarms but leave the router running", false)
+  .option("--debug", "Print raw JSON messages from router", false)
+  .action(async (cmd: any) => {
+    const opts = cmd;
+    const { host, port } = resolveRouterAddress(opts);
+    const running = await isRouterRunning(host, port);
+
+    if (!running) {
+      const stopped = cmd.keepRouter ? false : await stopRouterProcess(opts);
+      if (stopped) {
+        console.log("Router stopped.");
+      } else {
+        console.log("No running router found.");
+      }
+      return;
+    }
+
+    const transport = await createTransport(opts, { autoStartRouter: false });
+    const client = new RouterClient(transport);
+    const swarms = await requestSwarms(client);
+    const entries = Object.entries(swarms);
+
+    if (entries.length === 0) {
+      console.log("No swarms to stop.");
+    } else {
+      for (const [swarmId, info] of entries) {
+        const label = typeof (info as any)?.job_id === "string"
+          ? `${swarmId} (${(info as any).job_id})`
+          : swarmId;
+        console.log(`Stopping ${label}...`);
+        await terminateSwarmAndWait(client, swarmId);
+      }
+      console.log(`Stopped ${entries.length} swarm(s).`);
+    }
+
+    transport.close();
+
+    if (!cmd.keepRouter) {
+      const stopped = await stopRouterProcess(opts);
+      if (stopped) {
+        console.log("Router stopped.");
+      } else {
+        console.log("Router stop requested, but no router pid was found.");
+      }
+    }
+  });
+
+program
   .command("attach <swarmId>")
   .description("Attach to a running swarm and stream events continuously")
   .option("--config <path>", "Path to router config")
@@ -467,6 +1121,7 @@ program
 
     const transport = await createTransport(opts);
     const client = new RouterClient(transport);
+    const infoLogger = new SwarmInfoLogger(swarmId);
 
     // Validate swarm_id first
     const statusRequestId = client.status(swarmId);
@@ -509,19 +1164,7 @@ program
         e?.data?.swarm_id === swarmId &&
         typeof e?.data?.node_id === "number"
       ) {
-        const node = e.data.node_id;
-
-        if (e.event === "turn_started") {
-          process.stdout.write(`\n\n[swarm ${swarmId} | node ${node}]\n`);
-        }
-
-        if (e.event === "assistant_delta") {
-          process.stdout.write(e.data.content);
-        }
-
-        if (e.event === "turn_complete") {
-          process.stdout.write("\n");
-        }
+        infoLogger.handle(e);
       }
     });
 
@@ -536,8 +1179,6 @@ program
   });
 
 // --- Web Stack Supervisor ---
-
-import { fileURLToPath } from "url";
 
 async function runWebStack(opts: any) {
   const __filename = fileURLToPath(import.meta.url);
