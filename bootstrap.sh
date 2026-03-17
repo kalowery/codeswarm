@@ -45,11 +45,18 @@ ensure_path_in_shell_startup() {
 log "Starting environment checks"
 
 # --- Ensure nvm ---
+if [ -z "${HOME:-}" ]; then
+  echo "❌ HOME is not set in this shell environment."
+  exit 1
+fi
+
 export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 if [ -s "$NVM_DIR/nvm.sh" ]; then
   # Load nvm in non-interactive shells.
   # shellcheck source=/dev/null
+  set +u
   . "$NVM_DIR/nvm.sh"
+  set -u
 fi
 
 if ! command -v nvm >/dev/null 2>&1; then
@@ -58,7 +65,11 @@ if ! command -v nvm >/dev/null 2>&1; then
   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 
   export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-  [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+  if [ -s "$NVM_DIR/nvm.sh" ]; then
+    set +u
+    . "$NVM_DIR/nvm.sh"
+    set -u
+  fi
 fi
 
 if command -v nvm >/dev/null 2>&1; then
