@@ -205,6 +205,7 @@ Sample personas are provided under:
 - `personas/swarm-tool-orchestrator`
 - `personas/cuda-swarm-tool-client`
 - `personas/cuda-swarm-responder`
+- `personas/beads-task-graph-orchestrator`
 
 ## Auto-Routing From Task Completion
 
