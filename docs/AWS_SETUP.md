@@ -97,6 +97,8 @@ Example:
   "key_name": "codeswarm-keypair",
   "ssh_user": "ubuntu",
   "ssh_private_key_path": "~/.ssh/codeswarm.pem",
+  "ssh_retry_attempts": 4,
+  "ssh_retry_delay_seconds": 1.5,
   "instance_type": "c7i.4xlarge",
   "workers_per_node": 2,
   "ebs_volume_size_gb": 250,
@@ -147,6 +149,18 @@ Example:
 - Type: string (local file path)
 - Private key path on launch host.
 - `~` expansion is supported.
+
+### `ssh_retry_attempts`
+
+- Type: integer (`>= 1`)
+- Default: `4`
+- Number of retries for transient SSH failures during remote bootstrap/inject/control paths.
+
+### `ssh_retry_delay_seconds`
+
+- Type: number (`> 0`)
+- Default: `1.5`
+- Base delay between SSH retries (backoff scales by attempt number).
 
 ### `instance_type`
 
@@ -208,3 +222,9 @@ During terminate:
 
 1. Terminate all instances for the swarm job
 2. Conditionally delete EBS (based on `delete_ebs_on_shutdown`)
+
+Termination behavior details:
+
+- Router can force AWS termination after a shorter grace window via `router.aws_graceful_terminate_timeout_seconds` (default `45`).
+- Provider termination escalates to `terminate-instances --force --skip-os-shutdown` if normal termination stalls.
+- When `delete_ebs_on_shutdown=true`, provider attempts to clean up all job-tagged EBS volumes, including detach/retry paths.

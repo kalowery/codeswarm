@@ -38,6 +38,9 @@ class AwsProvider(ClusterProvider):
         if not self.region:
             raise RuntimeError("Missing AWS region in cluster.aws.region")
 
+        self.ssh_retry_attempts = max(1, int(self.aws_cfg.get("ssh_retry_attempts") or 4))
+        self.ssh_retry_delay_seconds = max(0.2, float(self.aws_cfg.get("ssh_retry_delay_seconds") or 1.5))
+
         safe_ref = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in self._provider_ref)
         self.state_file = Path(__file__).resolve().parents[1] / f"aws_provider_state_{safe_ref}.json"
         self._state_cache = self._load_state()
@@ -145,12 +148,47 @@ class AwsProvider(ClusterProvider):
         ]
 
     def _ssh(self, host: str, remote_cmd: str, input_text: str | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            self._ssh_cmd(host, remote_cmd),
-            input=input_text,
-            capture_output=True,
-            text=True,
-        )
+        last: subprocess.CompletedProcess | None = None
+        for attempt in range(1, self.ssh_retry_attempts + 1):
+            try:
+                result = subprocess.run(
+                    self._ssh_cmd(host, remote_cmd),
+                    input=input_text,
+                    capture_output=True,
+                    text=True,
+                )
+            except subprocess.TimeoutExpired:
+                if attempt >= self.ssh_retry_attempts:
+                    raise
+                time.sleep(self.ssh_retry_delay_seconds * attempt)
+                continue
+            last = result
+            if result.returncode == 0:
+                return result
+            if attempt >= self.ssh_retry_attempts:
+                break
+            if not self._is_transient_ssh_error(result.stdout, result.stderr):
+                break
+            time.sleep(self.ssh_retry_delay_seconds * attempt)
+        return last if last is not None else subprocess.CompletedProcess([], 255, "", "ssh failed")
+
+    @staticmethod
+    def _is_transient_ssh_error(stdout: str, stderr: str) -> bool:
+        text = f"{stdout}\n{stderr}".lower()
+        markers = [
+            "connection timed out",
+            "connection reset",
+            "connection refused",
+            "network is unreachable",
+            "no route to host",
+            "broken pipe",
+            "kex_exchange_identification",
+            "operation timed out",
+            "temporarily unavailable",
+            "could not resolve hostname",
+            "name or service not known",
+        ]
+        return any(marker in text for marker in markers)
 
     def _local_openai_api_key(self) -> str:
         key = str(os.environ.get("OPENAI_API_KEY") or "").strip()
@@ -234,9 +272,15 @@ class AwsProvider(ClusterProvider):
                     instances.append(instance)
         return instances
 
-    def _wait_instances_terminated(self, instance_ids: list[str], timeout_s: int = 420) -> tuple[bool, dict[str, str]]:
+    def _wait_instances_terminated(
+        self,
+        instance_ids: list[str],
+        timeout_s: int = 420,
+        poll_cb: Callable[[dict[str, str], int], None] | None = None,
+    ) -> tuple[bool, dict[str, str]]:
         deadline = time.time() + max(30, int(timeout_s))
         last_states: dict[str, str] = {}
+        last_cb = 0.0
         while time.time() < deadline:
             instances = self._describe_instances_by_ids_tolerant(instance_ids)
             if not instances:
@@ -253,6 +297,15 @@ class AwsProvider(ClusterProvider):
                     all_terminated = False
             if all_terminated:
                 return True, last_states
+            if callable(poll_cb):
+                now = time.time()
+                if (now - last_cb) >= 10.0:
+                    remaining = max(0, int(deadline - now))
+                    try:
+                        poll_cb(dict(last_states), remaining)
+                    except Exception:
+                        pass
+                    last_cb = now
             time.sleep(5)
         return False, last_states
 
@@ -989,6 +1042,19 @@ done
         if not instance_ids and isinstance(meta.get("instance_ids"), list):
             instance_ids = [str(i) for i in meta.get("instance_ids") if str(i).strip()]
 
+        progress_cb = None
+        if isinstance(terminate_params, dict):
+            candidate = terminate_params.get("_progress_cb")
+            if callable(candidate):
+                progress_cb = candidate
+
+        def _progress(stage: str, message: str) -> None:
+            if callable(progress_cb):
+                try:
+                    progress_cb(stage, message)
+                except Exception:
+                    pass
+
         delete_on_shutdown = bool(meta.get("delete_ebs_on_shutdown", False))
         if isinstance(terminate_params, dict) and "delete_ebs_on_shutdown" in terminate_params:
             delete_on_shutdown = bool(terminate_params.get("delete_ebs_on_shutdown"))
@@ -1007,20 +1073,33 @@ done
             pass
 
         if instance_ids:
+            _progress("provider_terminate", f"Requesting instance termination ({len(instance_ids)} instance(s))")
             self._aws(["ec2", "terminate-instances", "--instance-ids", *instance_ids])
             terminated, states = self._wait_instances_terminated(
                 instance_ids,
                 timeout_s=terminate_soft_timeout_s,
+                poll_cb=lambda current_states, remaining: _progress(
+                    "provider_terminate",
+                    "Waiting for instances to terminate (soft phase, "
+                    f"{remaining}s remaining): "
+                    + ", ".join(f"{iid}:{st}" for iid, st in sorted(current_states.items())),
+                ),
             )
             if not terminated:
                 # When instances are stuck in shutting-down, detach shared data volume
                 # and escalate to force terminate.
+                _progress(
+                    "provider_terminate",
+                    "Soft terminate timeout reached; escalating to force terminate",
+                )
                 if volume_ids:
                     try:
                         for vid in list(volume_ids):
                             self._detach_volume_force(vid)
+                        _progress("provider_terminate", "Issued force-detach for attached EBS volumes")
                     except Exception:
                         pass
+                _progress("provider_terminate", "Sending force terminate (--force --skip-os-shutdown)")
                 self._aws([
                     "ec2",
                     "terminate-instances",
@@ -1032,8 +1111,36 @@ done
                 terminated, states = self._wait_instances_terminated(
                     instance_ids,
                     timeout_s=terminate_force_timeout_s,
+                    poll_cb=lambda current_states, remaining: _progress(
+                        "provider_terminate",
+                        "Waiting for instances to terminate (force phase, "
+                        f"{remaining}s remaining): "
+                        + ", ".join(f"{iid}:{st}" for iid, st in sorted(current_states.items())),
+                    ),
                 )
                 if not terminated:
+                    # Re-issue force terminate once more in case AWS ignored prior request.
+                    _progress(
+                        "provider_terminate",
+                        "Force terminate wait timed out; retrying force terminate and detach once more",
+                    )
+                    try:
+                        self._aws([
+                            "ec2",
+                            "terminate-instances",
+                            "--instance-ids",
+                            *instance_ids,
+                            "--force",
+                            "--skip-os-shutdown",
+                        ])
+                    except Exception:
+                        pass
+                    if volume_ids:
+                        try:
+                            for vid in list(volume_ids):
+                                self._detach_volume_force(vid)
+                        except Exception:
+                            pass
                     state_text = ", ".join(f"{iid}:{st}" for iid, st in sorted(states.items()))
                     raise RuntimeError(
                         f"AWS instances did not terminate in time for job {job_id}. "
@@ -1041,6 +1148,7 @@ done
                     )
 
         if delete_on_shutdown and volume_ids:
+            _progress("provider_terminate", f"Deleting {len(volume_ids)} EBS volume(s)")
             delete_errors: list[str] = []
             for vid in sorted(volume_ids):
                 try:
@@ -1051,6 +1159,7 @@ done
                     pass
                 try:
                     self._aws(["ec2", "delete-volume", "--volume-id", vid])
+                    _progress("provider_terminate", f"Deleted EBS volume {vid}")
                 except Exception as e:
                     msg = str(e)
                     if "InvalidVolume.NotFound" in msg:

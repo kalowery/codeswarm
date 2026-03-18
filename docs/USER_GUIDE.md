@@ -68,6 +68,9 @@ CLI launch also supports the same launch-only payloads the web UI sends:
 - backend: `cluster.backend = "slurm"`
 - requires `cluster.slurm.login_host` (or profile-specific `cluster.slurm.profiles.<name>.login_host`) and `cluster.slurm.*`
 - mailbox under `<workspace_root>/<cluster_subdir>/mailbox`
+- transient SSH writes (inject/control/state checks) use retry/backoff:
+  - `cluster.slurm.ssh_retry_attempts` (default `4`)
+  - `cluster.slurm.ssh_retry_delay_seconds` (default `1.5`)
 
 ### AWS mode
 
@@ -76,6 +79,9 @@ CLI launch also supports the same launch-only payloads the web UI sends:
 - mounts shared workspace at `cluster.workspace_root`
 - supports multiple workers per node via provider launch fields
 - optional `delete_ebs_on_shutdown` controls EBS deletion during terminate
+- transient SSH writes (inject/control/bootstrap) use retry/backoff:
+  - `cluster.aws.ssh_retry_attempts` (default `4`)
+  - `cluster.aws.ssh_retry_delay_seconds` (default `1.5`)
 - detailed setup guide: `docs/AWS_SETUP.md`
 
 ### Multi-provider launch presets
@@ -197,6 +203,10 @@ Router sends `swarm_terminate`, marks swarm status as `terminating`, waits for
 agents to go idle (or timeout), then terminates backend resources and emits
 `swarm_terminated`.
 
+For AWS, router supports shorter graceful wait before force terminate via:
+
+- `router.aws_graceful_terminate_timeout_seconds` (default `45`)
+
 ## 10. Attention and navigation
 
 - node-level and swarm-level attention indicators pulse when unseen activity completes
@@ -231,6 +241,8 @@ Set Codex to workspace-write and disable internal approval prompts so Codeswarm 
 ### Router connectivity
 
 Ensure router is running on `127.0.0.1:8765` and backend can connect.
+
+Follower streams are auto-restarted by router when they drop (for both Slurm and AWS providers).
 
 ### Frontend build sanity check
 

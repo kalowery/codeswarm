@@ -55,6 +55,8 @@ Optional:
 
 - `cluster.slurm.account`
 - `cluster.slurm.qos`
+- `cluster.slurm.ssh_retry_attempts` (default: `4`)
+- `cluster.slurm.ssh_retry_delay_seconds` (default: `1.5`)
 
 Example:
 
@@ -88,6 +90,11 @@ Required:
 - `cluster.aws.subnet_id`
 - `cluster.aws.key_name`
 - `cluster.aws.ssh_private_key_path`
+
+Optional:
+
+- `cluster.aws.ssh_retry_attempts` (default: `4`)
+- `cluster.aws.ssh_retry_delay_seconds` (default: `1.5`)
 
 ### Launch provider presets (`launch_providers`)
 
@@ -153,6 +160,7 @@ New configs should use `login_host` under `cluster.slurm` or `cluster.slurm.prof
 - `graceful_terminate_timeout_seconds`
 - `graceful_terminate_poll_seconds`
 - `local_graceful_terminate_timeout_seconds`
+- `aws_graceful_terminate_timeout_seconds`
 
 ## Validation behavior
 

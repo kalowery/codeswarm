@@ -4,6 +4,7 @@ import json
 import shlex
 import base64
 import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
@@ -17,6 +18,8 @@ class SlurmProvider(ClusterProvider):
         self.cluster_cfg = config.get("cluster", {})
         self.slurm_cfg = self.cluster_cfg.get("slurm", {})
         self._provider_ref = str(config.get("_provider_ref") or "slurm")
+        self.ssh_retry_attempts = max(1, int(self.slurm_cfg.get("ssh_retry_attempts") or 4))
+        self.ssh_retry_delay_seconds = max(0.2, float(self.slurm_cfg.get("ssh_retry_delay_seconds") or 1.5))
 
     def _login_host(self) -> str:
         slurm_login = self.slurm_cfg.get("login_host")
@@ -26,6 +29,49 @@ class SlurmProvider(ClusterProvider):
         if isinstance(legacy, str) and legacy.strip():
             return legacy.strip()
         raise RuntimeError("Slurm login_host not configured in cluster.slurm")
+
+    @staticmethod
+    def _is_transient_ssh_error(stderr: str, stdout: str) -> bool:
+        text = f"{stderr}\n{stdout}".lower()
+        markers = [
+            "connection timed out",
+            "connection reset",
+            "connection refused",
+            "network is unreachable",
+            "no route to host",
+            "broken pipe",
+            "kex_exchange_identification",
+            "temporarily unavailable",
+            "operation timed out",
+            "could not resolve hostname",
+            "name or service not known",
+        ]
+        return any(marker in text for marker in markers)
+
+    def _ssh_run(self, args: list[str], timeout: int | None = None) -> subprocess.CompletedProcess:
+        last = None
+        for attempt in range(1, self.ssh_retry_attempts + 1):
+            try:
+                result = subprocess.run(
+                    args,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                if attempt >= self.ssh_retry_attempts:
+                    raise
+                time.sleep(self.ssh_retry_delay_seconds * attempt)
+                continue
+            last = result
+            if result.returncode == 0:
+                return result
+            if attempt >= self.ssh_retry_attempts:
+                break
+            if not self._is_transient_ssh_error(result.stderr or "", result.stdout or ""):
+                break
+            time.sleep(self.ssh_retry_delay_seconds * attempt)
+        return last
 
     def launch(
         self,
@@ -159,8 +205,7 @@ class SlurmProvider(ClusterProvider):
 
     def terminate(self, job_id: str, terminate_params: dict | None = None) -> None:
         login_host = self._login_host()
-
-        subprocess.run(["ssh", login_host, f"scancel {job_id}"])
+        self._ssh_run(["ssh", login_host, f"scancel {job_id}"])
 
     def archive(self, job_id: str, swarm_id: str) -> None:
         # Archival for Slurm should be handled by cluster-side policy
@@ -244,11 +289,9 @@ rm -rf "$TMP"
     def get_job_state(self, job_id: str) -> Optional[str]:
         login_host = self._login_host()
 
-        result = subprocess.run(
+        result = self._ssh_run(
             ["ssh", login_host, f"squeue -j {job_id} -h -o '%T'"],
-            capture_output=True,
-            text=True,
-            timeout=15
+            timeout=15,
         )
 
         state = result.stdout.strip()
@@ -265,7 +308,7 @@ rm -rf "$TMP"
             login_host,
             "squeue -h -o '%i|%j|%T'"
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = self._ssh_run(cmd)
 
         running_jobs: Dict[str, str] = {}
 
@@ -317,11 +360,7 @@ rm -rf "$TMP"
         json_line = json.dumps(payload)
         remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
 
-        result = subprocess.run(
-            ["ssh", login_host, remote_cmd],
-            capture_output=True,
-            text=True
-        )
+        result = self._ssh_run(["ssh", login_host, remote_cmd])
 
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
@@ -347,11 +386,7 @@ rm -rf "$TMP"
         json_line = json.dumps(payload)
         remote_cmd = f"printf '%s\\n' {shlex.quote(json_line)} >> {inbox_path}"
 
-        result = subprocess.run(
-            ["ssh", login_host, remote_cmd],
-            capture_output=True,
-            text=True
-        )
+        result = self._ssh_run(["ssh", login_host, remote_cmd])
 
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())

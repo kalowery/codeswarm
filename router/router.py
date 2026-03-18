@@ -903,6 +903,10 @@ def _graceful_terminate_swarm(config, provider, request_id, swarm_id, terminate_
         terminate_params = {}
     if isinstance(terminate_overrides, dict):
         terminate_params = {**terminate_params, **terminate_overrides}
+    terminate_params = {
+        **terminate_params,
+        "_progress_cb": _emit_terminate_progress,
+    }
     _maybe_export_workspace_archive(config, provider, request_id, swarm_id, job_id, terminate_params)
 
     try:
@@ -1938,15 +1942,26 @@ def run_daemon(config, providers):
     # Start one follower per backend provider so mixed-provider launches stream events.
     follower_procs = {}
     stdout_buffers = {}
+    follower_restart_after = {}
+    follower_starting = set()
 
     def start_follower_async(backend, provider):
+        if backend in follower_starting:
+            return
+        follower_starting.add(backend)
         try:
             proc = provider.start_follower()
             if proc:
                 follower_procs[backend] = proc
                 stdout_buffers[backend] = b""
+                follower_restart_after[backend] = time.time() + 1.0
+                if DEBUG:
+                    print(f"[router DEBUG] follower started: {backend}", flush=True)
         except Exception as e:
+            follower_restart_after[backend] = time.time() + 3.0
             print(f"Follower failed to start for {backend}: {e}", flush=True)
+        finally:
+            follower_starting.discard(backend)
 
     for backend, provider in providers.items():
         threading.Thread(target=start_follower_async, args=(backend, provider), daemon=True).start()
@@ -1966,8 +1981,21 @@ def run_daemon(config, providers):
             if exited:
                 follower_procs.pop(backend, None)
                 stdout_buffers.pop(backend, None)
+                follower_restart_after[backend] = time.time() + 2.0
                 if DEBUG:
                     print(f"[router DEBUG] follower exited: {backend}", flush=True)
+
+        now = time.time()
+        for backend, provider in providers.items():
+            if backend in follower_procs or backend in follower_starting:
+                continue
+            retry_at = float(follower_restart_after.get(backend, 0.0) or 0.0)
+            if now < retry_at:
+                continue
+            follower_restart_after[backend] = now + 2.0
+            if DEBUG:
+                print(f"[router DEBUG] restarting follower: {backend}", flush=True)
+            threading.Thread(target=start_follower_async, args=(backend, provider), daemon=True).start()
 
         streams = []
         fd_to_stream = {}
@@ -2064,6 +2092,7 @@ def run_daemon(config, providers):
         for backend in dead_backends:
             follower_procs.pop(backend, None)
             stdout_buffers.pop(backend, None)
+            follower_restart_after[backend] = time.time() + 1.0
             if DEBUG:
                 print(f"[router DEBUG] follower stream EOF: {backend}", flush=True)
 
