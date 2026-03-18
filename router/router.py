@@ -34,6 +34,7 @@ PENDING_APPROVALS = {}
 PENDING_APPROVAL_DECISIONS = {}
 RESOLVED_APPROVALS = {}
 RECENT_APPROVAL_RESULTS = {}
+APPROVALS_VERSION = 0
 ACTIVE_PROVIDER = None
 PROVIDERS = {}
 PROVIDER_SPECS = []
@@ -55,6 +56,12 @@ DEFAULT_AGENTS_FILE = Path(__file__).resolve().parents[1] / "AGENTS.md"
 GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
 GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
 RESOLVED_APPROVAL_TTL_SECONDS = 180
+
+
+def _bump_approvals_version():
+    global APPROVALS_VERSION
+    APPROVALS_VERSION += 1
+    return APPROVALS_VERSION
 
 
 def _normalize_agents_text(value):
@@ -269,6 +276,8 @@ def _pending_approvals_snapshot():
 
         approval = {
             "job_id": str(job_id),
+            "approval_id": meta.get("approval_id"),
+            "approval_status": meta.get("approval_status", "pending"),
             "call_id": str(call_id),
             "injection_id": meta.get("injection_id"),
             "turn_id": meta.get("turn_id"),
@@ -278,6 +287,7 @@ def _pending_approvals_snapshot():
             "proposed_execpolicy_amendment": meta.get("proposed_execpolicy_amendment"),
             "available_decisions": meta.get("available_decisions"),
             "created_at_ms": created_at_ms,
+            "updated_at_ms": int(float(meta.get("updated_at_ts") or created_at_ts or time.time()) * 1000),
         }
 
         node_map = snapshot.setdefault(str(swarm_id), {})
@@ -708,11 +718,15 @@ def _finalize_swarm_termination(provider, request_id, swarm_id, job_id):
             key for key in list(PENDING_APPROVALS.keys())
             if isinstance(key, tuple) and len(key) == 3 and str(key[0]) == str(job_id)
         ]
+        removed_any_approval = False
         for key in stale_approvals:
             PENDING_APPROVALS.pop(key, None)
             PENDING_APPROVAL_DECISIONS.pop(key, None)
             RESOLVED_APPROVALS.pop(key, None)
             RECENT_APPROVAL_RESULTS.pop(key, None)
+            removed_any_approval = True
+        if removed_any_approval:
+            _bump_approvals_version()
     save_state()
 
 
@@ -1692,8 +1706,11 @@ def translate_event(event):
             if existing_injection_id and (not event_turn_id or not injection_id):
                 merged_injection_id = existing_injection_id
             merged_turn_id = event_turn_id if event_turn_id else existing_turn_id
+            approval_id = existing.get("approval_id") or str(uuid.uuid4())
 
             PENDING_APPROVALS[key] = {
+                "approval_id": approval_id,
+                "approval_status": "pending",
                 "swarm_id": swarm_id,
                 "node_id": node_id,
                 "injection_id": merged_injection_id,
@@ -1707,13 +1724,17 @@ def translate_event(event):
                 "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
                 "available_decisions": merged_available,
                 "created_at_ts": time.time(),
+                "updated_at_ts": time.time(),
             }
+            approvals_version = _bump_approvals_version()
             approval_trace(
                 "required_received",
                 job_id=str(job_id),
                 swarm_id=str(swarm_id),
                 node_id=_normalize_node_id(node_id),
                 call_id=str(call_id),
+                approval_id=approval_id,
+                approvals_version=approvals_version,
                 injection_id=injection_id,
                 turn_id=event_turn_id,
                 approval_method=method,
@@ -1798,15 +1819,19 @@ def translate_event(event):
                     swarm_id=str(swarm_id),
                     node_id=_normalize_node_id(node_id),
                     call_id=str(call_id),
+                    approval_id=approval_id,
                     rpc_id=merged_rpc_id,
                 )
                 PENDING_APPROVAL_DECISIONS.pop(key, None)
                 PENDING_APPROVALS.pop(key, None)
+                _bump_approvals_version()
 
         return (
             "exec_approval_required",
             {
                 **base,
+                "approval_id": approval_id if call_id else None,
+                "approvals_version": APPROVALS_VERSION,
                 "injection_id": base.get("injection_id"),
                 "turn_id": event_turn_id,
                 "call_id": call_id,
@@ -2399,6 +2424,7 @@ def run_daemon(config, providers):
             elif command == "approvals_list":
                 emit_event("approvals_list", {
                     "request_id": request_id,
+                    "approvals_version": APPROVALS_VERSION,
                     "approvals": _pending_approvals_snapshot()
                 })
 
@@ -2524,6 +2550,7 @@ def run_daemon(config, providers):
                             "approved": approved,
                             "decision": decision,
                             "idempotent": True,
+                            "approvals_version": APPROVALS_VERSION,
                         })
                         continue
 
@@ -2854,6 +2881,7 @@ def run_daemon(config, providers):
                     })
                     continue
 
+                approval_id = meta.get("approval_id")
                 _remember_recent_approval_result(
                     job_id,
                     call_id,
@@ -2863,19 +2891,24 @@ def run_daemon(config, providers):
                 )
                 del PENDING_APPROVALS[key]
                 _mark_approval_resolved(job_id, call_id, meta.get("node_id"))
+                approvals_version = _bump_approvals_version()
 
                 emit_event("exec_approval_resolved", {
                     "request_id": request_id,
+                    "approval_id": approval_id,
                     "job_id": job_id,
                     "call_id": call_id,
                     "node_id": meta.get("node_id"),
                     "injection_id": meta.get("injection_id"),
                     "approved": approved,
                     "decision": decision,
+                    "approvals_version": approvals_version,
                 })
                 approval_trace(
                     "approve_command_resolved",
                     request_id=request_id,
+                    approval_id=approval_id,
+                    approvals_version=approvals_version,
                     job_id=str(job_id),
                     node_id=_normalize_node_id(meta.get("node_id")),
                     call_id=str(call_id),

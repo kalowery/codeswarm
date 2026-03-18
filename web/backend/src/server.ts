@@ -32,7 +32,7 @@ wss.on('connection', (ws: any) => {
     ws.send(
       JSON.stringify({
         type: 'approvals_snapshot',
-        payload: clonePendingApprovalsSnapshot()
+        payload: buildApprovalsSnapshotPayload()
       })
     );
   } catch {
@@ -87,7 +87,10 @@ const pendingProvidersRequests = new Map<
 const pendingApprovalsRequests = new Map<
   string,
   {
-    resolve: (approvals: Record<string, Record<number, ApprovalRecord[]>>) => void;
+    resolve: (snapshot: {
+      approvals_version: number;
+      approvals: Record<string, Record<number, ApprovalRecord[]>>;
+    }) => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }
@@ -104,6 +107,8 @@ type ApprovalStatus =
   | 'timeout';
 type ApprovalRecord = {
   job_id?: string;
+  approval_id?: string;
+  approval_status?: string;
   call_id: string;
   injection_id?: string;
   created_at_ms: number;
@@ -119,6 +124,7 @@ type ApprovalRecord = {
   available_decisions?: any;
 };
 const pendingApprovalsBySwarm = new Map<string, Map<number, ApprovalRecord[]>>();
+let latestApprovalsVersion = 0;
 const waitingOnApprovalByNode = new Map<string, number>();
 const WAITING_APPROVAL_STALE_MS = 45_000;
 const implicitResolvedApprovalByKey = new Map<string, number>();
@@ -275,7 +281,24 @@ function clonePendingApprovalsSnapshot() {
   return snapshot;
 }
 
-function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
+function buildApprovalsSnapshotPayload() {
+  return {
+    approvals_version: latestApprovalsVersion,
+    approvals: clonePendingApprovalsSnapshot()
+  };
+}
+
+function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any, incomingVersion?: number) {
+  if (Number.isFinite(incomingVersion)) {
+    const normalized = Number(incomingVersion);
+    if (normalized < latestApprovalsVersion) {
+      return;
+    }
+    latestApprovalsVersion = normalized;
+  } else {
+    latestApprovalsVersion += 1;
+  }
+
   const existingByKey = new Map<string, ApprovalRecord>();
   for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
     for (const [nodeId, approvals] of byNode.entries()) {
@@ -324,6 +347,14 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
 
         approvals.push({
           job_id: typeof rawApproval?.job_id === 'string' ? rawApproval.job_id : previous?.job_id,
+          approval_id:
+            typeof rawApproval?.approval_id === 'string'
+              ? rawApproval.approval_id
+              : previous?.approval_id,
+          approval_status:
+            typeof rawApproval?.approval_status === 'string'
+              ? rawApproval.approval_status
+              : previous?.approval_status,
           call_id: callId,
           injection_id:
             typeof rawApproval?.injection_id === 'string'
@@ -405,7 +436,7 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
 function broadcastApprovalsSnapshot() {
   hub.broadcast({
     type: 'approvals_snapshot',
-    payload: clonePendingApprovalsSnapshot()
+    payload: buildApprovalsSnapshotPayload()
   });
 }
 
@@ -882,10 +913,10 @@ function requestProvidersCatalog(timeoutMs = 5000): Promise<any[]> {
 
 function requestApprovalsSnapshot(
   timeoutMs = 2500
-): Promise<Record<string, Record<number, ApprovalRecord[]>>> {
+): Promise<{ approvals_version: number; approvals: Record<string, Record<number, ApprovalRecord[]>> }> {
   return new Promise((resolve, reject) => {
     if (!router.isConnected()) {
-      resolve(clonePendingApprovalsSnapshot());
+      resolve(buildApprovalsSnapshotPayload());
       return;
     }
     let request_id = '';
@@ -1062,6 +1093,8 @@ router.on('event', (msg: any) => {
       }
       upsertPendingApproval(swarmId, nodeId, {
         job_id: jobId,
+        approval_id: typeof data?.approval_id === 'string' ? data.approval_id : undefined,
+        approval_status: typeof data?.approval_status === 'string' ? data.approval_status : undefined,
         call_id: callId,
         injection_id: typeof data?.injection_id === 'string' ? data.injection_id : undefined,
         command: data?.command,
@@ -1274,14 +1307,17 @@ router.on('event', (msg: any) => {
 
   if (event === 'approvals_list') {
     const approvals = data?.approvals ?? {};
-    replacePendingApprovalsFromRouterSnapshot(approvals);
+    const approvalsVersionRaw = data?.approvals_version;
+    const approvalsVersion =
+      Number.isFinite(Number(approvalsVersionRaw)) ? Number(approvalsVersionRaw) : undefined;
+    replacePendingApprovalsFromRouterSnapshot(approvals, approvalsVersion);
     broadcastApprovalsSnapshot();
     const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
     if (requestId && pendingApprovalsRequests.has(requestId)) {
       const pending = pendingApprovalsRequests.get(requestId)!;
       clearTimeout(pending.timer);
       pendingApprovalsRequests.delete(requestId);
-      pending.resolve(clonePendingApprovalsSnapshot());
+      pending.resolve(buildApprovalsSnapshotPayload());
     }
     return;
   }
@@ -1679,7 +1715,7 @@ app.get('/queue', (req, res) => {
 
 app.get('/approvals', (req, res) => {
   // Serve the backend cache; a background router sync loop keeps this current.
-  return res.json(clonePendingApprovalsSnapshot());
+  return res.json(buildApprovalsSnapshotPayload());
 });
 
 app.get('/providers', async (req, res) => {

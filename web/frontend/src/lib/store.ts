@@ -63,6 +63,8 @@ export interface NodeTurn {
 }
 
 export interface PendingApproval {
+  approval_id?: string
+  approval_status?: string
   call_id: string
   injection_id?: string
   created_at_ms?: number
@@ -154,6 +156,7 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
   const pendingTaskComplete: Record<string, { content?: string }> = {}
   const idleCompletionTimers: Record<string, ReturnType<typeof setTimeout>> = {}
   let latestApprovalsSnapshot: Record<string, any> = {}
+  let latestApprovalsVersion = 0
   const resolvedApprovalsUntil: Record<string, number> = {}
 
   const approvalResolutionKey = (swarmId: string, nodeId: number, callId: string) =>
@@ -203,12 +206,15 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
   ): Record<number, PendingApproval[]> => {
     const merged: Record<number, PendingApproval[]> = {}
     const existing = existingPending ?? {}
+    const approvalKey = (approval: PendingApproval) =>
+      String(approval.approval_id || approval.call_id || '')
 
     const upsert = (nodeId: number, approval: PendingApproval) => {
       const current = merged[nodeId] ?? []
-      const prior = current.find((a) => a.call_id === approval.call_id)
+      const key = approvalKey(approval)
+      const prior = current.find((a) => approvalKey(a) === key)
       if (!prior || isIncomingApprovalNewer(prior, approval)) {
-        merged[nodeId] = [...current.filter((a) => a.call_id !== approval.call_id), approval]
+        merged[nodeId] = [...current.filter((a) => approvalKey(a) !== key), approval]
       }
     }
 
@@ -276,6 +282,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       const normalized = list
         .filter((a) => a && typeof a.call_id === 'string' && a.call_id.length > 0)
         .map((a) => ({
+          approval_id: typeof a.approval_id === 'string' ? a.approval_id : undefined,
+          approval_status: typeof a.approval_status === 'string' ? a.approval_status : undefined,
           call_id: a.call_id,
           injection_id: typeof a.injection_id === 'string' ? a.injection_id : undefined,
           created_at_ms: typeof a.created_at_ms === 'number' ? a.created_at_ms : undefined,
@@ -661,8 +669,22 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       }
 
       if (type === 'approvals_snapshot') {
-        const snapshot = payload && typeof payload === 'object' ? payload : {}
-        latestApprovalsSnapshot = snapshot as Record<string, any>
+        const snapshotRoot = payload && typeof payload === 'object' ? payload : {}
+        const incomingVersionRaw = (snapshotRoot as any).approvals_version
+        const incomingVersion = Number(incomingVersionRaw)
+        if (Number.isFinite(incomingVersion) && incomingVersion < latestApprovalsVersion) {
+          return
+        }
+        if (Number.isFinite(incomingVersion)) {
+          latestApprovalsVersion = incomingVersion
+        } else {
+          latestApprovalsVersion += 1
+        }
+        const snapshot =
+          (snapshotRoot as any).approvals && typeof (snapshotRoot as any).approvals === 'object'
+            ? ((snapshotRoot as any).approvals as Record<string, any>)
+            : (snapshotRoot as Record<string, any>)
+        latestApprovalsSnapshot = snapshot
         const state = get()
         const updatedSwarms: Record<string, SwarmRecord> = { ...state.swarms }
 
@@ -1204,6 +1226,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         const existingPendingForNode = (swarm.pending_approvals ?? {})[nodeId] ?? []
         const incomingPending: PendingApproval = {
+          approval_id: typeof payload.approval_id === 'string' ? payload.approval_id : undefined,
+          approval_status: typeof payload.approval_status === 'string' ? payload.approval_status : undefined,
           call_id: callId,
           injection_id: payload.injection_id,
           command: payload.command,
