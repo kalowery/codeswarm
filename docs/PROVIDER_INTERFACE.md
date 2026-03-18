@@ -101,6 +101,8 @@ Providers should set:
 - `CODESWARM_NODE_ID`
 - `CODESWARM_BASE_DIR`
 - `CODESWARM_CODEX_BIN` (optional)
+- `CODESWARM_CLAUDE_BIN` (optional fallback runtime when Codex is unavailable)
+- `CODESWARM_CODEX_ARGS_JSON` / `CODESWARM_CLAUDE_ARGS_JSON` (optional JSON arrays of runtime args)
 
 Workers should not depend on Slurm-specific env vars for control-plane behavior.
 

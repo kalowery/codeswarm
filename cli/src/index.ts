@@ -155,6 +155,16 @@ class SwarmInfoLogger {
       return;
     }
 
+    if (event.event === "worker_runtime_selected") {
+      const runtime = typeof data?.runtime === "string" ? data.runtime : "unknown";
+      const fallbackFrom =
+        typeof data?.fallback_from === "string" && data.fallback_from.trim()
+          ? ` (fallback from ${data.fallback_from})`
+          : "";
+      console.log(`[INFO] ${nodeLabel} runtime=${runtime}${fallbackFrom}`);
+      return;
+    }
+
     if (event.event === "command_started") {
       const commandText = formatCommandForLog(data?.command);
       const cwdSuffix =

@@ -5,6 +5,8 @@ import subprocess
 import time
 import select
 import signal
+import shlex
+import errno
 from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -36,6 +38,161 @@ def jsonrpc_notification(method, params=None):
     return json.dumps(msg)
 
 
+def parse_runtime_args(var_name, default_args):
+    raw = os.environ.get(var_name)
+    if not isinstance(raw, str) or not raw.strip():
+        return list(default_args)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(f"{var_name} must be valid JSON: {exc}") from exc
+
+    if not isinstance(parsed, list) or not all(isinstance(item, str) for item in parsed):
+        raise RuntimeError(f"{var_name} must decode to a JSON array of strings.")
+
+    return list(parsed)
+
+
+def build_runtime_candidates(codex_home: str):
+    codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
+    claude_bin = os.environ.get("CODESWARM_CLAUDE_BIN", "claude")
+
+    codex_args = parse_runtime_args(
+        "CODESWARM_CODEX_ARGS_JSON",
+        [
+            "--sandbox", "workspace-write",
+            "--ask-for-approval", "never",
+            "--add-dir", codex_home,
+            "app-server",
+            "--listen", "stdio://"
+        ],
+    )
+    claude_args = parse_runtime_args(
+        "CODESWARM_CLAUDE_ARGS_JSON",
+        [
+            "app-server",
+            "--listen", "stdio://"
+        ],
+    )
+
+    candidates = [
+        {
+            "runtime": "codex",
+            "bin": str(codex_bin),
+            "args": codex_args,
+        }
+    ]
+
+    disable_claude_fallback = str(os.environ.get("CODESWARM_DISABLE_CLAUDE_FALLBACK", "")).lower() in {
+        "1", "true", "yes"
+    }
+    if not disable_claude_fallback:
+        candidates.append({
+            "runtime": "claude",
+            "bin": str(claude_bin),
+            "args": claude_args,
+        })
+
+    return candidates
+
+
+def launch_runtime(candidates, outbox, job_id, node_id):
+    failures = []
+    first_runtime = candidates[0]["runtime"] if candidates else None
+
+    for candidate in candidates:
+        command = [candidate["bin"], *candidate["args"]]
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1
+            )
+        except FileNotFoundError as exc:
+            failures.append({
+                "runtime": candidate["runtime"],
+                "reason": f"not found: {exc}",
+            })
+            continue
+        except OSError as exc:
+            if exc.errno == errno.ENOEXEC:
+                shell_command = ["/bin/bash", candidate["bin"], *candidate["args"]]
+                try:
+                    proc = subprocess.Popen(
+                        shell_command,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        bufsize=1
+                    )
+                    command = shell_command
+                except OSError as shell_exc:
+                    failures.append({
+                        "runtime": candidate["runtime"],
+                        "reason": f"spawn failed: {shell_exc}",
+                    })
+                    continue
+            else:
+                failures.append({
+                    "runtime": candidate["runtime"],
+                    "reason": f"spawn failed: {exc}",
+                })
+                continue
+
+        event = {
+            "type": "worker_runtime_selected",
+            "job_id": job_id,
+            "node_id": node_id,
+            "runtime": candidate["runtime"],
+            "command": command,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if failures and first_runtime and candidate["runtime"] != first_runtime:
+            event["fallback_from"] = first_runtime
+            event["fallback_reasons"] = failures
+        write_event(outbox, event)
+        return proc, candidate["runtime"], command
+
+    raise RuntimeError(
+        "Unable to launch agent runtime. " +
+        "; ".join(
+            f"{failure['runtime']}: {failure['reason']}"
+            for failure in failures
+        )
+    )
+
+
+def finalize_worker(outbox, outbox_path, base, job_id, node_id, proc=None):
+    write_event(outbox, {
+        "type": "complete",
+        "job_id": job_id,
+        "node_id": node_id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
+    try:
+        archive_dir = base / "mailbox" / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        archived_path = archive_dir / outbox_path.name
+        outbox.flush()
+        outbox.close()
+        outbox_path.rename(archived_path)
+    except Exception:
+        pass
+
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 def main():
     # Ensure worker runs from project root
     config = load_config_from_env() if 'load_config_from_env' in globals() else None
@@ -61,25 +218,7 @@ def main():
     inbox_path.parent.mkdir(parents=True, exist_ok=True)
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
 
-    codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
-
     codex_home = str(Path.home() / ".codex")
-
-    proc = subprocess.Popen(
-        [
-            str(codex_bin),
-            "--sandbox", "workspace-write",
-            "--ask-for-approval", "never",
-            "--add-dir", codex_home,
-            "app-server",
-            "--listen", "stdio://"
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
 
     rpc_id = 0
     thread_id = None
@@ -98,30 +237,6 @@ def main():
 
     signal.signal(signal.SIGTERM, handle_shutdown)
     signal.signal(signal.SIGINT, handle_shutdown)
-
-    def send_request(method, params=None):
-        nonlocal rpc_id
-        request_id = rpc_id
-        msg = jsonrpc_request(request_id, method, params)
-        proc.stdin.write(msg + "\n")
-        proc.stdin.flush()
-        rpc_id += 1
-        return request_id
-
-    def send_notification(method, params=None):
-        msg = jsonrpc_notification(method, params)
-        proc.stdin.write(msg + "\n")
-        proc.stdin.flush()
-
-    def send_response(id_, result=None):
-        msg = {
-            "jsonrpc": "2.0",
-            "id": id_
-        }
-        if result is not None:
-            msg["result"] = result
-        proc.stdin.write(json.dumps(msg) + "\n")
-        proc.stdin.flush()
 
     def _extract_turn_id(payload):
         params = payload.get("params", {}) if isinstance(payload, dict) else {}
@@ -188,26 +303,94 @@ def main():
         })
 
     with open(outbox_path, "a", buffering=1) as outbox:
+        try:
+            runtime_candidates = build_runtime_candidates(codex_home)
+            proc, runtime_name, runtime_command = launch_runtime(
+                runtime_candidates,
+                outbox,
+                job_id,
+                node_id,
+            )
+        except Exception as exc:
+            write_event(outbox, {
+                "type": "worker_error",
+                "job_id": job_id,
+                "node_id": node_id,
+                "error": f"runtime_launch_failed: {exc}",
+            })
+            finalize_worker(outbox, outbox_path, base, job_id, node_id)
+            return
+
+        def send_request(method, params=None):
+            nonlocal rpc_id
+            request_id = rpc_id
+            msg = jsonrpc_request(request_id, method, params)
+            if proc.stdin is None:
+                raise RuntimeError("runtime stdin unavailable")
+            try:
+                proc.stdin.write(msg + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError(f"runtime request failed: {exc}") from exc
+            rpc_id += 1
+            return request_id
+
+        def send_notification(method, params=None):
+            msg = jsonrpc_notification(method, params)
+            if proc.stdin is None:
+                raise RuntimeError("runtime stdin unavailable")
+            try:
+                proc.stdin.write(msg + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError(f"runtime notification failed: {exc}") from exc
+
+        def send_response(id_, result=None):
+            msg = {
+                "jsonrpc": "2.0",
+                "id": id_
+            }
+            if result is not None:
+                msg["result"] = result
+            if proc.stdin is None:
+                raise RuntimeError("runtime stdin unavailable")
+            try:
+                proc.stdin.write(json.dumps(msg) + "\n")
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise RuntimeError(f"runtime response failed: {exc}") from exc
 
         write_event(outbox, {
             "type": "start",
             "job_id": job_id,
             "node_id": node_id,
             "hostname": hostname,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "runtime": runtime_name,
+            "command": " ".join(shlex.quote(part) for part in runtime_command),
         })
 
         # LSP-style handshake
-        send_request("initialize", {
-            "processId": None,
-            "rootUri": None,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "codeswarm-worker",
-                "title": "Codeswarm Worker",
-                "version": "0.1.0"
-            }
-        })
+        try:
+            send_request("initialize", {
+                "processId": None,
+                "rootUri": None,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "codeswarm-worker",
+                    "title": "Codeswarm Worker",
+                    "version": "0.1.0"
+                }
+            })
+        except RuntimeError as exc:
+            write_event(outbox, {
+                "type": "worker_error",
+                "job_id": job_id,
+                "node_id": node_id,
+                "error": str(exc),
+            })
+            finalize_worker(outbox, outbox_path, base, job_id, node_id, proc=proc)
+            return
 
         initialized_sent = False
         inbox_offset = 0
@@ -282,6 +465,8 @@ def main():
                     except Exception as e:
                         write_event(outbox, {
                             "type": "worker_error",
+                            "job_id": job_id,
+                            "node_id": node_id,
                             "error": str(e)
                         })
 
@@ -311,15 +496,25 @@ def main():
                     if event.get("type") == "user":
                         injection_id = event.get("injection_id")
                         last_injection_id = injection_id
-                        req_id = send_request("turn/start", {
-                            "threadId": thread_id,
-                            "input": [
-                                {
-                                    "type": "text",
-                                    "text": event.get("content", "")
-                                }
-                            ]
-                        })
+                        try:
+                            req_id = send_request("turn/start", {
+                                "threadId": thread_id,
+                                "input": [
+                                    {
+                                        "type": "text",
+                                        "text": event.get("content", "")
+                                    }
+                                ]
+                            })
+                        except RuntimeError as exc:
+                            write_event(outbox, {
+                                "type": "worker_error",
+                                "job_id": job_id,
+                                "node_id": node_id,
+                                "error": str(exc),
+                            })
+                            running = False
+                            break
                         request_to_injection[req_id] = injection_id
                         pending_injections.append(injection_id)
 
@@ -331,14 +526,34 @@ def main():
                             result = payload.get("result")
                             # Preserve local request id counter type; inbox rpc ids can be
                             # int or string depending on upstream request shape.
-                            send_response(response_id, result)
+                            try:
+                                send_response(response_id, result)
+                            except RuntimeError as exc:
+                                write_event(outbox, {
+                                    "type": "worker_error",
+                                    "job_id": job_id,
+                                    "node_id": node_id,
+                                    "error": str(exc),
+                                })
+                                running = False
+                                break
                         else:
                             method = payload.get("method")
                             params = payload.get("params")
 
                             if method:
                                 # Forward control notification directly to Codex app-server
-                                send_notification(method, params)
+                                try:
+                                    send_notification(method, params)
+                                except RuntimeError as exc:
+                                    write_event(outbox, {
+                                        "type": "worker_error",
+                                        "job_id": job_id,
+                                        "node_id": node_id,
+                                        "error": str(exc),
+                                    })
+                                    running = False
+                                    break
 
                     elif event.get("type") == "shutdown":
                         running = False
@@ -393,36 +608,15 @@ def main():
                 except Exception as e:
                     write_event(outbox, {
                         "type": "worker_error",
+                        "job_id": job_id,
+                        "node_id": node_id,
                         "error": f"session_tail_error: {str(e)}"
                     })
 
             if proc.poll() is not None:
                 running = False
 
-        write_event(outbox, {
-            "type": "complete",
-            "job_id": job_id,
-            "node_id": node_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        })
-
-        # Archive outbox file after completion (transport lifecycle cleanup)
-        try:
-            archive_dir = base / "mailbox" / "archive"
-            archive_dir.mkdir(parents=True, exist_ok=True)
-
-            archived_path = archive_dir / outbox_path.name
-            outbox.flush()
-            outbox.close()
-            outbox_path.rename(archived_path)
-        except Exception as e:
-            # Non-fatal; follower may continue until cleanup
-            pass
-
-        try:
-            proc.terminate()
-        except:
-            pass
+        finalize_worker(outbox, outbox_path, base, job_id, node_id, proc=proc)
 
 
 if __name__ == "__main__":
