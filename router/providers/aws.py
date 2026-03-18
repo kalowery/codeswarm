@@ -675,7 +675,8 @@ NODE_DIR="$TOOLS_DIR/node"
 NPM_BIN="$NODE_DIR/bin/npm"
 NPM_PREFIX="$TOOLS_DIR/npm-global"
 CODEX_BIN="$NPM_PREFIX/bin/codex"
-BEADS_BIN="$NPM_PREFIX/bin/beads"
+BEADS_BIN="$NPM_PREFIX/bin/bd"
+LEGACY_BEADS_BIN="$NPM_PREFIX/bin/beads"
 export PATH="$NODE_DIR/bin:$NPM_PREFIX/bin:$PATH"
 
 mkdir -p "$TOOLS_DIR" "$NPM_PREFIX"
@@ -700,11 +701,13 @@ if [ ! -x "$NPM_BIN" ]; then
 fi
 
 NPM_CONFIG_PREFIX="$NPM_PREFIX" "$NPM_BIN" install -g @openai/codex@{codex_version}
-NPM_CONFIG_PREFIX="$NPM_PREFIX" "$NPM_BIN" install -g beads@{beads_version} || true
+NPM_CONFIG_PREFIX="$NPM_PREFIX" "$NPM_BIN" install -g @beads/bd@{beads_version} || true
 
 "$CODEX_BIN" --version >/dev/null
 if [ -x "$BEADS_BIN" ]; then
   "$BEADS_BIN" --version >/dev/null
+elif [ -x "$LEGACY_BEADS_BIN" ]; then
+  "$LEGACY_BEADS_BIN" --version >/dev/null
 fi
 
 if ! "$CODEX_BIN" login status >/dev/null 2>&1; then

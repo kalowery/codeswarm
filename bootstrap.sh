@@ -21,6 +21,8 @@ Options:
 Environment:
   CODESWARM_BOOTSTRAP_VERBOSE=1   Enable verbose mode.
   CODESWARM_BOOTSTRAP_FORCE_NVM=1 Force nvm install/use path instead of system Node.
+  CODESWARM_BOOTSTRAP_INSTALL_BEADS=ask|yes|no  Optional Beads CLI install policy (default: ask).
+  CODESWARM_BEADS_VERSION=<version>             @beads/bd npm version to install (default: latest).
 USAGE
       exit 0
       ;;
@@ -39,6 +41,8 @@ NODE_VERSION="24.13.0"
 NODE_VERSION_TAG="v24.13.0"
 NODE_MAJOR_REQUIRED=18
 FORCE_NVM="${CODESWARM_BOOTSTRAP_FORCE_NVM:-0}"
+INSTALL_BEADS_POLICY="${CODESWARM_BOOTSTRAP_INSTALL_BEADS:-ask}"
+BEADS_VERSION="${CODESWARM_BEADS_VERSION:-latest}"
 
 log() {
   echo "[bootstrap] $*"
@@ -60,8 +64,55 @@ need_cmd() {
   fi
 }
 
+is_interactive_tty() {
+  [ -t 0 ] && [ -t 1 ]
+}
+
+should_install_beads() {
+  local policy="${1:-ask}"
+  case "$policy" in
+    yes|true|1|always)
+      return 0
+      ;;
+    no|false|0|never)
+      return 1
+      ;;
+    ask|prompt|"")
+      if ! is_interactive_tty; then
+        return 1
+      fi
+      printf "Optional dependency 'bd' (Beads CLI) is not installed. Install @beads/bd@%s now? [y/N] " "$BEADS_VERSION"
+      read -r reply
+      case "$reply" in
+        y|Y|yes|YES)
+          return 0
+          ;;
+        *)
+          return 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "⚠️ Unknown CODESWARM_BOOTSTRAP_INSTALL_BEADS policy '$policy'. Expected ask|yes|no. Skipping beads install."
+      return 1
+      ;;
+  esac
+}
+
 node_major() {
   node -p 'process.versions.node.split(".")[0]'
+}
+
+find_beads_cli() {
+  if command -v bd >/dev/null 2>&1; then
+    echo "bd"
+    return 0
+  fi
+  if command -v beads >/dev/null 2>&1; then
+    echo "beads"
+    return 0
+  fi
+  return 1
 }
 
 has_compatible_system_node() {
@@ -257,6 +308,31 @@ if ! command -v codeswarm >/dev/null 2>&1; then
 fi
 
 echo "✅ codeswarm linked at: $(command -v codeswarm)"
+
+# --- Optional: Beads CLI ---
+if BEADS_CLI="$(find_beads_cli)"; then
+  echo "✅ $BEADS_CLI detected: $("$BEADS_CLI" --version 2>/dev/null || echo 'installed')"
+else
+  echo "ℹ️ bd/beads CLI not found."
+  if should_install_beads "$INSTALL_BEADS_POLICY"; then
+    echo "📦 Installing @beads/bd@$BEADS_VERSION (optional)..."
+    set +e
+    npm install -g "@beads/bd@$BEADS_VERSION"
+    BEADS_INSTALL_RC=$?
+    set -e
+    if [ "$BEADS_INSTALL_RC" -ne 0 ]; then
+      echo "⚠️ Beads CLI installation failed; continuing without bd/beads."
+    fi
+    hash -r || true
+    if BEADS_CLI="$(find_beads_cli)"; then
+      echo "✅ $BEADS_CLI installed: $("$BEADS_CLI" --version 2>/dev/null || echo 'installed')"
+    else
+      echo "⚠️ bd/beads still not available on PATH after install attempt."
+    fi
+  else
+    echo "ℹ️ Skipping Beads CLI install."
+  fi
+fi
 
 # --- Ensure Homebrew paths (macOS) ---
 if [ -d "/opt/homebrew/bin" ]; then

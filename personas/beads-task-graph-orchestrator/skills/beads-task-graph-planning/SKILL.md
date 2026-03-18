@@ -2,6 +2,34 @@
 
 Use this skill to turn a software spec into a Beads task DAG and to retrieve the next ready task.
 
+## Mandatory Preflight
+
+Run this first in the target workspace:
+
+```bash
+BEADS_BIN="$(command -v bd || command -v beads || true)"
+test -n "$BEADS_BIN"
+"$BEADS_BIN" --version
+"$BEADS_BIN" --help
+```
+
+Then discover supported subcommands for this installed version:
+
+```bash
+"$BEADS_BIN" create --help
+"$BEADS_BIN" dep --help
+"$BEADS_BIN" ready --help
+"$BEADS_BIN" show --help
+"$BEADS_BIN" list --help
+```
+
+Do not assume command names. Use what help output confirms.
+
+Markdown-first policy:
+
+- For `build_graph`, markdown-based graph creation is required by default.
+- Fall back to per-task CLI creation only if markdown import/input is unsupported in the installed `bd` version.
+
 ## Intent Detection
 
 Treat prompt as `build_graph` if it includes:
@@ -27,8 +55,44 @@ If ambiguous, prefer `build_graph`.
    - foundations first
    - parallelizable branches
    - integration and validation tails
-5. Write tasks + dependencies into Beads repo.
+5. Write tasks + dependencies into Beads repo using markdown input/import by default.
 6. Query ready tasks and include top 3 in summary.
+
+### Canonical Markdown-First Patterns (verified against `bd --help`)
+
+Use markdown creation first:
+
+```bash
+# create multiple issues from markdown
+"$BEADS_BIN" create -f <tasks.md> --json
+```
+
+Dependency links in markdown should be expressed so `bd create -f` can materialize them directly.
+If some dependency edges are not represented by markdown parsing, add them explicitly after creation:
+
+```bash
+# blocked depends on blocker
+"$BEADS_BIN" dep add <blocked-id> <blocker-id> --json
+# equivalent form:
+"$BEADS_BIN" dep <blocker-id> --blocks <blocked-id> --json
+```
+
+### Per-Task Fallback Patterns (only if markdown import is unavailable)
+
+Use these only as fallback if supported by `--help`:
+
+```bash
+# create task
+"$BEADS_BIN" create --title "<title>" --description "<description>" --priority "<priority>" --json
+
+# set acceptance criteria (repeat or pass as supported)
+"$BEADS_BIN" update <task_id> --acceptance "<criterion>" --json
+
+# add dependency edge: child depends on parent
+"$BEADS_BIN" dep add <child_id> <parent_id> --json
+```
+
+If these exact subcommands are unavailable, map to equivalent discovered commands and record the mapping in output notes.
 
 ### Required Task Fields
 
@@ -52,6 +116,18 @@ If none ready:
 
 - return blocked status
 - list blocking dependencies/tasks to complete first
+
+### Canonical Query Patterns (adapt to installed CLI)
+
+```bash
+# list truly ready work (blocker-aware)
+"$BEADS_BIN" ready --json
+
+# inspect selected task including dependencies/details
+"$BEADS_BIN" show <task_id> --json
+```
+
+If JSON output is unavailable, parse stable text output conservatively and note that limitation.
 
 ## Response Templates
 
@@ -84,3 +160,4 @@ If none ready:
 - Never assign a task that has unsatisfied dependencies.
 - Never emit a "next task" that lacks acceptance criteria.
 - Keep descriptions implementation-ready and verifiable.
+- Include `commands_run` in every response so execution is auditable and reproducible.

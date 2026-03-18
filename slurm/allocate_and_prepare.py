@@ -172,7 +172,8 @@ def ensure_codex_ready(config):
     npm_bin = f"{node_bin}/npm"
     npm_prefix = f"{tools_dir}/npm-global"
     codex_bin = f"{npm_prefix}/bin/codex"
-    beads_bin = f"{npm_prefix}/bin/beads"
+    beads_bin = f"{npm_prefix}/bin/bd"
+    legacy_beads_bin = f"{npm_prefix}/bin/beads"
 
     # Ensure Node/npm exist in workspace
     if ssh_login(login_host, f'test -x "{npm_bin}"').returncode != 0:
@@ -199,15 +200,19 @@ def ensure_codex_ready(config):
     # by host-specific npm/nvm settings.
     BEADS_VERSION = "latest"  # change to explicit version if desired, e.g. "1.2.3"
 
-    if ssh_login(login_host, f'test -x "{beads_bin}"').returncode != 0:
-        print("beads not found in workspace. Installing (optional)...")
+    beads_present = ssh_login(
+        login_host,
+        f'test -x "{beads_bin}" || test -x "{legacy_beads_bin}"',
+    ).returncode == 0
+    if not beads_present:
+        print("Beads CLI (bd) not found in workspace. Installing (optional)...")
         install_cmd = (
             f'NPM_CONFIG_PREFIX="{npm_prefix}" '
-            f'"{npm_bin}" install -g beads@{BEADS_VERSION}'
+            f'"{npm_bin}" install -g @beads/bd@{BEADS_VERSION}'
         )
         result = ssh_login(login_host, install_cmd)
         if result.returncode != 0:
-            print("WARNING: beads installation failed; continuing without beads.")
+            print("WARNING: Beads CLI installation failed; continuing without bd/beads.")
             if result.stderr:
                 print(result.stderr)
 
@@ -218,12 +223,18 @@ def ensure_codex_ready(config):
         print(version_check.stderr)
         sys.exit(1)
 
-    if ssh_login(login_host, f'test -x "{beads_bin}"').returncode == 0:
-        beads_version_check = ssh_login(login_host, f'"{beads_bin}" --version')
-        if beads_version_check.returncode != 0:
-            print("WARNING: beads binary exists but failed to execute --version; continuing.")
-            if beads_version_check.stderr:
-                print(beads_version_check.stderr)
+    beads_version_check = ssh_login(
+        login_host,
+        (
+            f'if test -x "{beads_bin}"; then "{beads_bin}" --version; '
+            f'elif test -x "{legacy_beads_bin}"; then "{legacy_beads_bin}" --version; '
+            f'else exit 0; fi'
+        ),
+    )
+    if beads_version_check.returncode != 0:
+        print("WARNING: Beads CLI binary exists but failed to execute --version; continuing.")
+        if beads_version_check.stderr:
+            print(beads_version_check.stderr)
 
     # Check for existing Codex home configuration
     codex_home_check = ssh_login(

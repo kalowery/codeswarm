@@ -35,7 +35,7 @@ cd codeswarm
 ./bootstrap.sh
 ```
 
-Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, and verifies Codex CLI login.
+Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, links the `codeswarm` CLI, and checks for optional Beads CLI (`bd`) with optional install prompt.
 If runtime packages are missing after branch switches or large git updates, run:
 
 ```bash

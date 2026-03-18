@@ -5,6 +5,7 @@ import json
 import os
 import signal
 import tarfile
+import sys
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional
@@ -79,7 +80,7 @@ class LocalProvider(ClusterProvider):
                 continue
             if not isinstance(node_id, int) or node_id < 0:
                 continue
-            if not isinstance(start_ticks, int) or start_ticks <= 0:
+            if start_ticks is not None and (not isinstance(start_ticks, int) or start_ticks <= 0):
                 continue
             workers.append({
                 "pid": pid,
@@ -104,20 +105,25 @@ class LocalProvider(ClusterProvider):
     def _read_proc_cmdline(self, pid: int) -> str:
         try:
             raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            return (result.stdout or "").strip()
         except Exception:
             return ""
-        return raw.replace(b"\x00", b" ").decode("utf-8", errors="ignore")
 
     def _is_worker_alive(self, worker: dict) -> bool:
         pid = worker.get("pid")
         start_ticks = worker.get("start_ticks")
         if not isinstance(pid, int) or pid <= 0:
-            return False
-        if not isinstance(start_ticks, int) or start_ticks <= 0:
-            return False
-
-        current_ticks = self._read_proc_start_ticks(pid)
-        if current_ticks is None or current_ticks != start_ticks:
             return False
 
         try:
@@ -127,8 +133,17 @@ class LocalProvider(ClusterProvider):
         except PermissionError:
             return False
 
+        # On Linux, validate process identity via /proc start ticks to avoid PID reuse.
+        if isinstance(start_ticks, int) and start_ticks > 0:
+            current_ticks = self._read_proc_start_ticks(pid)
+            if current_ticks is None or current_ticks != start_ticks:
+                return False
+
         cmdline = self._read_proc_cmdline(pid)
-        return "codex_worker.py" in cmdline
+        if cmdline:
+            return "codex_worker.py" in cmdline
+        # Fallback if command line is unavailable on this platform.
+        return True
 
     def _active_workers_for_job(self, job_id: str) -> List[dict]:
         workers = self.jobs.get(job_id)
@@ -221,8 +236,12 @@ class LocalProvider(ClusterProvider):
             )
 
             start_ticks = self._read_proc_start_ticks(int(p.pid))
-            if not isinstance(start_ticks, int) or start_ticks <= 0:
-                raise RuntimeError(f"Unable to capture worker start time for pid {p.pid}")
+            if sys.platform.startswith("linux"):
+                if not isinstance(start_ticks, int) or start_ticks <= 0:
+                    raise RuntimeError(f"Unable to capture worker start time for pid {p.pid}")
+            else:
+                # /proc is Linux-specific; persist pid only on non-Linux hosts.
+                start_ticks = None
 
             workers.append({
                 "pid": int(p.pid),

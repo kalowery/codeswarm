@@ -119,8 +119,63 @@ type ApprovalRecord = {
   available_decisions?: any;
 };
 const pendingApprovalsBySwarm = new Map<string, Map<number, ApprovalRecord[]>>();
+const waitingOnApprovalByNode = new Map<string, number>();
+const WAITING_APPROVAL_STALE_MS = 45_000;
+const implicitResolvedApprovalByKey = new Map<string, number>();
+const IMPLICIT_RESOLVED_APPROVAL_TTL_MS = 5 * 60_000;
 const approvalKeyByRequestId = new Map<string, string>();
 let approvalSeq = 0;
+
+function waitingNodeKey(swarmId: string, nodeId: number) {
+  return `${swarmId}:${nodeId}`;
+}
+
+function approvalNodeKey(swarmId: string, nodeId: number, callId: string) {
+  return `${swarmId}:${nodeId}:${callId}`;
+}
+
+function markNodeWaitingOnApproval(swarmId: string, nodeId: number) {
+  if (!swarmId || !Number.isFinite(nodeId)) return;
+  waitingOnApprovalByNode.set(waitingNodeKey(swarmId, Number(nodeId)), Date.now());
+}
+
+function clearNodeWaitingOnApproval(swarmId: string, nodeId: number) {
+  if (!swarmId || !Number.isFinite(nodeId)) return;
+  waitingOnApprovalByNode.delete(waitingNodeKey(swarmId, Number(nodeId)));
+}
+
+function pruneStaleWaitingNodes(now: number) {
+  for (const [key, ts] of waitingOnApprovalByNode.entries()) {
+    if (now - ts > WAITING_APPROVAL_STALE_MS) {
+      waitingOnApprovalByNode.delete(key);
+    }
+  }
+}
+
+function pruneStaleImplicitResolvedApprovals(now: number) {
+  for (const [key, ts] of implicitResolvedApprovalByKey.entries()) {
+    if (now - ts > IMPLICIT_RESOLVED_APPROVAL_TTL_MS) {
+      implicitResolvedApprovalByKey.delete(key);
+    }
+  }
+}
+
+function markImplicitApprovalResolved(swarmId: string, nodeId: number, callId: string) {
+  if (!swarmId || !Number.isFinite(nodeId) || !callId) return;
+  implicitResolvedApprovalByKey.set(approvalNodeKey(swarmId, Number(nodeId), callId), Date.now());
+}
+
+function clearImplicitApprovalResolved(swarmId: string, nodeId: number, callId: string) {
+  if (!swarmId || !Number.isFinite(nodeId) || !callId) return;
+  implicitResolvedApprovalByKey.delete(approvalNodeKey(swarmId, Number(nodeId), callId));
+}
+
+function isImplicitlyResolvedApproval(swarmId: string, nodeId: number, callId: string) {
+  if (!swarmId || !Number.isFinite(nodeId) || !callId) return false;
+  const ts = implicitResolvedApprovalByKey.get(approvalNodeKey(swarmId, Number(nodeId), callId));
+  if (!Number.isFinite(ts)) return false;
+  return Date.now() - Number(ts) <= IMPLICIT_RESOLVED_APPROVAL_TTL_MS;
+}
 
 function sendRouterCommand(command: string, payload: any): string {
   if (!router.isConnected()) {
@@ -233,6 +288,8 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
 
   const nextBySwarm = new Map<string, Map<number, ApprovalRecord[]>>();
   const now = Date.now();
+  pruneStaleWaitingNodes(now);
+  pruneStaleImplicitResolvedApprovals(now);
   const snapshot = rawSnapshot && typeof rawSnapshot === 'object' ? rawSnapshot : {};
 
   for (const [swarmIdRaw, nodeMapRaw] of Object.entries(snapshot)) {
@@ -250,6 +307,7 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
       for (const rawApproval of approvalsRaw) {
         const callId = String(rawApproval?.call_id || '').trim();
         if (!callId) continue;
+        if (isImplicitlyResolvedApproval(swarmId, parsedNodeId, callId)) continue;
         const previous = existingByKey.get(`${swarmId}:${parsedNodeId}:${callId}`);
         const preservedStatus =
           previous?.status === 'submitted' || previous?.status === 'acknowledged'
@@ -299,6 +357,48 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
   pendingApprovalsBySwarm.clear();
   for (const [swarmId, byNode] of nextBySwarm.entries()) {
     pendingApprovalsBySwarm.set(swarmId, byNode);
+  }
+
+  // Router snapshots can briefly arrive empty while agents are already flagged
+  // waiting on approval. Preserve existing pending rows for those nodes until
+  // we receive an explicit resolve/start/reject or waiting flag clears.
+  for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
+    for (const nodeId of byNode.keys()) {
+      const key = waitingNodeKey(swarmId, nodeId);
+      if (!waitingOnApprovalByNode.has(key)) continue;
+      waitingOnApprovalByNode.set(key, now);
+    }
+  }
+  for (const [key, lastSeenMs] of waitingOnApprovalByNode.entries()) {
+    if (now - lastSeenMs > WAITING_APPROVAL_STALE_MS) continue;
+    const [swarmId, nodeIdRaw] = key.split(':');
+    const nodeId = Number(nodeIdRaw);
+    if (!swarmId || !Number.isFinite(nodeId)) continue;
+
+    const byNode = pendingApprovalsBySwarm.get(swarmId);
+    const hasCurrent = !!byNode && Array.isArray(byNode.get(nodeId)) && (byNode.get(nodeId)!.length > 0);
+    if (hasCurrent) continue;
+
+    const existingByNode = existingByKey;
+    const prefix = `${swarmId}:${nodeId}:`;
+    const carryForward: ApprovalRecord[] = [];
+    for (const [approvalKeyToken, approval] of existingByNode.entries()) {
+      if (!approvalKeyToken.startsWith(prefix)) continue;
+      if (!approval) continue;
+      if (isImplicitlyResolvedApproval(swarmId, nodeId, String(approval.call_id || ''))) continue;
+      const status = approval.status;
+      if (status !== 'pending' && status !== 'submitted' && status !== 'acknowledged') continue;
+      carryForward.push({
+        ...approval,
+        updated_at_ms: now,
+        approval_seq: nextApprovalSeq()
+      });
+    }
+    if (carryForward.length === 0) continue;
+    carryForward.sort((a, b) => Number(a.created_at_ms) - Number(b.created_at_ms));
+    const mergedByNode = byNode ?? new Map<number, ApprovalRecord[]>();
+    mergedByNode.set(nodeId, carryForward);
+    pendingApprovalsBySwarm.set(swarmId, mergedByNode);
   }
 }
 
@@ -392,6 +492,7 @@ function removePendingApprovalByCallId(swarmId: string, callId: string, nodeId?:
   if (!byNode) return;
   const nodeIds = Number.isFinite(nodeId) ? [Number(nodeId)] : Array.from(byNode.keys());
   for (const id of nodeIds) {
+    markImplicitApprovalResolved(swarmId, id, callId);
     const existing = byNode.get(id) ?? [];
     const next = existing.filter((a) => a?.call_id !== callId);
     if (next.length > 0) byNode.set(id, next);
@@ -411,7 +512,17 @@ function removePendingApprovalByCallId(swarmId: string, callId: string, nodeId?:
 function clearPendingApprovalsForSwarm(swarmId: string) {
   if (!swarmId) return;
   pendingApprovalsBySwarm.delete(swarmId);
+  for (const key of Array.from(waitingOnApprovalByNode.keys())) {
+    if (key.startsWith(`${swarmId}:`)) {
+      waitingOnApprovalByNode.delete(key);
+    }
+  }
   approvalKeyByRequestId.clear();
+  for (const key of Array.from(implicitResolvedApprovalByKey.keys())) {
+    if (key.startsWith(`${swarmId}:`)) {
+      implicitResolvedApprovalByKey.delete(key);
+    }
+  }
 }
 
 function clearReplyRoutesForSwarm(swarmId: string) {
@@ -919,14 +1030,39 @@ router.on('event', (msg: any) => {
   console.log('Router event received:', msg.event);
   const { event, data } = msg;
 
+  if (event === 'thread_status') {
+    const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
+    const nodeId = Number(data?.node_id);
+    const activeFlags = Array.isArray(data?.status?.activeFlags) ? data.status.activeFlags : [];
+    const waiting = activeFlags.includes('waitingOnApproval');
+    if (swarmId && Number.isFinite(nodeId)) {
+      if (waiting) {
+        markNodeWaitingOnApproval(swarmId, Number(nodeId));
+        // Opportunistically refresh approval snapshot when agent enters
+        // waitingOnApproval, so UI can surface pending requests promptly.
+        try {
+          sendRouterCommand('approvals_list', {});
+        } catch {
+          // best-effort only
+        }
+      } else {
+        clearNodeWaitingOnApproval(swarmId, Number(nodeId));
+      }
+    }
+  }
+
   if (event === 'exec_approval_required') {
     const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
     const nodeId = Number(data?.node_id);
     const jobId = typeof data?.job_id === 'string' ? data.job_id : '';
+    const callId = typeof data?.call_id === 'string' ? data.call_id : '';
     if (swarmId && Number.isFinite(nodeId)) {
+      if (callId) {
+        clearImplicitApprovalResolved(swarmId, Number(nodeId), callId);
+      }
       upsertPendingApproval(swarmId, nodeId, {
         job_id: jobId,
-        call_id: typeof data?.call_id === 'string' ? data.call_id : '',
+        call_id: callId,
         injection_id: typeof data?.injection_id === 'string' ? data.injection_id : undefined,
         command: data?.command,
         reason: typeof data?.reason === 'string' ? data.reason : '',
@@ -1004,11 +1140,32 @@ router.on('event', (msg: any) => {
         );
       }
       resolveApprovalAcksByData(data, { type: 'started' });
+      const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
+      const nodeId = Number(data?.node_id);
+      if (swarmId && Number.isFinite(nodeId)) {
+        // If command execution has begun, any pending approval for this exact
+        // call is effectively resolved even if runtime skips explicit resolved event.
+        removePendingApprovalByCallId(swarmId, data.call_id, Number(nodeId));
+        clearNodeWaitingOnApproval(swarmId, Number(nodeId));
+        broadcastApprovalsSnapshot();
+      }
     }
     // Do not eagerly clear pending approvals on command_started.
     // Some runtimes emit exec_command_begin before/alongside approval-required
     // for the same call_id, and removing here can make dialogs disappear until
     // another user action triggers fresh state.
+  }
+
+  if (event === 'command_completed') {
+    const swarmId = typeof data?.swarm_id === 'string' ? data.swarm_id : '';
+    const callId = typeof data?.call_id === 'string' ? data.call_id : '';
+    const nodeId = Number(data?.node_id);
+    if (swarmId && callId && Number.isFinite(nodeId)) {
+      markImplicitApprovalResolved(swarmId, Number(nodeId), callId);
+      removePendingApprovalByCallId(swarmId, callId, Number(nodeId));
+      clearNodeWaitingOnApproval(swarmId, Number(nodeId));
+      broadcastApprovalsSnapshot();
+    }
   }
 
   if (event === 'command_rejected') {

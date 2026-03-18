@@ -1702,6 +1702,7 @@ def translate_event(event):
                 "request_id_hint": existing.get("request_id_hint") or request_id_hint,
                 "approval_method": method,
                 "command": command,
+                "reason": reason,
                 "cwd": cwd,
                 "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
                 "available_decisions": merged_available,
