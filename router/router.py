@@ -1319,18 +1319,42 @@ def translate_event(event):
             "status": {"type": "idle"},
         })
 
-    if event_type != "codex_rpc":
-        return None
-
-    payload = event.get("payload", {})
-    method = payload.get("method")
-
     base = {
         "swarm_id": swarm_id,
         "job_id": job_id,
         "node_id": node_id,
         "injection_id": injection_id
     }
+
+    if event_type == "worker_runtime_selected":
+        return (
+            "worker_runtime_selected",
+            {
+                **base,
+                "runtime": event.get("runtime"),
+                "command": event.get("command"),
+                "fallback_from": event.get("fallback_from"),
+                "fallback_reasons": event.get("fallback_reasons"),
+                "timestamp": event.get("timestamp"),
+            },
+        )
+
+    if event_type == "worker_error":
+        return (
+            "agent_error",
+            {
+                **base,
+                "message": event.get("error"),
+                "error_code": "worker_error",
+                "raw": event,
+            },
+        )
+
+    if event_type != "codex_rpc":
+        return None
+
+    payload = event.get("payload", {})
+    method = payload.get("method")
 
     def _collect_text_parts(value):
         if isinstance(value, str):
