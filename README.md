@@ -202,6 +202,9 @@ Sample personas are provided under:
 - `personas/amd-gpu-developer`
 - `personas/full-stack-web-developer`
 - `personas/flutter-mobile-app-developer`
+- `personas/swarm-tool-orchestrator`
+- `personas/cuda-swarm-tool-client`
+- `personas/cuda-swarm-responder`
 
 ## Auto-Routing From Task Completion
 
