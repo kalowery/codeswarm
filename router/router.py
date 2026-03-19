@@ -237,7 +237,99 @@ def _normalize_decision_for_available(
             return "accept"
         if flags["approved"]:
             return "approved"
-        return "accept" if approved_flag else "cancel"
+    return "accept" if approved_flag else "cancel"
+
+
+def _choose_richer_approval_command(previous, new):
+    if previous is None:
+        return new
+    if new is None:
+        return previous
+
+    def _change_count(command):
+        if not isinstance(command, dict):
+            return 0
+        changes = command.get("changes")
+        if isinstance(changes, list):
+            return len(changes)
+        if isinstance(changes, dict):
+            files = changes.get("files")
+            nested = changes.get("changes")
+            return max(
+                len(files) if isinstance(files, list) else 0,
+                len(nested) if isinstance(nested, list) else 0,
+                len(changes),
+            )
+        return 0
+
+    prev_count = _change_count(previous)
+    new_count = _change_count(new)
+    if new_count > prev_count:
+        return new
+    if prev_count > new_count:
+        return previous
+    if new_count > 0 and prev_count > 0:
+        return new if len(json.dumps(new, ensure_ascii=False)) >= len(json.dumps(previous, ensure_ascii=False)) else previous
+    return new
+
+
+def _parse_apply_patch_command_from_input(patch_input):
+    if not isinstance(patch_input, str) or not patch_input.strip():
+        return "Apply file changes"
+
+    changes = []
+    current = None
+
+    def _finish_current():
+        if current is None:
+            return
+        diff_lines = current.pop("_diff_lines", [])
+        diff_text = "\n".join(diff_lines).strip()
+        if diff_text:
+            current["diff"] = diff_text
+        changes.append(current)
+
+    for raw_line in patch_input.splitlines():
+        line = raw_line.rstrip("\n")
+        if line.startswith("*** Add File: "):
+            _finish_current()
+            current = {
+                "path": line[len("*** Add File: "):].strip(),
+                "kind": {"type": "add"},
+                "_diff_lines": [],
+            }
+            continue
+        if line.startswith("*** Update File: "):
+            _finish_current()
+            current = {
+                "path": line[len("*** Update File: "):].strip(),
+                "kind": {"type": "update"},
+                "_diff_lines": [],
+            }
+            continue
+        if line.startswith("*** Delete File: "):
+            _finish_current()
+            current = {
+                "path": line[len("*** Delete File: "):].strip(),
+                "kind": {"type": "delete"},
+                "_diff_lines": [],
+            }
+            continue
+        if line.startswith("*** Move to: "):
+            if current is not None:
+                current["to"] = line[len("*** Move to: "):].strip()
+                current["kind"] = {"type": "move"}
+                current.setdefault("_diff_lines", []).append(line)
+            continue
+        if line.startswith("*** End Patch"):
+            break
+        if current is not None:
+            current.setdefault("_diff_lines", []).append(line)
+
+    _finish_current()
+    if not changes:
+        return "Apply file changes"
+    return {"changes": changes}
 
     def _denied_plain():
         if prefer_native_dialect:
@@ -1873,6 +1965,7 @@ def translate_event(event):
                     and not bool(existing.get("has_native_approval"))
                 ):
                     existing["approval_method"] = approval_method
+                    existing["command"] = _choose_richer_approval_command(existing.get("command"), command)
                     existing["available_decisions"] = list(available_decisions or ["approved", "abort"])
                     existing["available_decisions_native"] = list(available_decisions or ["approved", "abort"])
                     existing["available_decisions_item"] = list(available_decisions or ["approved", "abort"])
@@ -1947,6 +2040,21 @@ def translate_event(event):
                 },
             )
 
+        if entry_type == "response_item" and payload.get("type") == "reasoning":
+            content = payload.get("content")
+            summary = payload.get("summary")
+            encrypted_content = payload.get("encrypted_content")
+            has_plaintext = bool(content) or bool(summary)
+            if not has_plaintext and isinstance(encrypted_content, str) and encrypted_content:
+                return (
+                    "reasoning",
+                    {
+                        **base,
+                        "content": "Reasoning captured by Codex is encrypted in the current app-server payload and is not available as plaintext.",
+                        "raw": entry,
+                    },
+                )
+
         if entry_type == "response_item" and payload.get("type") == "function_call" and payload.get("name") == "exec_command":
             arguments = payload.get("arguments")
             if isinstance(arguments, str):
@@ -1983,9 +2091,10 @@ def translate_event(event):
             )
 
         if entry_type == "response_item" and payload.get("type") == "custom_tool_call" and payload.get("name") == "apply_patch":
+            parsed_command = _parse_apply_patch_command_from_input(payload.get("input"))
             return _emit_session_approval(
                 payload.get("call_id"),
-                "Apply file changes",
+                parsed_command,
                 "Approve file changes",
                 None,
                 None,
@@ -2607,6 +2716,9 @@ def translate_event(event):
                             rpc_id=merged_rpc_id,
                             fallback_notify=True,
                             native_request=bool(rpc_id is not None),
+                            stored_decision=raw_decision,
+                            replay_decision=rpc_decision,
+                            available_decisions=merged_available,
                         )
                         pending_decision["control_payload"] = primary_control_payload
                         pending_decision["compat_rpc_payload"] = compat_rpc_payload

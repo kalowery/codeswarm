@@ -380,6 +380,50 @@ function mapRouterApprovalStatusToUi(status: any): ApprovalStatus | undefined {
   return undefined;
 }
 
+function approvalCommandChangeCount(command: any): number {
+  if (!command || typeof command !== 'object') return 0;
+  const changes = (command as any).changes;
+  if (Array.isArray(changes)) return changes.length;
+  if (changes && typeof changes === 'object') {
+    const files = Array.isArray((changes as any).files) ? (changes as any).files.length : 0;
+    const list = Array.isArray((changes as any).changes) ? (changes as any).changes.length : 0;
+    return Math.max(files, list, Object.keys(changes).length);
+  }
+  return 0;
+}
+
+function approvalCommandLooksGeneric(command: any): boolean {
+  if (typeof command !== 'string') return false;
+  const normalized = command.trim().toLowerCase();
+  return normalized === 'apply file changes' || normalized === 'review file changes';
+}
+
+function chooseApprovalCommand(previous: any, next: any) {
+  if (next === undefined || next === null) return previous;
+  if (previous === undefined || previous === null) return next;
+
+  const previousChangeCount = approvalCommandChangeCount(previous);
+  const nextChangeCount = approvalCommandChangeCount(next);
+
+  if (nextChangeCount > previousChangeCount) return next;
+  if (previousChangeCount > nextChangeCount) return previous;
+
+  if (previousChangeCount > 0 && nextChangeCount > 0) {
+    const nextDiffLen = JSON.stringify(next).length;
+    const previousDiffLen = JSON.stringify(previous).length;
+    return nextDiffLen >= previousDiffLen ? next : previous;
+  }
+
+  if (approvalCommandLooksGeneric(next) && !approvalCommandLooksGeneric(previous)) {
+    return previous;
+  }
+  if (approvalCommandLooksGeneric(previous) && !approvalCommandLooksGeneric(next)) {
+    return next;
+  }
+
+  return next;
+}
+
 function clonePendingApprovalsSnapshot() {
   const snapshot: Record<string, Record<number, ApprovalRecord[]>> = {};
   for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
@@ -484,7 +528,7 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any, incomingVer
             typeof rawApproval?.injection_id === 'string'
               ? rawApproval.injection_id
               : previous?.injection_id,
-          command: rawApproval?.command,
+          command: chooseApprovalCommand(previous?.command, rawApproval?.command),
           reason: typeof rawApproval?.reason === 'string' ? rawApproval.reason : '',
           cwd: typeof rawApproval?.cwd === 'string' ? rawApproval.cwd : undefined,
           proposed_execpolicy_amendment: rawApproval?.proposed_execpolicy_amendment,
@@ -593,6 +637,7 @@ function upsertPendingApproval(swarmId: string, nodeId: number, approval: any) {
       : (routerStatus ?? 'pending');
   const nextApproval = {
     ...approval,
+    command: chooseApprovalCommand(idx >= 0 ? existing[idx]?.command : undefined, approval?.command),
     status: nextStatus,
     updated_at_ms: now,
     approval_seq: nextApprovalSeq(),

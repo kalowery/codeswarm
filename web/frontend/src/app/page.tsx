@@ -94,6 +94,12 @@ function formatUsd(value: number) {
   })
 }
 
+type ApprovalChangeDetail = {
+  path: string
+  summary: string
+  diff?: string
+}
+
 export default function Home() {
   const swarms = useSwarmStore((s) => s.swarms)
   const setSwarms = useSwarmStore((s) => s.setSwarms)
@@ -672,52 +678,98 @@ export default function Home() {
     return String(command ?? '')
   }
 
-  function extractApprovalFilePaths(command: PendingApproval['command']) {
-    const paths = new Set<string>()
+  function extractApprovalChangeDetails(command: PendingApproval['command']): ApprovalChangeDetail[] {
+    const details = new Map<string, ApprovalChangeDetail>()
 
-    const addMaybePath = (value: unknown) => {
-      if (typeof value !== 'string') return
-      const trimmed = value.trim()
-      if (!trimmed) return
-      paths.add(trimmed)
+    const inferPath = (rec: Record<string, unknown>) => {
+      const candidates = [
+        rec.path,
+        rec.file,
+        rec.target,
+        rec.new_path,
+        rec.old_path,
+        rec.from,
+        rec.to
+      ]
+      for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+      }
+      return ''
     }
 
-    const scanChangeEntry = (entry: unknown) => {
-      if (!entry || typeof entry !== 'object') return
-      const rec = entry as Record<string, unknown>
-      addMaybePath(rec.path)
-      addMaybePath(rec.file)
-      addMaybePath(rec.target)
-      addMaybePath(rec.new_path)
-      addMaybePath(rec.old_path)
-      addMaybePath(rec.from)
-      addMaybePath(rec.to)
+    const inferSummary = (rec: Record<string, unknown>) => {
+      const kind = rec.kind
+      if (kind && typeof kind === 'object') {
+        const kindType = String((kind as Record<string, unknown>).type ?? '').trim()
+        if (kindType) return kindType
+      }
+      for (const key of ['op', 'action', 'type', 'status']) {
+        const value = rec[key]
+        if (typeof value === 'string' && value.trim()) return value.trim()
+      }
+      return 'update'
     }
 
-    const walk = (node: unknown) => {
+    const visit = (node: unknown) => {
       if (!node) return
       if (Array.isArray(node)) {
-        for (const item of node) walk(item)
+        for (const item of node) visit(item)
         return
       }
       if (typeof node !== 'object') return
       const rec = node as Record<string, unknown>
-      scanChangeEntry(rec)
-      for (const [key, value] of Object.entries(rec)) {
-        if (key === 'changes' || key === 'files' || key === 'edits' || key === 'ops') {
-          walk(value)
-        } else if (value && (Array.isArray(value) || typeof value === 'object')) {
-          walk(value)
-        }
+      const path = inferPath(rec)
+      if (path) {
+        const summary = inferSummary(rec)
+        const diff = typeof rec.diff === 'string' && rec.diff.trim() ? rec.diff.trim() : undefined
+        details.set(path, { path, summary, diff })
+      }
+      for (const value of Object.values(rec)) {
+        if (value && (Array.isArray(value) || typeof value === 'object')) visit(value)
       }
     }
 
     if (command && typeof command === 'object') {
-      const anyCmd = command as Record<string, unknown>
-      walk(anyCmd.changes)
+      visit(command)
     }
 
-    return Array.from(paths)
+    return Array.from(details.values())
+  }
+
+  function extractApprovalFilePaths(command: PendingApproval['command']) {
+    return extractApprovalChangeDetails(command).map((detail) => detail.path)
+  }
+
+  function renderApprovalChangeSummary(command: PendingApproval['command']) {
+    const changes = extractApprovalChangeDetails(command)
+    if (changes.length === 0) return null
+
+    return (
+      <div className="mt-2 space-y-2">
+        <div className="text-[11px] text-slate-300">
+          Files: {changes.map((change) => change.path).join(', ')}
+        </div>
+        <div className="space-y-2">
+          {changes.map((change) => {
+            const diffLines = change.diff ? change.diff.split(/\r?\n/).slice(0, 8) : []
+            const hasMore = change.diff ? change.diff.split(/\r?\n/).length > diffLines.length : false
+            return (
+              <div key={change.path} className="rounded border border-slate-700 bg-slate-950 p-2">
+                <div className="text-[11px] text-amber-200 break-words">
+                  {change.summary}: {change.path}
+                </div>
+                {diffLines.length > 0 && (
+                  <pre className="mt-1 whitespace-pre-wrap break-words text-[10px] text-slate-300">
+                    {diffLines.join('\n')}
+                    {hasMore ? '\n...' : ''}
+                  </pre>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
   }
 
   function renderFallbackApprovals(
@@ -738,16 +790,7 @@ export default function Home() {
             <div className="text-slate-200">
               $ {formatApprovalCommand(approval.command)}
             </div>
-            {(() => {
-              const filePaths = extractApprovalFilePaths(approval.command)
-              if (filePaths.length === 0) return null
-              return (
-                <div className="mt-1 text-[11px] text-slate-300">
-                  Files: {filePaths.slice(0, 4).join(', ')}
-                  {filePaths.length > 4 ? ` (+${filePaths.length - 4} more)` : ''}
-                </div>
-              )
-            })()}
+            {renderApprovalChangeSummary(approval.command)}
             <div className="mt-1 text-slate-300">{approval.reason}</div>
             {approval.status && (
               <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
@@ -1227,16 +1270,7 @@ export default function Home() {
                       <div className="text-slate-200 break-words">
                         $ {formatApprovalCommand(approval.command)}
                       </div>
-                      {(() => {
-                        const filePaths = extractApprovalFilePaths(approval.command)
-                        if (filePaths.length === 0) return null
-                        return (
-                          <div className="mt-1 text-[11px] text-slate-300 break-words">
-                            Files: {filePaths.slice(0, 4).join(', ')}
-                            {filePaths.length > 4 ? ` (+${filePaths.length - 4} more)` : ''}
-                          </div>
-                        )
-                      })()}
+                      {renderApprovalChangeSummary(approval.command)}
                       <div className="mt-1 text-slate-300">{approval.reason}</div>
                       {approval.status && (
                         <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
