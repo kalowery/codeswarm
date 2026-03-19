@@ -493,7 +493,16 @@ export default function Home() {
       })
     })
     if (!res.ok) {
-      throw new Error(`Approval failed (${res.status})`)
+      const payload = await res.json().catch(() => null)
+      // Approval submit is best-effort; backend can return non-2xx while
+      // request is still in flight/racing with ack. Keep UI responsive.
+      console.warn('Approval submit non-OK response', {
+        status: res.status,
+        job_id,
+        call_id,
+        approved,
+        error: payload?.error
+      })
     }
 
     // Force an immediate approval-state refresh after each submit so
@@ -510,6 +519,8 @@ export default function Home() {
     setApprovalSubmitting((prev) => ({ ...prev, [callId]: true }))
     try {
       await action()
+    } catch (err) {
+      console.error('Approval submit failed', { call_id: callId, error: err })
     } finally {
       setTimeout(() => {
         setApprovalSubmitting((prev) => {
@@ -534,10 +545,28 @@ export default function Home() {
     )
   }
 
+  function isCompactPolicyAmendment(amendment: string[] | undefined) {
+    if (!Array.isArray(amendment) || amendment.length === 0) return false
+    if (amendment.length > 8) return false
+    let total = 0
+    for (const part of amendment) {
+      if (typeof part !== 'string') return false
+      if (part.includes('\n') || part.includes('\r')) return false
+      if (part.length > 200) return false
+      total += part.length
+      if (total > 400) return false
+    }
+    return true
+  }
+
   function buildPolicyDecision(
     availableDecisions: Array<string | Record<string, any>> | undefined,
     amendment: string[]
   ) {
+    if (!isCompactPolicyAmendment(amendment)) {
+      return approveToken(availableDecisions)
+    }
+
     const hasAcceptStyle = Array.isArray(availableDecisions) &&
       availableDecisions.some(
         (d) =>
@@ -594,14 +623,46 @@ export default function Home() {
     if (typeof command === 'string') return command
     if (command && typeof command === 'object') {
       const anyCmd = command as Record<string, any>
+      const collectChangeEntries = (value: unknown): Array<Record<string, unknown>> => {
+        const out: Array<Record<string, unknown>> = []
+        const visit = (node: unknown) => {
+          if (!node) return
+          if (Array.isArray(node)) {
+            for (const item of node) visit(item)
+            return
+          }
+          if (typeof node !== 'object') return
+          const rec = node as Record<string, unknown>
+          if (
+            typeof rec.path === 'string' ||
+            typeof rec.file === 'string' ||
+            typeof rec.target === 'string' ||
+            typeof rec.new_path === 'string' ||
+            typeof rec.old_path === 'string' ||
+            typeof rec.from === 'string' ||
+            typeof rec.to === 'string'
+          ) {
+            out.push(rec)
+          }
+          for (const value of Object.values(rec)) {
+            if (value && (Array.isArray(value) || typeof value === 'object')) visit(value)
+          }
+        }
+        visit(value)
+        return out
+      }
       if (anyCmd.type === 'file_changes' || anyCmd.type === 'file_changes_apply') {
         const changes = anyCmd.changes
+        const changeEntries = collectChangeEntries(changes)
+        if (changeEntries.length > 0) return `apply ${changeEntries.length} file change(s)`
         if (Array.isArray(changes)) return `apply ${changes.length} file change(s)`
-        if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+        if (changes && typeof changes === 'object') return 'apply file changes'
         return 'apply file changes'
       }
       const changes = anyCmd.changes
-      if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+      const changeEntries = collectChangeEntries(changes)
+      if (changeEntries.length > 0) return `apply ${changeEntries.length} file change(s)`
+      if (changes && typeof changes === 'object') return 'apply file changes'
       try {
         return JSON.stringify(command)
       } catch {
@@ -609,6 +670,54 @@ export default function Home() {
       }
     }
     return String(command ?? '')
+  }
+
+  function extractApprovalFilePaths(command: PendingApproval['command']) {
+    const paths = new Set<string>()
+
+    const addMaybePath = (value: unknown) => {
+      if (typeof value !== 'string') return
+      const trimmed = value.trim()
+      if (!trimmed) return
+      paths.add(trimmed)
+    }
+
+    const scanChangeEntry = (entry: unknown) => {
+      if (!entry || typeof entry !== 'object') return
+      const rec = entry as Record<string, unknown>
+      addMaybePath(rec.path)
+      addMaybePath(rec.file)
+      addMaybePath(rec.target)
+      addMaybePath(rec.new_path)
+      addMaybePath(rec.old_path)
+      addMaybePath(rec.from)
+      addMaybePath(rec.to)
+    }
+
+    const walk = (node: unknown) => {
+      if (!node) return
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item)
+        return
+      }
+      if (typeof node !== 'object') return
+      const rec = node as Record<string, unknown>
+      scanChangeEntry(rec)
+      for (const [key, value] of Object.entries(rec)) {
+        if (key === 'changes' || key === 'files' || key === 'edits' || key === 'ops') {
+          walk(value)
+        } else if (value && (Array.isArray(value) || typeof value === 'object')) {
+          walk(value)
+        }
+      }
+    }
+
+    if (command && typeof command === 'object') {
+      const anyCmd = command as Record<string, unknown>
+      walk(anyCmd.changes)
+    }
+
+    return Array.from(paths)
   }
 
   function renderFallbackApprovals(
@@ -629,6 +738,16 @@ export default function Home() {
             <div className="text-slate-200">
               $ {formatApprovalCommand(approval.command)}
             </div>
+            {(() => {
+              const filePaths = extractApprovalFilePaths(approval.command)
+              if (filePaths.length === 0) return null
+              return (
+                <div className="mt-1 text-[11px] text-slate-300">
+                  Files: {filePaths.slice(0, 4).join(', ')}
+                  {filePaths.length > 4 ? ` (+${filePaths.length - 4} more)` : ''}
+                </div>
+              )
+            })()}
             <div className="mt-1 text-slate-300">{approval.reason}</div>
             {approval.status && (
               <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
@@ -654,7 +773,8 @@ export default function Home() {
               </button>
               {Array.isArray(approval.proposed_execpolicy_amendment) &&
                 approval.proposed_execpolicy_amendment.length > 0 &&
-                approvalHasPolicyOption(approval.available_decisions) && (
+                approvalHasPolicyOption(approval.available_decisions) &&
+                isCompactPolicyAmendment(approval.proposed_execpolicy_amendment) && (
                   <button
                     disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                     className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
@@ -1107,6 +1227,16 @@ export default function Home() {
                       <div className="text-slate-200 break-words">
                         $ {formatApprovalCommand(approval.command)}
                       </div>
+                      {(() => {
+                        const filePaths = extractApprovalFilePaths(approval.command)
+                        if (filePaths.length === 0) return null
+                        return (
+                          <div className="mt-1 text-[11px] text-slate-300 break-words">
+                            Files: {filePaths.slice(0, 4).join(', ')}
+                            {filePaths.length > 4 ? ` (+${filePaths.length - 4} more)` : ''}
+                          </div>
+                        )
+                      })()}
                       <div className="mt-1 text-slate-300">{approval.reason}</div>
                       {approval.status && (
                         <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
@@ -1132,7 +1262,8 @@ export default function Home() {
                         </button>
                         {Array.isArray(approval.proposed_execpolicy_amendment) &&
                           approval.proposed_execpolicy_amendment.length > 0 &&
-                          approvalHasPolicyOption(approval.available_decisions) && (
+                          approvalHasPolicyOption(approval.available_decisions) &&
+                          isCompactPolicyAmendment(approval.proposed_execpolicy_amendment) && (
                             <button
                               disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                               className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"

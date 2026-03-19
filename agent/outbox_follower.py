@@ -18,8 +18,14 @@ def main():
         with path.open("rb") as f:
             f.seek(start_offset)
             while True:
+                line_start = f.tell()
                 line = f.readline()
                 if not line:
+                    break
+                # Do not consume partial JSONL writes. If a writer has appended
+                # bytes without a terminating newline yet, rewind and retry later.
+                if not line.endswith(b"\n"):
+                    f.seek(line_start)
                     break
                 sys.stdout.buffer.write(line)
                 sys.stdout.flush()
@@ -37,25 +43,39 @@ def main():
                     archived = archive_dir / tracked.name
                     if archived.exists():
                         try:
-                            drain_path(archived, offsets[tracked])
+                            drain_path(archived, int(offsets[tracked].get("offset", 0)))
                         except FileNotFoundError:
                             # Best effort: if archive disappears concurrently, drop offset.
                             pass
                     del offsets[tracked]
 
             for path in files:
-                if path not in offsets:
-                    offsets[path] = 0
+                stat = path.stat()
+                inode = getattr(stat, "st_ino", None)
+                size = int(stat.st_size)
+                tracked = offsets.get(path)
+                if tracked is None:
+                    offsets[path] = {"offset": 0, "inode": inode}
+                    tracked = offsets[path]
+                else:
+                    # If file rotated/truncated in-place, reset offset so new lines
+                    # are not skipped forever (critical for approval events).
+                    if (
+                        tracked.get("inode") != inode
+                        or int(tracked.get("offset", 0)) > size
+                    ):
+                        tracked["offset"] = 0
+                    tracked["inode"] = inode
 
-                offsets[path] = drain_path(path, offsets[path])
+                tracked["offset"] = drain_path(path, int(tracked.get("offset", 0)))
 
-            time.sleep(0.5)
+            time.sleep(0.1)
 
         except KeyboardInterrupt:
             break
         except Exception as e:
             print(f"Follower error: {e}", file=sys.stderr)
-            time.sleep(1)
+            time.sleep(0.2)
 
 
 if __name__ == "__main__":

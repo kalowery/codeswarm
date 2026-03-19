@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "child_process";
 import { RouterClient } from "./router/RouterClient.js";
 import { EventFormatter } from "./formatter/EventFormatter.js";
 import fs from "fs/promises";
+import { existsSync } from "fs";
 import path from "path";
 import process from "process";
 import net from "net";
@@ -471,6 +472,15 @@ function printProviders(providers: LaunchProvider[]) {
 }
 
 function getRepoRoot(): string {
+  const cwd = process.cwd();
+  const cwdLooksLikeRepo =
+    existsSync(path.join(cwd, "router", "router.py")) &&
+    existsSync(path.join(cwd, "web", "backend")) &&
+    existsSync(path.join(cwd, "web", "frontend"));
+  if (cwdLooksLikeRepo) {
+    return cwd;
+  }
+
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
   return path.resolve(__dirname, "../../");
@@ -1039,6 +1049,11 @@ program
       if (!requestId || e?.data?.request_id !== requestId) return;
 
       switch (e.event) {
+        case "swarm_status":
+        case "swarm_terminate_progress":
+        case "queue_updated":
+          // Intermediate events during asynchronous termination.
+          return;
         case "swarm_terminated":
           console.log(`Swarm ${swarmId} terminated.`);
           process.exit(0);
@@ -1201,6 +1216,27 @@ async function runWebStack(opts: any) {
 
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  async function isTcpPortListening(host: string, port: number, timeoutMs = 700): Promise<boolean> {
+    return await new Promise<boolean>((resolve) => {
+      const socket = new net.Socket();
+      let settled = false;
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        try {
+          socket.destroy();
+        } catch {}
+        resolve(result);
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once("connect", () => finish(true));
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+      socket.connect(port, host);
+    });
+  }
+
   async function checkHttpReady(url: string, timeoutMs: number): Promise<boolean> {
     try {
       const controller = new AbortController();
@@ -1254,12 +1290,22 @@ async function runWebStack(opts: any) {
   }
 
   // Router (daemon + debug mode)
-  spawnWithPrefix(
-    "router",
-    pythonCmd,
-    ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
-    repoRoot
-  );
+  // Reuse existing router instead of crashing on "Address already in use".
+  const routerHost = "127.0.0.1";
+  const routerPort = 8765;
+  const routerAlreadyListening = await isTcpPortListening(routerHost, routerPort);
+  if (routerAlreadyListening) {
+    console.log(
+      `[web] Router already listening on ${routerHost}:${routerPort}; reusing existing process.`
+    );
+  } else {
+    spawnWithPrefix(
+      "router",
+      pythonCmd,
+      ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
+      repoRoot
+    );
+  }
 
   // Backend (dev mode)
   // Use non-watch mode in web stack to avoid restart flapping.

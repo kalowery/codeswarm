@@ -127,6 +127,12 @@ def build_sbatch_script(args, config):
     ])
 
     if args.launch_codex_run:
+        capture_all_session = str(os.environ.get("CODESWARM_CAPTURE_ALL_SESSION") or "").strip()
+        capture_line = (
+            f"export CODESWARM_CAPTURE_ALL_SESSION={shlex.quote(capture_all_session)}\n"
+            if capture_all_session
+            else ""
+        )
         lines.extend([
             "",
             "# Per-agent working directory isolation (runs/<job_id>/agent_XX layout)",
@@ -136,6 +142,7 @@ def build_sbatch_script(args, config):
             f"export CODESWARM_BASE_DIR={hpc_base}\n"
             f"export CODESWARM_CODEX_BIN={hpc_base}/tools/npm-global/bin/codex\n"
             f"export PATH={hpc_base}/tools/npm-global/bin:$PATH\n"
+            f"{capture_line}"
             f"AGENT_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
             f"AGENT_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/agent_${{AGENT_INDEX}}\"\n"
             f"mkdir -p \"$AGENT_WORKDIR\"\n"

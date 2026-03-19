@@ -56,6 +56,11 @@ DEFAULT_AGENTS_FILE = Path(__file__).resolve().parents[1] / "AGENTS.md"
 GRACEFUL_TERMINATE_TIMEOUT_SECONDS = 300
 GRACEFUL_TERMINATE_POLL_SECONDS = 0.5
 RESOLVED_APPROVAL_TTL_SECONDS = 180
+APPROVAL_ACK_RETRY_SECONDS = 2.0
+# Keep retrying approval decisions until command begin/end (or filechange begin/end)
+# confirms delivery. Short outages can exceed fixed retry windows and otherwise
+# deadlock a turn until a new prompt re-triggers approval flow.
+APPROVAL_ACK_MAX_BACKOFF_SECONDS = 15.0
 
 
 def _bump_approvals_version():
@@ -101,6 +106,70 @@ def _normalize_node_id(value):
 
 def _approval_key(job_id, call_id, node_id):
     return (str(job_id), _normalize_node_id(node_id), str(call_id))
+
+
+def _is_jsonrpc_id(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return True
+    # bool is a subclass of int in Python; exclude it explicitly.
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float))
+
+
+def _same_jsonrpc_id(left, right):
+    if not _is_jsonrpc_id(left) or not _is_jsonrpc_id(right):
+        return False
+    return type(left) is type(right) and left == right
+
+
+def _to_appserver_approval_decision(decision, approved_flag):
+    """
+    Normalize approval decisions to documented app-server vocabulary:
+      - accept
+      - acceptForSession
+      - decline
+      - cancel
+      - {acceptWithExecpolicyAmendment:{execpolicy_amendment:[...]}}
+    """
+    if isinstance(decision, dict):
+        if isinstance(decision.get("acceptWithExecpolicyAmendment"), dict):
+            amendment = decision["acceptWithExecpolicyAmendment"].get("execpolicy_amendment")
+            if isinstance(amendment, list):
+                return {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }
+        # Back-compat: translate legacy/native amendment form.
+        if isinstance(decision.get("approved_execpolicy_amendment"), dict):
+            amendment = decision["approved_execpolicy_amendment"].get("proposed_execpolicy_amendment")
+            if isinstance(amendment, list):
+                return {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }
+        return "accept" if bool(approved_flag) else "decline"
+
+    if isinstance(decision, str):
+        if bool(approved_flag):
+            if decision in ("decline", "cancel", "abort"):
+                return "accept"
+        else:
+            if decision in ("accept", "acceptForSession", "approved"):
+                return "decline"
+        if decision in ("accept", "acceptForSession", "decline", "cancel"):
+            return decision
+        # Back-compat aliases seen in existing traces.
+        if decision == "approved":
+            return "accept"
+        if decision == "abort":
+            return "decline"
+
+    return "accept" if bool(approved_flag) else "decline"
 
 
 def _approval_lookup(job_id, call_id, node_id=None, injection_id=None):
@@ -188,20 +257,26 @@ def _is_recently_resolved_approval(job_id, call_id, node_id):
     return (now - float(ts)) <= RESOLVED_APPROVAL_TTL_SECONDS
 
 
-def _send_duplicate_approval_replay(provider, job_id, node_id, call_id, rpc_id, request_id_hint, approved, decision):
-    # Retry both response dialects for robustness across codex/app-server variants.
+def _send_duplicate_approval_replay(
+    provider,
+    job_id,
+    node_id,
+    call_id,
+    rpc_id,
+    request_id_hint,
+    approved,
+    decision,
+    approval_method=None,
+    has_native_approval=False,
+    turn_id=None,
+):
+    # Replay resolved approvals using the exact stored decision token/object.
     try:
-        accept_decision = decision
-        if not isinstance(accept_decision, (str, dict)):
-            accept_decision = "accept" if bool(approved) else "cancel"
-        if isinstance(accept_decision, str):
-            if accept_decision == "approved":
-                accept_decision = "accept"
-            elif accept_decision == "abort":
-                accept_decision = "cancel"
-            elif accept_decision not in ("accept", "cancel"):
-                accept_decision = "accept" if bool(approved) else "cancel"
+        replay_decision = decision
+        if replay_decision is None:
+            replay_decision = "approved" if bool(approved) else "abort"
 
+        sent_rpc = False
         if rpc_id is not None:
             provider.send_control(
                 job_id,
@@ -210,40 +285,80 @@ def _send_duplicate_approval_replay(provider, job_id, node_id, call_id, rpc_id, 
                     "type": "rpc_response",
                     "rpc_id": rpc_id,
                     "result": {
-                        "decision": accept_decision,
-                        "approved": bool(approved),
+                        "decision": replay_decision,
                     },
                 },
             )
-        if request_id_hint is not None and str(request_id_hint) != str(rpc_id):
-            provider.send_control(
-                job_id,
-                node_id,
-                {
-                    "type": "rpc_response",
-                    "rpc_id": request_id_hint,
-                    "result": {
-                        "decision": accept_decision,
-                        "approved": bool(approved),
-                    },
-                },
-            )
+            sent_rpc = True
 
+        # Also send notification-style fallback for maximum runtime compatibility.
+        notify_decision = _to_appserver_approval_decision(replay_decision, bool(approved))
+
+        params_payload = {
+            "call_id": call_id,
+            "callId": call_id,
+            "approved": bool(approved),
+            "decision": notify_decision,
+        }
+        if isinstance(turn_id, (str, int)):
+            params_payload["id"] = turn_id
+            params_payload["turn_id"] = turn_id
+            params_payload["turnId"] = turn_id
+        if isinstance(notify_decision, dict):
+            params_payload.update(notify_decision)
         provider.send_control(
             job_id,
             node_id,
             {
                 "method": "exec/approvalResponse",
-                "params": {
-                    "call_id": call_id,
-                    "callId": call_id,
-                    "approved": bool(approved),
-                    "decision": "approved" if bool(approved) else "abort",
-                },
+                "params": params_payload,
             },
         )
+        # Do not emit fallback rpc_response for notification-style approvals.
+        # Only the top-level JSON-RPC id is a transport correlation id.
     except Exception:
         return False
+    return True
+
+
+def _prune_pending_approval_for_call(job_id, node_id, call_id, source):
+    key, meta = _approval_lookup(job_id, call_id, node_id=node_id)
+    if not key:
+        return False
+    pending_decision = PENDING_APPROVAL_DECISIONS.pop(key, None)
+    PENDING_APPROVALS.pop(key, None)
+    if pending_decision:
+        _remember_recent_approval_result(
+            job_id,
+            call_id,
+            node_id,
+            bool(pending_decision.get("approved")),
+            pending_decision.get("decision"),
+        )
+    _mark_approval_resolved(job_id, call_id, node_id)
+    approvals_version = _bump_approvals_version()
+    approval_trace(
+        "pending_pruned_by_command_event",
+        source=source,
+        job_id=str(job_id),
+        node_id=_normalize_node_id(node_id),
+        call_id=str(call_id),
+        approval_id=(meta or {}).get("approval_id"),
+        approvals_version=approvals_version,
+    )
+    if pending_decision:
+        emit_event("exec_approval_resolved", {
+            "request_id": pending_decision.get("request_id"),
+            "approval_id": (meta or {}).get("approval_id"),
+            "job_id": str(job_id),
+            "call_id": str(call_id),
+            "node_id": _normalize_node_id(node_id),
+            "injection_id": (meta or {}).get("injection_id"),
+            "approved": bool(pending_decision.get("approved")),
+            "decision": pending_decision.get("decision"),
+            "source": source,
+            "approvals_version": approvals_version,
+        })
     return True
 
 
@@ -274,10 +389,21 @@ def _pending_approvals_snapshot():
         except Exception:
             created_at_ms = int(time.time() * 1000)
 
+        approval_status = str(meta.get("approval_status") or "pending")
+        approval_method = str(meta.get("approval_method") or "")
+        is_session_derived = approval_method.startswith("session/")
+        # Keep submitted approvals visible until explicit progress or resolution
+        # arrives for that exact call_id. Hiding native approvals immediately on
+        # submit causes dialogs to flash/disappear before the runtime actually
+        # consumes the approval, which is especially confusing during approval
+        # races or follower lag.
+        if approval_status == "resolved":
+            continue
+
         approval = {
             "job_id": str(job_id),
             "approval_id": meta.get("approval_id"),
-            "approval_status": meta.get("approval_status", "pending"),
+            "approval_status": approval_status,
             "call_id": str(call_id),
             "injection_id": meta.get("injection_id"),
             "turn_id": meta.get("turn_id"),
@@ -299,6 +425,154 @@ def _pending_approvals_snapshot():
             approvals.sort(key=lambda a: int(a.get("created_at_ms", 0)))
 
     return snapshot
+
+
+def _send_approval_decision(
+    provider,
+    job_id,
+    node_id,
+    control_payload,
+    compat_rpc_payload=None,
+    compat_notify_payload=None,
+):
+    if not isinstance(control_payload, dict):
+        raise RuntimeError("missing approval control payload")
+    provider.send_control(job_id, node_id, control_payload)
+    if compat_rpc_payload is not None:
+        provider.send_control(job_id, node_id, compat_rpc_payload)
+    if compat_notify_payload is not None:
+        provider.send_control(job_id, node_id, compat_notify_payload)
+
+
+def _retry_unacked_approvals():
+    now = time.time()
+    for key, meta in list(PENDING_APPROVALS.items()):
+        if not isinstance(meta, dict):
+            continue
+        status = str(meta.get("approval_status") or "")
+        if status not in ("approved_pending_ack", "denied_pending_ack"):
+            continue
+
+        pending = PENDING_APPROVAL_DECISIONS.get(key)
+        if not isinstance(pending, dict):
+            continue
+
+        approval_method = str(meta.get("approval_method") or "")
+        # Implicit file-change approvals are synthesized from item/started when
+        # app-server never emitted a real requestApproval event. There is no
+        # request id to correlate against, and repeated exec/approvalResponse
+        # notifications do not unblock Codex. Skip retries for this fallback so
+        # the UI can time out quickly instead of appearing hung.
+        if approval_method == "item/fileChange/implicitFromStarted":
+            continue
+
+        attempts = int(pending.get("send_attempts", 0) or 0)
+        # Exponential-ish backoff with cap; do not stop retrying.
+        retry_after = min(
+            APPROVAL_ACK_RETRY_SECONDS * max(1.0, float(2 ** min(attempts // 4, 6))),
+            APPROVAL_ACK_MAX_BACKOFF_SECONDS,
+        )
+        last_sent = float(pending.get("last_sent_ts", 0.0) or 0.0)
+        if (now - last_sent) < retry_after:
+            continue
+
+        swarm_id = meta.get("swarm_id")
+        provider = _provider_for_swarm(swarm_id)
+        if not provider:
+            continue
+
+        try:
+            control_payload = pending.get("control_payload") or {}
+            if (
+                pending.get("compat_notify_payload") is None
+                and isinstance(control_payload, dict)
+                and control_payload.get("type") == "rpc_response"
+            ):
+                approved_flag = bool(pending.get("approved"))
+                route_available_decisions = (
+                    meta.get("available_decisions")
+                    if isinstance(meta.get("available_decisions"), list)
+                    else []
+                )
+                notify_decision = _normalize_decision_for_available(
+                    pending.get("decision"),
+                    approved_flag,
+                    route_available_decisions,
+                    False,
+                )
+                notify_params = {
+                    "call_id": key[2],
+                    "callId": key[2],
+                    "approved": approved_flag,
+                    "decision": notify_decision,
+                }
+                if isinstance(notify_decision, dict):
+                    notify_params.update(notify_decision)
+                pending["compat_notify_payload"] = {
+                    "method": "exec/approvalResponse",
+                    "params": notify_params,
+                }
+                approval_trace(
+                    "approve_command_retry_notify_synthesized",
+                    job_id=str(pending.get("job_id")),
+                    node_id=_normalize_node_id(pending.get("node_id")),
+                    call_id=str(key[2]),
+                    approval_id=meta.get("approval_id"),
+                )
+
+            _send_approval_decision(
+                provider,
+                pending.get("job_id"),
+                pending.get("node_id"),
+                pending.get("control_payload"),
+                pending.get("compat_rpc_payload"),
+                pending.get("compat_notify_payload"),
+            )
+            pending["send_attempts"] = attempts + 1
+            pending["last_sent_ts"] = now
+            meta["updated_at_ts"] = now
+            route_mode = "rpc_response" if control_payload.get("type") == "rpc_response" else "exec_approval_response"
+            fallback_notify = pending.get("compat_notify_payload") is not None
+            # Structured retry-route diagnostics for approval correlation.
+            if pending["send_attempts"] <= 3 or (pending["send_attempts"] % 10 == 0):
+                emit_event("debug", {
+                    "source": "router",
+                    "message": (
+                        "approval retry route="
+                        f"{route_mode} job_id={pending.get('job_id')} node_id={pending.get('node_id')} "
+                        f"call_id={key[2]} rpc_id={control_payload.get('rpc_id')} "
+                        f"compat_rpc_id={(pending.get('compat_rpc_payload') or {}).get('rpc_id')} "
+                        f"fallback_notify={fallback_notify} attempt={pending['send_attempts']}"
+                    ),
+                })
+            if pending["send_attempts"] % 20 == 0:
+                emit_event("debug", {
+                    "source": "router",
+                    "message": (
+                        "approval delivery still awaiting ack "
+                        f"job_id={pending.get('job_id')} node_id={pending.get('node_id')} "
+                        f"call_id={key[2]} attempts={pending['send_attempts']}"
+                    ),
+                })
+            approval_trace(
+                "approve_command_retry_sent",
+                job_id=str(pending.get("job_id")),
+                node_id=_normalize_node_id(pending.get("node_id")),
+                call_id=str(key[2]),
+                approval_id=meta.get("approval_id"),
+                send_attempts=pending["send_attempts"],
+                fallback_notify=fallback_notify,
+            )
+        except Exception as e:
+            approval_trace(
+                "approve_command_retry_error",
+                job_id=str(pending.get("job_id")),
+                node_id=_normalize_node_id(pending.get("node_id")),
+                call_id=str(key[2]),
+                approval_id=meta.get("approval_id"),
+                send_attempts=attempts,
+                error=str(e),
+            )
 
 
 def save_state():
@@ -552,7 +826,26 @@ def debug_event(message):
 
 
 def approval_trace(stage, **fields):
-    payload = {"stage": str(stage), "ts": time.time(), **fields}
+    def _compact(value, depth=0):
+        if value is None:
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= 240 else (value[:240] + "…")
+        if isinstance(value, (int, float, bool)):
+            return value
+        if depth >= 3:
+            return "[truncated]"
+        if isinstance(value, list):
+            limit = 8
+            out = [_compact(item, depth + 1) for item in value[:limit]]
+            if len(value) > limit:
+                out.append(f"[+{len(value) - limit} more]")
+            return out
+        if isinstance(value, dict):
+            return {str(k): _compact(v, depth + 1) for k, v in value.items()}
+        return str(value)
+
+    payload = {"stage": str(stage), "ts": time.time(), **_compact(fields)}
     try:
         print(f"[router APPROVAL] {json.dumps(payload, sort_keys=True)}", flush=True)
     except Exception:
@@ -1333,6 +1626,183 @@ def translate_event(event):
             "status": {"type": "idle"},
         })
 
+    if event_type == "worker_error":
+        message = event.get("error")
+        call_id = event.get("call_id")
+        if (
+            isinstance(message, str)
+            and message.startswith("synthetic_exec_unsupported:")
+            and call_id
+        ):
+            _prune_pending_approval_for_call(job_id, node_id, call_id, "worker_error_synthetic_exec_unsupported")
+        return (
+            "agent_error",
+            {
+                "swarm_id": swarm_id,
+                "job_id": job_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                "message": message,
+                "raw": event,
+            },
+        )
+
+    if event_type == "session_trace":
+        entry = event.get("entry")
+        if not isinstance(entry, dict):
+            return None
+
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            return None
+
+        entry_type = entry.get("type")
+        base = {
+            "swarm_id": swarm_id,
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+        }
+
+        def _emit_session_approval(call_id, command, reason, cwd, proposed_execpolicy_amendment, available_decisions, approval_method, raw_payload):
+            if not isinstance(call_id, str) or not call_id.strip():
+                return None
+            key = _approval_key(job_id, call_id, node_id)
+            existing = PENDING_APPROVALS.get(key)
+            if existing:
+                # If we first synthesized a generic implicit file-change approval
+                # from item/started and later observe the richer session trace for
+                # the same apply_patch call, upgrade the existing approval route
+                # so notification-only replies use the apply-patch decision dialect.
+                if (
+                    approval_method == "session/custom_tool_call/apply_patch"
+                    and existing.get("approval_method") == "item/fileChange/implicitFromStarted"
+                    and not bool(existing.get("has_native_approval"))
+                ):
+                    existing["approval_method"] = approval_method
+                    existing["available_decisions"] = list(available_decisions or ["approved", "abort"])
+                    existing["available_decisions_native"] = list(available_decisions or ["approved", "abort"])
+                    existing["available_decisions_item"] = list(available_decisions or ["approved", "abort"])
+                    existing["updated_at_ts"] = time.time()
+                    approvals_version = _bump_approvals_version()
+                    approval_trace(
+                        "required_upgraded_from_session_trace",
+                        job_id=str(job_id),
+                        swarm_id=str(swarm_id),
+                        node_id=_normalize_node_id(node_id),
+                        call_id=str(call_id),
+                        approval_id=existing.get("approval_id"),
+                        approvals_version=approvals_version,
+                        injection_id=injection_id,
+                        turn_id=event.get("turn_id"),
+                        approval_method=approval_method,
+                    )
+                return None
+            if _is_recently_resolved_approval(job_id, call_id, node_id):
+                return None
+
+            approval_id = str(uuid.uuid4())
+            PENDING_APPROVALS[key] = {
+                "approval_id": approval_id,
+                "approval_status": "pending",
+                "swarm_id": swarm_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                "turn_id": event.get("turn_id"),
+                "rpc_id": None,
+                "request_id_hint": None,
+                "approval_method": approval_method,
+                "command": command,
+                "reason": reason,
+                "cwd": cwd,
+                "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
+                "available_decisions": list(available_decisions or ["accept", "cancel"]),
+                "available_decisions_native": [],
+                "available_decisions_item": list(available_decisions or ["accept", "cancel"]),
+                "synthetic_request": True,
+                "has_native_approval": False,
+                "created_at_ts": time.time(),
+                "updated_at_ts": time.time(),
+            }
+            approvals_version = _bump_approvals_version()
+            approval_trace(
+                "required_received_session_trace",
+                job_id=str(job_id),
+                swarm_id=str(swarm_id),
+                node_id=_normalize_node_id(node_id),
+                call_id=str(call_id),
+                approval_id=approval_id,
+                approvals_version=approvals_version,
+                injection_id=injection_id,
+                turn_id=event.get("turn_id"),
+                approval_method=approval_method,
+            )
+            return (
+                "exec_approval_required",
+                {
+                    **base,
+                    "approval_id": approval_id,
+                    "approvals_version": approvals_version,
+                    "turn_id": event.get("turn_id"),
+                    "call_id": call_id,
+                    "command": command,
+                    "reason": reason,
+                    "cwd": cwd,
+                    "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
+                    "available_decisions": list(available_decisions or ["accept", "cancel"]),
+                    "raw": raw_payload,
+                },
+            )
+
+        if entry_type == "response_item" and payload.get("type") == "function_call" and payload.get("name") == "exec_command":
+            arguments = payload.get("arguments")
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except Exception:
+                    arguments = None
+            if not isinstance(arguments, dict):
+                return None
+            if arguments.get("sandbox_permissions") != "require_escalated":
+                return None
+
+            prefix_rule = arguments.get("prefix_rule")
+            available_decisions = ["accept", "cancel"]
+            if isinstance(prefix_rule, list) and prefix_rule:
+                available_decisions = [
+                    "accept",
+                    {
+                        "acceptWithExecpolicyAmendment": {
+                            "execpolicy_amendment": prefix_rule,
+                        }
+                    },
+                    "cancel",
+                ]
+            return _emit_session_approval(
+                payload.get("call_id"),
+                arguments.get("cmd") or arguments.get("command") or "Execute command",
+                arguments.get("justification") or "Approve command execution",
+                arguments.get("workdir") or arguments.get("cwd"),
+                prefix_rule if isinstance(prefix_rule, list) and prefix_rule else None,
+                available_decisions,
+                "session/function_call/exec_command",
+                entry,
+            )
+
+        if entry_type == "response_item" and payload.get("type") == "custom_tool_call" and payload.get("name") == "apply_patch":
+            return _emit_session_approval(
+                payload.get("call_id"),
+                "Apply file changes",
+                "Approve file changes",
+                None,
+                None,
+                ["approved", "abort"],
+                "session/custom_tool_call/apply_patch",
+                entry,
+            )
+
+        return None
+
     if event_type != "codex_rpc":
         return None
 
@@ -1540,6 +2010,8 @@ def translate_event(event):
         "item/commandExecution/requestApproval",
         "codex/event/apply_patch_approval_request",
         "item/fileChange/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
     ):
         params = payload.get("params", {})
         msg = params.get("msg")
@@ -1554,8 +2026,9 @@ def translate_event(event):
                 reason = msg.get("reason") or "Approve file changes"
                 cwd = msg.get("cwd")
                 proposed_execpolicy_amendment = None
-                available_decisions = msg.get("available_decisions") or ["accept", "cancel"]
-                event_turn_id = msg.get("turn_id") or params.get("id")
+                # Native apply-patch approvals use approved/abort-style decisions.
+                available_decisions = msg.get("available_decisions") or ["approved", "abort"]
+                event_turn_id = msg.get("turn_id")
             else:
                 # Shape A: codex/event/exec_approval_request
                 call_id = msg.get("call_id")
@@ -1564,13 +2037,13 @@ def translate_event(event):
                 cwd = msg.get("cwd")
                 proposed_execpolicy_amendment = msg.get("proposed_execpolicy_amendment")
                 available_decisions = msg.get("available_decisions")
-                event_turn_id = msg.get("turn_id") or params.get("id")
+                event_turn_id = msg.get("turn_id")
         else:
             if method == "item/fileChange/requestApproval":
                 # Shape B2: item/fileChange/requestApproval
                 call_id = params.get("itemId")
                 changes = params.get("changes")
-                command = {"changes": changes} if isinstance(changes, list) else "Apply file changes"
+                command = {"changes": changes} if isinstance(changes, (list, dict)) else "Apply file changes"
                 reason = params.get("reason") or "Approve file changes"
                 cwd = params.get("cwd")
                 proposed_execpolicy_amendment = None
@@ -1580,7 +2053,7 @@ def translate_event(event):
                     or ["accept", "cancel"]
                 )
                 event_turn_id = params.get("turnId")
-            else:
+            elif method == "item/commandExecution/requestApproval":
                 # Shape B: item/commandExecution/requestApproval
                 call_id = params.get("itemId")
                 command = params.get("command")
@@ -1589,11 +2062,30 @@ def translate_event(event):
                 proposed_execpolicy_amendment = params.get("proposedExecpolicyAmendment") or params.get("proposed_execpolicy_amendment")
                 available_decisions = params.get("availableDecisions") or params.get("available_decisions")
                 event_turn_id = params.get("turnId")
+            elif method == "applyPatchApproval":
+                # Shape C1: direct review-decision patch approval RPC
+                call_id = params.get("callId")
+                changes = params.get("fileChanges")
+                command = {"changes": changes} if isinstance(changes, dict) else "Apply file changes"
+                reason = params.get("reason") or "Approve file changes"
+                cwd = params.get("grantRoot")
+                proposed_execpolicy_amendment = None
+                available_decisions = ["approved", "approved_for_session", "denied", "abort"]
+                event_turn_id = None
+            else:
+                # Shape C2: direct review-decision command approval RPC
+                call_id = params.get("callId")
+                command = params.get("command")
+                reason = params.get("reason")
+                cwd = params.get("cwd")
+                proposed_execpolicy_amendment = None
+                available_decisions = ["approved", "approved_for_session", "denied", "abort"]
+                event_turn_id = None
 
-        rpc_id = payload.get("id")
+        raw_rpc_id = payload.get("id")
+        rpc_id = raw_rpc_id if _is_jsonrpc_id(raw_rpc_id) else None
+        payload_id_hint = rpc_id
         request_id_hint = None
-        if rpc_id is None and isinstance(params.get("id"), (int, str)):
-            request_id_hint = params.get("id")
 
         if call_id:
             key = _approval_key(job_id, call_id, node_id)
@@ -1615,6 +2107,9 @@ def translate_event(event):
                             request_id_hint if request_id_hint is not None else existing.get("request_id_hint"),
                             bool(recent.get("approved")),
                             recent.get("decision"),
+                            approval_method=method if method else existing.get("approval_method"),
+                            has_native_approval=bool(existing.get("has_native_approval")),
+                            turn_id=event_turn_id if event_turn_id else existing.get("turn_id"),
                         )
                     approval_trace(
                         "required_ignored_recently_resolved",
@@ -1638,10 +2133,23 @@ def translate_event(event):
             # Keep the strongest request shape when both legacy and request-style
             # approval events are emitted for the same call_id.
             existing_rpc_id = existing.get("rpc_id")
-            merged_rpc_id = rpc_id if rpc_id is not None else existing_rpc_id
+            native_approval_method = method in (
+                "codex/event/exec_approval_request",
+                "codex/event/apply_patch_approval_request",
+            )
+            # If the incoming approval event has a top-level JSON-RPC id, treat
+            # it as request-correlated and respond with that same id.
+            if rpc_id is not None:
+                merged_rpc_id = rpc_id
+            else:
+                merged_rpc_id = existing_rpc_id
 
             existing_available = existing.get("available_decisions") or []
+            existing_native_available = existing.get("available_decisions_native") or []
+            existing_item_available = existing.get("available_decisions_item") or []
             new_available = available_decisions or []
+            new_native_available = list(new_available) if native_approval_method else []
+            new_item_available = list(new_available) if not native_approval_method else []
 
             def _has_accept_decisions(decisions):
                 return any(
@@ -1697,6 +2205,28 @@ def translate_event(event):
                 ):
                     merged_available = list(new_available)
 
+            if not existing_native_available:
+                merged_native_available = list(new_native_available)
+            elif not new_native_available:
+                merged_native_available = list(existing_native_available)
+            else:
+                merged_native_available = list(existing_native_available)
+                for decision in new_native_available:
+                    token = _decision_key(decision)
+                    if all(_decision_key(existing_decision) != token for existing_decision in merged_native_available):
+                        merged_native_available.append(decision)
+
+            if not existing_item_available:
+                merged_item_available = list(new_item_available)
+            elif not new_item_available:
+                merged_item_available = list(existing_item_available)
+            else:
+                merged_item_available = list(existing_item_available)
+                for decision in new_item_available:
+                    token = _decision_key(decision)
+                    if all(_decision_key(existing_decision) != token for existing_decision in merged_item_available):
+                        merged_item_available.append(decision)
+
             # Some runtimes emit duplicate approval events where one shape has
             # no turn_id and/or stale injection_id. Preserve existing
             # correlation fields unless the new event has stronger identifiers.
@@ -1708,21 +2238,87 @@ def translate_event(event):
             merged_turn_id = event_turn_id if event_turn_id else existing_turn_id
             approval_id = existing.get("approval_id") or str(uuid.uuid4())
 
+            has_native_approval = bool(existing.get("has_native_approval")) or native_approval_method
+            existing_approval_method = existing.get("approval_method")
+            existing_native_method = existing_approval_method in (
+                "codex/event/exec_approval_request",
+                "codex/event/apply_patch_approval_request",
+            )
+            # Keep the approval method anchored to native codex/event/* once seen.
+            # Duplicate item/* events for the same call_id must not downgrade routing
+            # to notification mode when an RPC response is required.
+            if has_native_approval and existing_native_method:
+                merged_approval_method = existing_approval_method
+            else:
+                merged_approval_method = method
+            requested_synthetic = bool(
+                params.get("synthetic_request") is True
+                or (isinstance(msg, dict) and msg.get("synthetic_request") is True)
+            )
+            merged_synthetic_request = bool(existing.get("synthetic_request") or requested_synthetic)
+            if has_native_approval:
+                # Native approval RPC observed for this call_id: never treat it
+                # as synthetic or we may skip the required RPC response.
+                merged_synthetic_request = False
+                # Keep merged decisions across duplicate shapes for the same call.
+                # Some runtimes emit mixed dialects (item/* => accept/cancel and
+                # codex/event/* => approved/abort) for one call_id. Keeping the
+                # union allows downstream normalization to pick a compatible token
+                # per response channel.
+
+            # Worker-side synthetic approvals are only placeholders to surface an
+            # escalation before Codex app-server emits its real correlated request.
+            # Once commandExecution approval arrives with a top-level JSON-RPC id,
+            # Codex expects to execute the command on the worker host and receive
+            # its own exec_command lifecycle. Do not steal execution into router.
+            if (
+                method == "item/commandExecution/requestApproval"
+                and merged_rpc_id is not None
+            ):
+                merged_synthetic_request = False
+
+            existing_status = str(existing.get("approval_status") or "")
+            if existing_status in ("approved_pending_ack", "denied_pending_ack"):
+                # Preserve the submitted state across late duplicate/native
+                # approval shapes for the same call_id. Reopening them as
+                # pending causes approval dialogs to flash and can require an
+                # unnecessary second click.
+                merged_status = existing_status
+            elif existing_status in ("started", "resolved"):
+                merged_status = existing_status
+            else:
+                merged_status = "pending"
+
+            existing_request_id_hint = existing.get("request_id_hint")
+            # Keep hint stable once set; do not overwrite from duplicate item/*
+            # events because those ids are frequently non-correlating.
+            if existing_request_id_hint is not None:
+                merged_request_id_hint = existing_request_id_hint
+            else:
+                merged_request_id_hint = request_id_hint
+
             PENDING_APPROVALS[key] = {
                 "approval_id": approval_id,
-                "approval_status": "pending",
+                "approval_status": merged_status,
                 "swarm_id": swarm_id,
                 "node_id": node_id,
                 "injection_id": merged_injection_id,
                 "turn_id": merged_turn_id,
                 "rpc_id": merged_rpc_id,
-                "request_id_hint": existing.get("request_id_hint") or request_id_hint,
-                "approval_method": method,
+                # For non-native item/* approvals, preserve top-level payload id
+                # as a compatibility hint even when we stay in notification mode.
+                # Some runtimes accept/require rpc_response against that id.
+                "request_id_hint": merged_request_id_hint,
+                "approval_method": merged_approval_method,
                 "command": command,
                 "reason": reason,
                 "cwd": cwd,
                 "proposed_execpolicy_amendment": proposed_execpolicy_amendment,
                 "available_decisions": merged_available,
+                "available_decisions_native": merged_native_available,
+                "available_decisions_item": merged_item_available,
+                "synthetic_request": merged_synthetic_request,
+                "has_native_approval": has_native_approval,
                 "created_at_ts": time.time(),
                 "updated_at_ts": time.time(),
             }
@@ -1743,88 +2339,92 @@ def translate_event(event):
                 available_decisions_count=len(merged_available) if isinstance(merged_available, list) else None,
             )
 
-            # If user already approved via legacy notification path, immediately
-            # satisfy the later request-style approval without requiring a 2nd click.
+            # If the user already submitted a decision for this call_id, replay
+            # that exact approval onto any later native/request-correlated
+            # approval event without requiring a second click.
             pending_decision = PENDING_APPROVAL_DECISIONS.get(key)
             if (
                 pending_decision
-                and ACTIVE_PROVIDER is not None
-                and merged_rpc_id is not None
+                and existing_status in ("approved_pending_ack", "denied_pending_ack")
             ):
+                approval_provider = _provider_for_swarm(swarm_id)
+                if approval_provider is None:
+                    approval_provider = ACTIVE_PROVIDER
                 approved_flag = bool(pending_decision.get("approved"))
                 raw_decision = pending_decision.get("decision")
-
-                if isinstance(raw_decision, str):
-                    if raw_decision in ("accept", "cancel"):
-                        rpc_decision = raw_decision
-                    elif raw_decision == "approved":
-                        rpc_decision = "accept"
-                    elif raw_decision == "abort":
-                        rpc_decision = "cancel"
-                    else:
-                        rpc_decision = "accept" if approved_flag else "cancel"
-                elif (
-                    isinstance(raw_decision, dict)
-                    and isinstance(raw_decision.get("acceptWithExecpolicyAmendment"), dict)
-                ):
-                    rpc_decision = raw_decision
-                elif (
-                    isinstance(raw_decision, dict)
-                    and isinstance(raw_decision.get("approved_execpolicy_amendment"), dict)
-                ):
-                    amendment = raw_decision["approved_execpolicy_amendment"].get(
-                        "proposed_execpolicy_amendment"
-                    )
-                    rpc_decision = {
-                        "acceptWithExecpolicyAmendment": {
-                            "execpolicy_amendment": amendment if isinstance(amendment, list) else []
-                        }
-                    }
-                else:
-                    rpc_decision = "accept" if approved_flag else "cancel"
-
-                primary_rpc_payload = {
-                    "type": "rpc_response",
-                    "rpc_id": merged_rpc_id,
-                    "result": {
-                        "decision": rpc_decision,
-                        "approved": approved_flag,
-                    },
-                }
-                ACTIVE_PROVIDER.send_control(
-                    job_id,
-                    node_id,
-                    primary_rpc_payload,
+                rpc_decision = _normalize_decision_for_available(
+                    raw_decision,
+                    approved_flag,
+                    merged_available,
+                    native_approval_method or has_native_approval,
                 )
-                existing_request_id_hint = existing.get("request_id_hint")
-                if (
-                    existing_request_id_hint is not None
-                    and str(existing_request_id_hint) != str(merged_rpc_id)
-                ):
-                    ACTIVE_PROVIDER.send_control(
+                rpc_decision = _coerce_to_advertised_decision(
+                    rpc_decision,
+                    merged_available,
+                    approved_flag,
+                    native_approval_method or has_native_approval,
+                )
+                notify_decision = rpc_decision
+                notify_params = {
+                    "call_id": call_id,
+                    "callId": call_id,
+                    "approved": approved_flag,
+                    "decision": notify_decision,
+                    **(notify_decision if isinstance(notify_decision, dict) else {}),
+                }
+                if event_turn_id:
+                    notify_params["id"] = event_turn_id
+                    notify_params["turn_id"] = event_turn_id
+                    notify_params["turnId"] = event_turn_id
+                compat_notify_payload = {
+                    "method": "exec/approvalResponse",
+                    "params": notify_params,
+                }
+                primary_control_payload = (
+                    {
+                        "type": "rpc_response",
+                        "rpc_id": merged_rpc_id,
+                        "result": {
+                            "decision": rpc_decision,
+                        },
+                    }
+                    if merged_rpc_id is not None
+                    else compat_notify_payload
+                )
+                compat_rpc_payload = None
+                if approval_provider is not None:
+                    _send_approval_decision(
+                        approval_provider,
                         job_id,
                         node_id,
-                        {
-                            "type": "rpc_response",
-                            "rpc_id": existing_request_id_hint,
-                            "result": {
-                                "decision": rpc_decision,
-                                "approved": approved_flag,
-                            },
-                        },
+                        primary_control_payload,
+                        compat_rpc_payload,
+                        compat_notify_payload,
                     )
-                approval_trace(
-                    "required_autoreplay_sent",
-                    job_id=str(job_id),
-                    swarm_id=str(swarm_id),
-                    node_id=_normalize_node_id(node_id),
-                    call_id=str(call_id),
-                    approval_id=approval_id,
-                    rpc_id=merged_rpc_id,
-                )
-                PENDING_APPROVAL_DECISIONS.pop(key, None)
-                PENDING_APPROVALS.pop(key, None)
-                _bump_approvals_version()
+                    approval_trace(
+                        "required_autoreplay_sent",
+                        job_id=str(job_id),
+                        swarm_id=str(swarm_id),
+                        node_id=_normalize_node_id(node_id),
+                        call_id=str(call_id),
+                        approval_id=approval_id,
+                        rpc_id=merged_rpc_id,
+                        fallback_notify=True,
+                        native_request=bool(rpc_id is not None),
+                    )
+                    pending_decision["control_payload"] = primary_control_payload
+                    pending_decision["compat_rpc_payload"] = compat_rpc_payload
+                    pending_decision["compat_notify_payload"] = compat_notify_payload
+                    pending_decision["job_id"] = str(job_id)
+                    pending_decision["node_id"] = int(node_id)
+                    pending_decision["send_attempts"] = int(pending_decision.get("send_attempts", 0) or 0) + 1
+                    pending_decision["last_sent_ts"] = time.time()
+                    PENDING_APPROVAL_DECISIONS[key] = pending_decision
+                    PENDING_APPROVALS[key]["approval_status"] = (
+                        "approved_pending_ack" if approved_flag else "denied_pending_ack"
+                    )
+                    PENDING_APPROVALS[key]["updated_at_ts"] = time.time()
+                    _bump_approvals_version()
 
         return (
             "exec_approval_required",
@@ -1846,6 +2446,9 @@ def translate_event(event):
 
     if method == "codex/event/exec_command_begin":
         msg = payload.get("params", {}).get("msg", {})
+        call_id = msg.get("call_id")
+        if call_id:
+            _prune_pending_approval_for_call(job_id, node_id, call_id, "command_begin")
         return (
             "command_started",
             {
@@ -1860,6 +2463,9 @@ def translate_event(event):
 
     if method == "codex/event/exec_command_end":
         msg = payload.get("params", {}).get("msg", {})
+        call_id = msg.get("call_id")
+        if call_id:
+            _prune_pending_approval_for_call(job_id, node_id, call_id, "command_end")
         return (
             "command_completed",
             {
@@ -1875,6 +2481,152 @@ def translate_event(event):
                 "raw": payload
             }
         )
+
+    if method == "codex/event/patch_apply_begin":
+        msg = payload.get("params", {}).get("msg", {})
+        call_id = msg.get("call_id")
+        if call_id:
+            _prune_pending_approval_for_call(job_id, node_id, call_id, "patch_apply_begin")
+        return (
+            "filechange_started",
+            {
+                **base,
+                "turn_id": msg.get("turn_id"),
+                "call_id": call_id,
+                "raw": payload,
+            },
+        )
+
+    if method == "codex/event/patch_apply_end":
+        msg = payload.get("params", {}).get("msg", {})
+        call_id = msg.get("call_id")
+        if call_id:
+            _prune_pending_approval_for_call(job_id, node_id, call_id, "patch_apply_end")
+        return (
+            "filechange_completed",
+            {
+                **base,
+                "turn_id": msg.get("turn_id"),
+                "call_id": call_id,
+                "status": msg.get("status"),
+                "raw": payload,
+            },
+        )
+
+    if method in ("item/started", "item/completed", "codex/event/item_started", "codex/event/item_completed"):
+        params = payload.get("params", {})
+        item = params.get("item")
+        if item is None:
+            item = params.get("msg", {}).get("item", {})
+
+        item_type = None
+        call_id = None
+        if isinstance(item, dict):
+            item_type = re.sub(r"[^a-z]", "", str(item.get("type") or "").lower())
+            call_id = item.get("id")
+
+        if call_id and item_type in ("filechange", "commandexecution"):
+            started = method in ("item/started", "codex/event/item_started")
+            if item_type == "filechange":
+                if started:
+                    key = _approval_key(job_id, call_id, node_id)
+                    existing = PENDING_APPROVALS.get(key)
+                    resolved_recently = _is_recently_resolved_approval(job_id, call_id, node_id)
+                    if not existing and not resolved_recently:
+                        approval_id = str(uuid.uuid4())
+                        command = {"changes": item.get("changes")} if isinstance(item.get("changes"), (list, dict)) else "Apply file changes"
+                        PENDING_APPROVALS[key] = {
+                            "approval_id": approval_id,
+                            "approval_status": "pending",
+                            "swarm_id": swarm_id,
+                            "node_id": node_id,
+                            "injection_id": base.get("injection_id"),
+                            "turn_id": params.get("turnId") or params.get("msg", {}).get("turn_id"),
+                            "rpc_id": None,
+                            "request_id_hint": None,
+                            "approval_method": "item/fileChange/implicitFromStarted",
+                            "command": command,
+                            "reason": "Approve file changes",
+                            "cwd": item.get("cwd"),
+                            "proposed_execpolicy_amendment": None,
+                            "available_decisions": ["accept", "cancel"],
+                            "available_decisions_native": [],
+                            "available_decisions_item": ["accept", "cancel"],
+                            "synthetic_request": False,
+                            "has_native_approval": False,
+                            "created_at_ts": time.time(),
+                            "updated_at_ts": time.time(),
+                        }
+                        approvals_version = _bump_approvals_version()
+                        approval_trace(
+                            "required_received_implicit",
+                            job_id=str(job_id),
+                            swarm_id=str(swarm_id),
+                            node_id=_normalize_node_id(node_id),
+                            call_id=str(call_id),
+                            approval_id=approval_id,
+                            approvals_version=approvals_version,
+                            injection_id=base.get("injection_id"),
+                            turn_id=params.get("turnId") or params.get("msg", {}).get("turn_id"),
+                            approval_method="item/fileChange/implicitFromStarted",
+                        )
+                        return (
+                            "exec_approval_required",
+                            {
+                                **base,
+                                "approval_id": approval_id,
+                                "approvals_version": approvals_version,
+                                "injection_id": base.get("injection_id"),
+                                "turn_id": params.get("turnId") or params.get("msg", {}).get("turn_id"),
+                                "call_id": call_id,
+                                "command": command,
+                                "reason": "Approve file changes",
+                                "cwd": item.get("cwd"),
+                                "proposed_execpolicy_amendment": None,
+                                "available_decisions": ["accept", "cancel"],
+                                "raw": payload,
+                            },
+                        )
+                source = "filechange_item_started" if started else "filechange_item_completed"
+                event_name = "filechange_started" if started else "filechange_completed"
+                if not started:
+                    _prune_pending_approval_for_call(job_id, node_id, call_id, source)
+                return (
+                    event_name,
+                    {
+                        **base,
+                        "turn_id": params.get("turnId") or params.get("msg", {}).get("turn_id"),
+                        "call_id": call_id,
+                        "raw": payload,
+                    },
+                )
+
+            source = "command_item_started" if started else "command_item_completed"
+            event_name = "command_started" if started else "command_completed"
+            if not started:
+                _prune_pending_approval_for_call(job_id, node_id, call_id, source)
+            return (
+                event_name,
+                {
+                    **base,
+                    "turn_id": params.get("turnId") or params.get("msg", {}).get("turn_id"),
+                    "call_id": call_id,
+                    "command": item.get("command"),
+                    "cwd": item.get("cwd"),
+                    "stdout": item.get("stdout") or item.get("aggregatedOutput"),
+                    "stderr": item.get("stderr"),
+                    "exit_code": item.get("exitCode"),
+                    "duration": item.get("durationMs"),
+                    "status": item.get("status"),
+                    "raw": payload,
+                },
+            )
+
+        if call_id and item_type == "dynamictoolcall":
+            started = method in ("item/started", "codex/event/item_started")
+            if not started:
+                _prune_pending_approval_for_call(job_id, node_id, call_id, "dynamic_tool_item_completed")
+            return None
 
     # --- Reasoning normalization ---
     if method == "codex/event/agent_reasoning_delta":
@@ -1965,11 +2717,13 @@ def run_daemon(config, providers):
 
     threading.Thread(target=tcp_server, daemon=True).start()
 
-    # Start one follower per backend provider so mixed-provider launches stream events.
+    # Start followers lazily per provider_ref. Do not prestart followers for
+    # configured-but-idle backends/profiles.
     follower_procs = {}
     stdout_buffers = {}
     follower_restart_after = {}
     follower_starting = set()
+    follower_enabled = set()
 
     def start_follower_async(backend, provider):
         if backend in follower_starting:
@@ -1989,8 +2743,26 @@ def run_daemon(config, providers):
         finally:
             follower_starting.discard(backend)
 
-    for backend, provider in providers.items():
-        threading.Thread(target=start_follower_async, args=(backend, provider), daemon=True).start()
+    def enable_follower(backend):
+        if not backend:
+            return
+        if backend not in providers:
+            return
+        follower_enabled.add(backend)
+        if backend in follower_procs or backend in follower_starting:
+            return
+        threading.Thread(target=start_follower_async, args=(backend, providers[backend]), daemon=True).start()
+
+    # If state recovery restored running swarms, enable followers only for those
+    # specific provider refs.
+    for swarm in SWARMS.values():
+        if not isinstance(swarm, dict):
+            continue
+        provider_ref = swarm.get("provider")
+        provider_backend = swarm.get("provider_backend")
+        backend_key = provider_ref if provider_ref in providers else provider_backend
+        if isinstance(backend_key, str):
+            enable_follower(backend_key)
 
     debug_event("daemon_started")
     # Resume queued inter-swarm work after router restart.
@@ -2012,7 +2784,10 @@ def run_daemon(config, providers):
                     print(f"[router DEBUG] follower exited: {backend}", flush=True)
 
         now = time.time()
-        for backend, provider in providers.items():
+        for backend in list(follower_enabled):
+            provider = providers.get(backend)
+            if not provider:
+                continue
             if backend in follower_procs or backend in follower_starting:
                 continue
             retry_at = float(follower_restart_after.get(backend, 0.0) or 0.0)
@@ -2122,6 +2897,9 @@ def run_daemon(config, providers):
             if DEBUG:
                 print(f"[router DEBUG] follower stream EOF: {backend}", flush=True)
 
+        # Keep approval delivery resilient across transient transport gaps.
+        _retry_unacked_approvals()
+
         # Process queued stdin commands
 # Process queued stdin commands
         while not COMMAND_QUEUE.empty():
@@ -2211,6 +2989,8 @@ def run_daemon(config, providers):
                         "reason": f"provider backend unavailable: {provider_backend}"
                     })
                     continue
+                # Ensure follower is active for the provider handling this launch.
+                enable_follower(provider_ref)
                 launch_defaults = provider_spec.get("defaults")
                 launch_defaults = launch_defaults if isinstance(launch_defaults, dict) else {}
                 effective_launch_params = {**launch_defaults, **provider_params}
@@ -2605,10 +3385,33 @@ def run_daemon(config, providers):
                     rpc_id = meta.get("rpc_id")
                     request_id_hint = meta.get("request_id_hint")
                     approval_method = meta.get("approval_method")
+                    has_native_approval = bool(meta.get("has_native_approval"))
                     available_decisions = meta.get("available_decisions") or []
+                    available_decisions_native = meta.get("available_decisions_native") or []
+                    available_decisions_item = meta.get("available_decisions_item") or []
+                    proposed_execpolicy_amendment = meta.get("proposed_execpolicy_amendment")
+                    native_approval_method = approval_method in (
+                        "codex/event/exec_approval_request",
+                        "codex/event/apply_patch_approval_request",
+                        "execCommandApproval",
+                        "applyPatchApproval",
+                    )
+                    prefer_native_dialect = native_approval_method or has_native_approval
+                    # item/* approvals are still JSON-RPC requests when they carry
+                    # a top-level id. A companion native codex/event/* approval, if
+                    # present, only affects decision dialect selection, not whether
+                    # we owe an rpc_response.
+
+                    route_available_decisions = (
+                        available_decisions_native
+                        if prefer_native_dialect
+                        else available_decisions_item
+                    ) or available_decisions
 
                     def _extract_amendment_from_decision(d):
                         if not isinstance(d, dict):
+                            if isinstance(proposed_execpolicy_amendment, list):
+                                return proposed_execpolicy_amendment
                             return None
                         if isinstance(d.get("approved_execpolicy_amendment"), dict):
                             inner = d["approved_execpolicy_amendment"]
@@ -2618,97 +3421,211 @@ def run_daemon(config, providers):
                             inner = d["acceptWithExecpolicyAmendment"]
                             if isinstance(inner.get("execpolicy_amendment"), list):
                                 return inner["execpolicy_amendment"]
+                        if isinstance(proposed_execpolicy_amendment, list):
+                            return proposed_execpolicy_amendment
                         return None
 
-                    def _normalize_approved_decision(d, approved_flag):
-                        if d is None:
-                            return "approved" if approved_flag else "abort"
-                        if isinstance(d, str):
-                            if d in ("approved", "abort"):
-                                return d
-                            if d == "accept":
-                                return "approved"
-                            if d == "cancel":
-                                return "abort"
-                            return "approved" if approved_flag else "abort"
-                        if isinstance(d, dict):
-                            amendment = _extract_amendment_from_decision(d)
-                            if amendment:
-                                return {
-                                    "approved_execpolicy_amendment": {
-                                        "proposed_execpolicy_amendment": amendment
-                                    }
-                                }
-                        return "approved" if approved_flag else "abort"
+                    def _available_flags(available):
+                        flags = {
+                            "accept": False,
+                            "cancel": False,
+                            "approved": False,
+                            "approved_for_session": False,
+                            "denied": False,
+                            "abort": False,
+                            "accept_with_amendment": False,
+                            "approved_with_amendment": False,
+                        }
+                        for entry in (available or []):
+                            if isinstance(entry, str):
+                                if entry in flags:
+                                    flags[entry] = True
+                            elif isinstance(entry, dict):
+                                if "acceptWithExecpolicyAmendment" in entry:
+                                    flags["accept_with_amendment"] = True
+                                if "approved_execpolicy_amendment" in entry:
+                                    flags["approved_with_amendment"] = True
+                        return flags
 
-                    def _normalize_accept_decision(d, approved_flag):
-                        if d is None:
-                            return "accept" if approved_flag else "cancel"
-                        if isinstance(d, str):
-                            if d in ("accept", "cancel"):
-                                return d
-                            if d == "approved":
+                    def _normalize_decision_for_available(d, approved_flag, available, prefer_native_dialect=False):
+                        """
+                        Normalize UI decision to only use decisions explicitly present
+                        in available_decisions. This prevents emitting amendment objects
+                        when runtime only supports plain string decisions.
+                        """
+                        flags = _available_flags(available)
+                        amendment = _extract_amendment_from_decision(d)
+
+                        def _approved_plain():
+                            if prefer_native_dialect:
+                                if flags["approved"]:
+                                    return "approved"
+                                if flags["approved_for_session"]:
+                                    return "approved_for_session"
+                                return "approved" if approved_flag else "abort"
+                            if flags["accept"]:
                                 return "accept"
-                            if d == "abort":
-                                return "cancel"
+                            if flags["approved"]:
+                                return "approved"
                             return "accept" if approved_flag else "cancel"
-                        if isinstance(d, dict):
-                            amendment = _extract_amendment_from_decision(d)
-                            if amendment:
-                                return {
-                                    "acceptWithExecpolicyAmendment": {
-                                        "execpolicy_amendment": amendment
+
+                        def _denied_plain():
+                            if prefer_native_dialect:
+                                if flags["denied"]:
+                                    return "denied"
+                                if flags["abort"]:
+                                    return "abort"
+                                return "abort" if not approved_flag else "approved"
+                            if flags["cancel"]:
+                                return "cancel"
+                            if flags["abort"]:
+                                return "abort"
+                            return "cancel" if not approved_flag else "accept"
+
+                        if approved_flag:
+                            # Preserve an explicit valid string decision.
+                            if isinstance(d, str):
+                                if prefer_native_dialect:
+                                    if d == "accept":
+                                        d = "approved"
+                                    elif d == "cancel":
+                                        d = "abort"
+                                    elif d == "acceptForSession":
+                                        d = "approved_for_session"
+                                if d in ("accept", "approved", "approved_for_session") and flags.get(d, False):
+                                    return d
+                                if d == "cancel" and flags["cancel"]:
+                                    return "cancel"
+                                if d == "denied" and flags["denied"]:
+                                    return "denied"
+                                if d == "abort" and flags["abort"]:
+                                    return "abort"
+
+                            if (
+                                prefer_native_dialect
+                                and isinstance(d, dict)
+                                and isinstance(d.get("acceptWithExecpolicyAmendment"), dict)
+                            ):
+                                native_amendment = d["acceptWithExecpolicyAmendment"].get("execpolicy_amendment")
+                                if isinstance(native_amendment, list):
+                                    return {
+                                        "approved_execpolicy_amendment": {
+                                            "proposed_execpolicy_amendment": native_amendment
+                                        }
                                     }
-                                }
-                        return "accept" if approved_flag else "cancel"
 
-                    def _normalize_decision_for_available(d, approved_flag, available):
-                        """
-                        Normalize UI decision into one of the runtime-supported dialects:
-                        - accept/cancel (+ acceptWithExecpolicyAmendment)
-                        - approved/abort (+ approved_execpolicy_amendment)
-                        """
-                        has_accept_local = any(
-                            (isinstance(x, str) and x in ("accept", "cancel")) or
-                            (isinstance(x, dict) and "acceptWithExecpolicyAmendment" in x)
-                            for x in (available or [])
-                        )
-                        if has_accept_local:
-                            return _normalize_accept_decision(d, approved_flag)
-                        return _normalize_approved_decision(d, approved_flag)
+                            # Only emit amendment objects when explicitly supported.
+                            if amendment:
+                                if prefer_native_dialect and flags["approved_with_amendment"]:
+                                    return {
+                                        "approved_execpolicy_amendment": {
+                                            "proposed_execpolicy_amendment": amendment
+                                        }
+                                    }
+                                if flags["accept_with_amendment"]:
+                                    return {
+                                        "acceptWithExecpolicyAmendment": {
+                                            "execpolicy_amendment": amendment
+                                        }
+                                    }
+                                if flags["approved_with_amendment"]:
+                                    return {
+                                        "approved_execpolicy_amendment": {
+                                            "proposed_execpolicy_amendment": amendment
+                                        }
+                                    }
+                            return _approved_plain()
 
-                    has_accept = any(
-                        (isinstance(d, str) and d in ("accept", "cancel")) or
-                        (isinstance(d, dict) and "acceptWithExecpolicyAmendment" in d)
-                        for d in available_decisions
-                    )
+                        # deny path
+                        if isinstance(d, str):
+                            if prefer_native_dialect:
+                                if d == "accept":
+                                    d = "approved"
+                                elif d == "cancel":
+                                    d = "abort"
+                                elif d == "decline":
+                                    d = "denied"
+                            if d in ("cancel", "abort", "denied") and flags.get(d, False):
+                                return d
+                            if d == "accept" and flags["accept"]:
+                                return "accept"
+                            if d == "approved" and flags["approved"]:
+                                return "approved"
+                        return _denied_plain()
+
+                    def _coerce_to_advertised_decision(candidate, available, approved_flag, prefer_native_dialect=False):
+                        """
+                        Enforce protocol contract: outgoing decision must be one of
+                        the options advertised in available_decisions.
+                        """
+                        def _decision_token(value):
+                            if isinstance(value, str):
+                                return ("s", value)
+                            if isinstance(value, dict):
+                                try:
+                                    return ("j", json.dumps(value, sort_keys=True))
+                                except Exception:
+                                    return ("o", str(value))
+                            return ("x", str(value))
+
+                        advertised = list(available or [])
+                        if not advertised:
+                            return candidate
+
+                        advertised_keys = {_decision_token(entry) for entry in advertised}
+                        if _decision_token(candidate) in advertised_keys:
+                            return candidate
+
+                        if bool(approved_flag):
+                            preferred = (
+                                ("approved", "approved_for_session", "accept", "acceptForSession")
+                                if prefer_native_dialect
+                                else ("accept", "approved", "acceptForSession")
+                            )
+                        else:
+                            preferred = (
+                                ("denied", "abort", "cancel", "decline")
+                                if prefer_native_dialect
+                                else ("cancel", "decline", "abort")
+                            )
+
+                        for token in preferred:
+                            if token in advertised:
+                                return token
+
+                        if bool(approved_flag):
+                            for entry in advertised:
+                                if isinstance(entry, dict):
+                                    return entry
+
+                        return advertised[0]
+
                     compat_rpc_payload = None
+                    compat_notify_payload = None
+
+                    # Do not silently upgrade plain approve into an amendment decision.
+                    # "Approve + Remember" is an explicit user action from the UI and
+                    # arrives as a dict decision payload. Keeping plain approve as a
+                    # string token avoids oversized control payloads and mismatches.
 
                     if rpc_id is not None:
                         # JSON-RPC request-style approval (must send response with same id)
-                        if has_accept:
-                            normalized_decision = _normalize_accept_decision(decision, bool(approved))
-                        else:
-                            normalized = _normalize_approved_decision(decision, bool(approved))
-                            # Request-style API expects accept/cancel naming.
-                            if normalized == "approved":
-                                normalized_decision = "accept"
-                            elif normalized == "abort":
-                                normalized_decision = "cancel"
-                            elif isinstance(normalized, dict):
-                                amendment = _extract_amendment_from_decision(normalized)
-                                normalized_decision = {
-                                    "acceptWithExecpolicyAmendment": {
-                                        "execpolicy_amendment": amendment or []
-                                    }
-                                }
-                            else:
-                                normalized_decision = "accept" if bool(approved) else "cancel"
+                        normalized_decision = _normalize_decision_for_available(
+                            decision,
+                            bool(approved),
+                            route_available_decisions,
+                            prefer_native_dialect,
+                        )
+                        normalized_decision = _coerce_to_advertised_decision(
+                            normalized_decision,
+                            route_available_decisions,
+                            bool(approved),
+                            prefer_native_dialect,
+                        )
 
                         # Newer app-server expects an object with explicit `decision`.
                         result_payload = {
                             "decision": normalized_decision,
-                            "approved": bool(approved),
                         }
 
                         control_payload = {
@@ -2717,41 +3634,76 @@ def run_daemon(config, providers):
                             "result": result_payload
                         }
                         route_mode = "rpc_response"
-                        if request_id_hint is not None and str(request_id_hint) != str(rpc_id):
-                            compat_rpc_payload = {
-                                "type": "rpc_response",
-                                "rpc_id": request_id_hint,
-                                "result": result_payload
+                        # Keep notification fallback enabled; some runtimes only
+                        # resume on exec/approvalResponse even when rpc_response is sent.
+                        notify_decision = _normalize_decision_for_available(
+                            decision,
+                            bool(approved),
+                            route_available_decisions,
+                            prefer_native_dialect,
+                        )
+                        notify_decision = _coerce_to_advertised_decision(
+                            notify_decision,
+                            route_available_decisions,
+                            bool(approved),
+                            prefer_native_dialect,
+                        )
+                        notify_params = {
+                            "call_id": call_id,
+                            "callId": call_id,
+                            "approved": bool(approved),
+                            "decision": notify_decision,
+                        }
+                        if meta.get("turn_id"):
+                            notify_params["id"] = meta.get("turn_id")
+                            notify_params["turn_id"] = meta.get("turn_id")
+                            notify_params["turnId"] = meta.get("turn_id")
+                        if isinstance(notify_decision, dict):
+                            notify_params.update(notify_decision)
+                        if approval_method in ("applyPatchApproval", "execCommandApproval"):
+                            compat_notify_payload = None
+                        else:
+                            compat_notify_payload = {
+                                "method": "exec/approvalResponse",
+                                "params": notify_params,
                             }
+                        compat_rpc_payload = None
                     else:
                         # Notification-style approval
                         normalized = _normalize_decision_for_available(
                             decision,
                             bool(approved),
-                            available_decisions,
+                            route_available_decisions,
+                            prefer_native_dialect,
                         )
+                        normalized = _coerce_to_advertised_decision(
+                            normalized,
+                            route_available_decisions,
+                            bool(approved),
+                            prefer_native_dialect,
+                        )
+                        notify_decision = normalized
                         params_payload = {
                             "call_id": call_id,
                             "callId": call_id,
                             "approved": bool(approved),
                         }
-                        # Always include explicit decision token/object for compatibility.
-                        if normalized == "approved":
-                            params_payload["approved"] = True
-                            params_payload["decision"] = "approved"
-                        elif normalized == "abort":
-                            params_payload["approved"] = False
-                            params_payload["decision"] = "abort"
-                        elif normalized == "accept":
-                            params_payload["approved"] = True
-                            params_payload["decision"] = "accept"
-                        elif normalized == "cancel":
-                            params_payload["approved"] = False
-                            params_payload["decision"] = "cancel"
-                        elif isinstance(normalized, dict):
-                            params_payload.update(normalized)
-                            params_payload["approved"] = True
-                            params_payload["decision"] = normalized
+                        if meta.get("turn_id"):
+                            params_payload["id"] = meta.get("turn_id")
+                            params_payload["turn_id"] = meta.get("turn_id")
+                            params_payload["turnId"] = meta.get("turn_id")
+                        # Always include the exact normalized decision token/object
+                        # chosen from advertised available_decisions.
+                        if isinstance(notify_decision, dict):
+                            params_payload.update(notify_decision)
+                            params_payload["decision"] = notify_decision
+                            params_payload["approved"] = bool(approved)
+                        elif isinstance(notify_decision, str):
+                            params_payload["decision"] = notify_decision
+                            if notify_decision in ("accept", "acceptForSession", "approved"):
+                                params_payload["approved"] = True
+                            elif notify_decision in ("cancel", "decline", "abort"):
+                                params_payload["approved"] = False
 
                         control_payload = {
                             "method": "exec/approvalResponse",
@@ -2759,113 +3711,77 @@ def run_daemon(config, providers):
                         }
                         route_mode = "exec_approval_response"
 
-                        # Compatibility path for certain runtimes that emit
-                        # codex/event/exec_approval_request with params.id but
-                        # do not include top-level payload.id.
-                        if (
-                            approval_method in (
-                                "codex/event/exec_approval_request",
-                                "codex/event/apply_patch_approval_request",
-                                "item/commandExecution/requestApproval",
-                                "item/fileChange/requestApproval",
-                            )
-                            and request_id_hint is not None
-                        ):
-                            if has_accept:
-                                compat_decision = _normalize_accept_decision(decision, bool(approved))
-                            else:
-                                normalized_for_rpc = _normalize_approved_decision(decision, bool(approved))
-                                if normalized_for_rpc == "approved":
-                                    compat_decision = "accept"
-                                elif normalized_for_rpc == "abort":
-                                    compat_decision = "cancel"
-                                elif isinstance(normalized_for_rpc, dict):
-                                    amendment = _extract_amendment_from_decision(normalized_for_rpc)
-                                    compat_decision = {
-                                        "acceptWithExecpolicyAmendment": {
-                                            "execpolicy_amendment": amendment or []
-                                        }
-                                    }
-                                else:
-                                    compat_decision = "accept" if bool(approved) else "cancel"
-                            compat_rpc_payload = {
-                                "type": "rpc_response",
-                                "rpc_id": request_id_hint,
-                                "result": {
-                                    "decision": compat_decision,
-                                    "approved": bool(approved),
-                                },
-                            }
-                            approval_trace(
-                                "approve_command_compat_rpc_prepared",
-                                request_id=request_id,
-                                job_id=str(job_id),
-                                node_id=_normalize_node_id(meta.get("node_id")),
-                                call_id=str(call_id),
-                                compat_rpc_id=request_id_hint,
-                            )
+                        # Notification-style approvals are answered via
+                        # exec/approvalResponse only.
+                        compat_rpc_payload = None
 
-                    is_synthetic_request = (
-                        meta.get("approval_method") == "item/commandExecution/requestApproval"
-                        and rpc_id is None
+                    is_synthetic_request = bool(
+                        (meta.get("synthetic_request") is True)
+                        and not bool(meta.get("has_native_approval"))
                     )
 
-                    if is_synthetic_request:
-                        # Synthetic approvals are emitted by worker-side bridging when
-                        # app-server produced a function_call without native approval RPC.
-                        # Execute command directly once approved so the action is visible.
-                        if bool(approved):
-                            threading.Thread(
-                                target=execute_synthetic_approved_command,
-                                args=(dict(meta), str(job_id), call_id),
-                                daemon=True,
-                            ).start()
+                    approval_trace(
+                        "approve_command_route_send",
+                        request_id=request_id,
+                        job_id=str(job_id),
+                        node_id=_normalize_node_id(meta.get("node_id")),
+                        call_id=str(call_id),
+                        route_mode=route_mode,
+                        rpc_id=rpc_id,
+                        synthetic=is_synthetic_request,
+                    )
+                    emit_event("debug", {
+                        "source": "router",
+                        "message": (
+                            "approval route="
+                            f"{route_mode} job_id={job_id} node_id={_normalize_node_id(meta.get('node_id'))} "
+                            f"call_id={call_id} rpc_id={rpc_id} request_id_hint={request_id_hint} "
+                            f"approval_method={approval_method} has_native={has_native_approval} "
+                            f"synthetic={is_synthetic_request} "
+                            f"fallback_notify={compat_notify_payload is not None}"
+                        ),
+                    })
+                    _send_approval_decision(
+                        approval_provider,
+                        job_id,
+                        meta["node_id"],
+                        control_payload,
+                        compat_rpc_payload,
+                        compat_notify_payload,
+                    )
+                    if compat_rpc_payload is not None:
                         approval_trace(
-                            "approve_command_synthetic",
+                            "approve_command_compat_rpc_sent",
                             request_id=request_id,
                             job_id=str(job_id),
                             node_id=_normalize_node_id(meta.get("node_id")),
                             call_id=str(call_id),
-                            approved=bool(approved),
+                            compat_rpc_id=request_id_hint,
                         )
-                    else:
+                    if compat_notify_payload is not None:
                         approval_trace(
-                            "approve_command_route_send",
+                            "approve_command_compat_notify_sent",
                             request_id=request_id,
                             job_id=str(job_id),
                             node_id=_normalize_node_id(meta.get("node_id")),
                             call_id=str(call_id),
-                            route_mode=route_mode,
-                            rpc_id=rpc_id,
+                            method="exec/approvalResponse",
                         )
-                        approval_provider.send_control(
-                            job_id,
-                            meta["node_id"],
-                            control_payload,
-                        )
-                        if compat_rpc_payload is not None:
-                            approval_provider.send_control(
-                                job_id,
-                                meta["node_id"],
-                                compat_rpc_payload,
-                            )
-                            approval_trace(
-                                "approve_command_compat_rpc_sent",
-                                request_id=request_id,
-                                job_id=str(job_id),
-                                node_id=_normalize_node_id(meta.get("node_id")),
-                                call_id=str(call_id),
-                                compat_rpc_id=request_id_hint,
-                            )
 
-                    if rpc_id is None:
-                        PENDING_APPROVAL_DECISIONS[key] = {
-                            "approved": bool(approved),
-                            "decision": decision,
-                            "timestamp": time.time(),
-                        }
-                    else:
-                        PENDING_APPROVAL_DECISIONS.pop(key, None)
+                    persisted_decision = normalized_decision if rpc_id is not None else normalized
+                    PENDING_APPROVAL_DECISIONS[key] = {
+                        "request_id": request_id,
+                        "approved": bool(approved),
+                        "decision": persisted_decision,
+                        "job_id": str(job_id),
+                        "node_id": meta.get("node_id"),
+                        "control_payload": control_payload,
+                        "compat_rpc_payload": compat_rpc_payload,
+                        "compat_notify_payload": compat_notify_payload,
+                        "timestamp": time.time(),
+                        "last_sent_ts": time.time(),
+                        "send_attempts": 1,
+                    }
                 except Exception as e:
                     approval_trace(
                         "approve_command_route_error",
@@ -2882,18 +3798,12 @@ def run_daemon(config, providers):
                     continue
 
                 approval_id = meta.get("approval_id")
-                _remember_recent_approval_result(
-                    job_id,
-                    call_id,
-                    meta.get("node_id"),
-                    approved,
-                    decision,
+                PENDING_APPROVALS[key]["approval_status"] = (
+                    "approved_pending_ack" if bool(approved) else "denied_pending_ack"
                 )
-                del PENDING_APPROVALS[key]
-                _mark_approval_resolved(job_id, call_id, meta.get("node_id"))
+                PENDING_APPROVALS[key]["updated_at_ts"] = time.time()
                 approvals_version = _bump_approvals_version()
-
-                emit_event("exec_approval_resolved", {
+                emit_event("exec_approval_submitted", {
                     "request_id": request_id,
                     "approval_id": approval_id,
                     "job_id": job_id,
@@ -2905,7 +3815,7 @@ def run_daemon(config, providers):
                     "approvals_version": approvals_version,
                 })
                 approval_trace(
-                    "approve_command_resolved",
+                    "approve_command_submitted_pending_ack",
                     request_id=request_id,
                     approval_id=approval_id,
                     approvals_version=approvals_version,
@@ -2913,6 +3823,7 @@ def run_daemon(config, providers):
                     node_id=_normalize_node_id(meta.get("node_id")),
                     call_id=str(call_id),
                     approved=bool(approved),
+                    synthetic=is_synthetic_request,
                 )
 
             elif command == "swarm_terminate":

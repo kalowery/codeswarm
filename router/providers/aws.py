@@ -771,6 +771,10 @@ fi
             if not worker_ids:
                 continue
             worker_list = " ".join(str(i) for i in worker_ids)
+            capture_all_session = str(os.environ.get("CODESWARM_CAPTURE_ALL_SESSION") or "").strip()
+            capture_export = ""
+            if capture_all_session:
+                capture_export = f'    export CODESWARM_CAPTURE_ALL_SESSION={self._quote(capture_all_session)}\n'
             script = f"""
 set -euo pipefail
 BASE={self._quote(self.base_path)}
@@ -803,6 +807,7 @@ for wid in {worker_list}; do
     export CODESWARM_BASE_DIR="$BASE"
     export CODESWARM_CODEX_BIN="$BASE/tools/npm-global/bin/codex"
     export PATH="$BASE/tools/node/bin:$BASE/tools/npm-global/bin:$PATH"
+{capture_export}    # Optional full raw session capture for Codex protocol debugging
     nohup python3 "$BASE/agent/codex_worker.py" >> "$AGENT_WORKDIR/worker.log" 2>&1 &
     echo $! > "$AGENT_WORKDIR/worker.pid"
   )

@@ -112,6 +112,14 @@ codex --sandbox workspace-write --ask-for-approval never
 
 If Codex is left in read-only or on-request modes, commands may execute inconsistently or fail to write files.
 
+For protocol debugging, you can enable continuous raw session capture from each worker:
+
+```bash
+export CODESWARM_CAPTURE_ALL_SESSION=1
+```
+
+With that set before launch, workers emit every raw Codex session entry to mailbox outbox as `session_trace` records in addition to the normal `codex_rpc` stream. This applies to local, Slurm, and AWS worker launches.
+
 ## Architecture
 
 ```mermaid

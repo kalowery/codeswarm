@@ -5,6 +5,7 @@ import subprocess
 import time
 import select
 import signal
+import tempfile
 from collections import deque
 from pathlib import Path
 from datetime import datetime, timezone
@@ -62,15 +63,26 @@ def main():
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
 
     codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
+    sandbox_mode = os.environ.get("CODESWARM_SANDBOX_MODE", "workspace-write")
+    approval_policy = os.environ.get("CODESWARM_ASK_FOR_APPROVAL", "never")
+    capture_all_session = os.environ.get("CODESWARM_CAPTURE_ALL_SESSION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     codex_home = str(Path.home() / ".codex")
+    workspace_dir = os.getcwd()
 
     proc = subprocess.Popen(
         [
             str(codex_bin),
-            "--sandbox", "workspace-write",
-            "--ask-for-approval", "never",
+            "--cd", workspace_dir,
+            "--sandbox", sandbox_mode,
+            "--ask-for-approval", approval_policy,
             "--add-dir", codex_home,
+            "--add-dir", workspace_dir,
             "app-server",
             "--listen", "stdio://"
         ],
@@ -90,7 +102,14 @@ def main():
     request_to_injection = {}
     pending_injections = deque()
     session_offset = 0
-    emitted_escalation_calls = set()
+    pending_dynamic_tool_requests = {}
+    pending_dynamic_tool_calls = {}
+    pending_session_tool_calls = {}
+    session_response_history = []
+    session_trace_lines_remaining = 0
+    session_trace_reason = None
+    session_trace_turn_id = None
+    SESSION_TOOL_NATIVE_GRACE_SECONDS = 1.0
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -122,6 +141,341 @@ def main():
             msg["result"] = result
         proc.stdin.write(json.dumps(msg) + "\n")
         proc.stdin.flush()
+
+    def _format_exec_output(command, completed):
+        parts = [f"Command: {command}"]
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        if stdout:
+            parts.append(stdout.rstrip())
+        if stderr:
+            parts.append(stderr.rstrip())
+        if completed.returncode not in (0, None):
+            parts.append(f"Exit code: {completed.returncode}")
+        output = "\n".join(part for part in parts if part)
+        return output[:16000]
+
+    def _execute_exec_command_args(args):
+        command = args.get("cmd")
+        if not isinstance(command, str) or not command.strip():
+            raise RuntimeError("exec_command args missing non-empty cmd")
+
+        shell_bin = args.get("shell") or os.environ.get("SHELL") or "/bin/bash"
+        shell_flag = "-lc" if bool(args.get("login", True)) else "-c"
+        cwd = args.get("workdir") or os.getcwd()
+        env = os.environ.copy()
+        override_env = args.get("env")
+        if isinstance(override_env, dict):
+            for key, value in override_env.items():
+                if value is None:
+                    env.pop(str(key), None)
+                else:
+                    env[str(key)] = str(value)
+
+        return subprocess.run(
+            [str(shell_bin), shell_flag, command],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+
+    def _apply_patch_text(patch_text):
+        if not isinstance(patch_text, str) or not patch_text.strip():
+            raise RuntimeError("apply_patch input missing")
+
+        def _resolve_workspace_path(raw_path):
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise RuntimeError("invalid patch path")
+            path = Path(raw_path).expanduser()
+            if not path.is_absolute():
+                path = (Path(workspace_dir) / path).resolve()
+            else:
+                path = path.resolve()
+            workspace_root = Path(workspace_dir).resolve()
+            if path != workspace_root and workspace_root not in path.parents:
+                raise RuntimeError(f"path outside workspace: {path}")
+            return path
+
+        def _write_text(path, content):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        def _find_subsequence(haystack, needle, start):
+            if not needle:
+                return start
+            end = len(haystack) - len(needle) + 1
+            for idx in range(max(0, start), max(0, end)):
+                if haystack[idx:idx + len(needle)] == needle:
+                    return idx
+            return -1
+
+        def _apply_update_file(path, patch_lines, move_to=None):
+            original_text = path.read_text(encoding="utf-8")
+            had_trailing_newline = original_text.endswith("\n")
+            original_lines = original_text.splitlines()
+            result = []
+            src_idx = 0
+            i = 0
+            while i < len(patch_lines):
+                marker = patch_lines[i]
+                if not marker.startswith("@@"):
+                    i += 1
+                    continue
+                i += 1
+                chunk = []
+                while i < len(patch_lines) and not patch_lines[i].startswith("@@"):
+                    chunk.append(patch_lines[i])
+                    i += 1
+                old_seq = []
+                for entry in chunk:
+                    if entry.startswith((" ", "-")):
+                        old_seq.append(entry[1:])
+                pos = _find_subsequence(original_lines, old_seq, src_idx)
+                if pos < 0:
+                    raise RuntimeError(f"failed to locate patch context for {path}")
+                result.extend(original_lines[src_idx:pos])
+                cur = pos
+                for entry in chunk:
+                    prefix = entry[:1]
+                    text = entry[1:]
+                    if prefix == " ":
+                        if cur >= len(original_lines) or original_lines[cur] != text:
+                            raise RuntimeError(f"context mismatch while patching {path}")
+                        result.append(text)
+                        cur += 1
+                    elif prefix == "-":
+                        if cur >= len(original_lines) or original_lines[cur] != text:
+                            raise RuntimeError(f"delete mismatch while patching {path}")
+                        cur += 1
+                    elif prefix == "+":
+                        result.append(text)
+                    else:
+                        raise RuntimeError(f"unsupported patch line: {entry}")
+                src_idx = cur
+            result.extend(original_lines[src_idx:])
+            new_text = "\n".join(result)
+            if had_trailing_newline or new_text:
+                new_text += "\n"
+            target_path = _resolve_workspace_path(move_to) if move_to else path
+            if move_to and target_path != path:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            _write_text(target_path, new_text)
+            return target_path
+
+        lines = patch_text.splitlines()
+        if not lines or lines[0] != "*** Begin Patch":
+            raise RuntimeError("invalid patch header")
+        i = 1
+        changed = []
+        while i < len(lines):
+            line = lines[i]
+            if line == "*** End Patch":
+                break
+            if line.startswith("*** Add File: "):
+                target = _resolve_workspace_path(line[len("*** Add File: "):])
+                i += 1
+                content_lines = []
+                while i < len(lines) and not lines[i].startswith("*** "):
+                    entry = lines[i]
+                    if not entry.startswith("+"):
+                        raise RuntimeError(f"invalid add line: {entry}")
+                    content_lines.append(entry[1:])
+                    i += 1
+                content = "\n".join(content_lines)
+                if content:
+                    content += "\n"
+                _write_text(target, content)
+                changed.append(str(target))
+                continue
+            if line.startswith("*** Delete File: "):
+                target = _resolve_workspace_path(line[len("*** Delete File: "):])
+                try:
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+                changed.append(str(target))
+                i += 1
+                continue
+            if line.startswith("*** Update File: "):
+                target = _resolve_workspace_path(line[len("*** Update File: "):])
+                i += 1
+                move_to = None
+                if i < len(lines) and lines[i].startswith("*** Move to: "):
+                    move_to = lines[i][len("*** Move to: "):]
+                    i += 1
+                patch_lines = []
+                while i < len(lines) and not lines[i].startswith("*** "):
+                    patch_lines.append(lines[i])
+                    i += 1
+                changed.append(str(_apply_update_file(target, patch_lines, move_to=move_to)))
+                continue
+            raise RuntimeError(f"unsupported patch block: {line}")
+        return changed
+
+    def _session_output_item(kind, call_id, success, text):
+        del success
+        return {
+            "type": kind,
+            "call_id": call_id,
+            "output": text[:16000],
+        }
+
+    def _resume_thread_with_output(output_item, injection_id):
+        if not thread_id:
+            raise RuntimeError("thread_id unavailable for thread/resume")
+        history = list(session_response_history)
+        history.append(output_item)
+        req_id = send_request("thread/resume", {
+            "threadId": thread_id,
+            "history": history,
+            "persistExtendedHistory": True,
+        })
+        if injection_id is not None:
+            request_to_injection[req_id] = injection_id
+            pending_injections.append(injection_id)
+
+    def _finish_session_tool_call(call_id):
+        pending_session_tool_calls.pop(call_id, None)
+
+    def _mark_native_session_tool_call(call_id):
+        info = pending_session_tool_calls.get(call_id)
+        if not isinstance(info, dict):
+            return
+        info["state"] = "native"
+        info["native_seen"] = True
+
+    def _fulfill_session_tool_call(call_id, approved):
+        info = pending_session_tool_calls.get(call_id)
+        if not info or info.get("state") in ("done", "running", "native"):
+            return
+        info["state"] = "running"
+        tool_type = info.get("tool_type")
+        injection_id = info.get("injection_id")
+        try:
+            if not approved:
+                if tool_type == "function_call_output":
+                    text = "Command execution was denied by approval policy."
+                else:
+                    text = "Patch application was denied by approval policy."
+                output_item = _session_output_item(tool_type, call_id, False, text)
+                _resume_thread_with_output(output_item, injection_id)
+                write_event(outbox, {
+                    "type": "worker_trace",
+                    "job_id": job_id,
+                    "node_id": node_id,
+                    "injection_id": injection_id,
+                    "event": "session_tool_denied",
+                    "call_id": call_id,
+                    "tool_type": tool_type,
+                })
+            elif tool_type == "function_call_output":
+                args = info.get("arguments") or {}
+                completed = _execute_exec_command_args(args)
+                text = _format_exec_output(args.get("cmd"), completed)
+                output_item = _session_output_item(tool_type, call_id, completed.returncode == 0, text)
+                _resume_thread_with_output(output_item, injection_id)
+                write_event(outbox, {
+                    "type": "worker_trace",
+                    "job_id": job_id,
+                    "node_id": node_id,
+                    "injection_id": injection_id,
+                    "event": "session_tool_fulfilled",
+                    "call_id": call_id,
+                    "tool_type": tool_type,
+                    "success": completed.returncode == 0,
+                })
+            elif tool_type == "custom_tool_call_output":
+                changed = _apply_patch_text(info.get("input") or "")
+                text = "Success. Updated the following files:\n" + "\n".join(
+                    f"M {path}" for path in changed
+                )
+                output_item = _session_output_item(tool_type, call_id, True, text)
+                _resume_thread_with_output(output_item, injection_id)
+                write_event(outbox, {
+                    "type": "worker_trace",
+                    "job_id": job_id,
+                    "node_id": node_id,
+                    "injection_id": injection_id,
+                    "event": "session_tool_fulfilled",
+                    "call_id": call_id,
+                    "tool_type": tool_type,
+                    "success": True,
+                })
+            else:
+                raise RuntimeError(f"unsupported session tool type: {tool_type}")
+            info["state"] = "done"
+        except Exception as exc:
+            output_item = _session_output_item(
+                tool_type,
+                call_id,
+                False,
+                f"{tool_type} failed: {exc}",
+            )
+            try:
+                _resume_thread_with_output(output_item, injection_id)
+            except Exception:
+                pass
+            write_event(outbox, {
+                "type": "worker_error",
+                "job_id": job_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                "error": f"session_tool_fulfillment_error[{call_id}]: {exc}",
+            })
+            info["state"] = "done"
+
+    def _finish_dynamic_tool_call(request_id, call_id):
+        pending_dynamic_tool_requests.pop(request_id, None)
+        if isinstance(call_id, str):
+            pending_dynamic_tool_calls.pop(call_id, None)
+
+    def _send_dynamic_tool_result(request_id, success, text, call_id):
+        send_response(request_id, {
+            "success": bool(success),
+            "contentItems": [
+                {
+                    "type": "inputText",
+                    "text": text[:16000],
+                }
+            ],
+        })
+        _finish_dynamic_tool_call(request_id, call_id)
+
+    def _handle_dynamic_exec_approval(request_id, approved):
+        info = pending_dynamic_tool_requests.get(request_id)
+        if not info:
+            return
+        call_id = info.get("call_id")
+        if not approved:
+            _send_dynamic_tool_result(
+                request_id,
+                False,
+                "Command execution was denied by approval policy.",
+                call_id,
+            )
+            return
+
+        try:
+            completed = _execute_exec_command_args(info.get("arguments") or {})
+            output = _format_exec_output((info.get("arguments") or {}).get("cmd"), completed)
+            _send_dynamic_tool_result(
+                request_id,
+                completed.returncode == 0,
+                output,
+                call_id,
+            )
+        except Exception as exc:
+            _send_dynamic_tool_result(
+                request_id,
+                False,
+                f"exec_command failed: {exc}",
+                call_id,
+            )
 
     def _extract_turn_id(payload):
         params = payload.get("params", {}) if isinstance(payload, dict) else {}
@@ -158,33 +512,25 @@ def main():
 
         return last_injection_id
 
-    def emit_escalation_request_from_function_call(call_id, args, injection_id):
-        if not call_id or call_id in emitted_escalation_calls:
-            return
-
-        emitted_escalation_calls.add(call_id)
-
-        command = args.get("cmd")
-        reason = args.get("justification")
-        cwd = args.get("workdir") or os.getcwd()
-
-        synthetic_payload = {
-            "method": "item/commandExecution/requestApproval",
-            "params": {
-                "itemId": call_id,
-                "command": command,
-                "reason": reason,
-                "cwd": cwd,
-                "availableDecisions": ["accept", "cancel"],
-            },
-        }
-
+    def _emit_dynamic_exec_approval_request(request_id, call_id, arguments, injection_id):
         write_event(outbox, {
             "type": "codex_rpc",
             "job_id": job_id,
             "node_id": node_id,
             "injection_id": injection_id,
-            "payload": synthetic_payload,
+            "payload": {
+                "id": request_id,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "itemId": call_id,
+                    "command": arguments.get("cmd"),
+                    "reason": arguments.get("justification"),
+                    "cwd": arguments.get("workdir") or os.getcwd(),
+                    "availableDecisions": ["accept", "cancel"],
+                    "synthetic_request": True,
+                    "tool_name": "exec_command",
+                },
+            },
         })
 
     with open(outbox_path, "a", buffering=1) as outbox:
@@ -194,14 +540,17 @@ def main():
             "job_id": job_id,
             "node_id": node_id,
             "hostname": hostname,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "capture_all_session": capture_all_session,
         })
 
         # LSP-style handshake
         send_request("initialize", {
             "processId": None,
             "rootUri": None,
-            "capabilities": {},
+            "capabilities": {
+                "experimentalApi": True,
+            },
             "clientInfo": {
                 "name": "codeswarm-worker",
                 "title": "Codeswarm Worker",
@@ -210,7 +559,7 @@ def main():
         })
 
         initialized_sent = False
-        inbox_offset = 0
+        inbox_offset_bytes = 0
         running = True
 
         while running and not shutdown_requested:
@@ -256,6 +605,53 @@ def main():
                             "payload": msg
                         })
 
+                        if msg.get("method") == "thread/status/changed":
+                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                            status = params.get("status") if isinstance(params.get("status"), dict) else {}
+                            active_flags = status.get("activeFlags") if isinstance(status.get("activeFlags"), list) else []
+                            if "waitingOnApproval" in active_flags:
+                                session_trace_lines_remaining = max(session_trace_lines_remaining, 120)
+                                session_trace_reason = "waitingOnApproval"
+                                session_trace_turn_id = _extract_turn_id(msg)
+                                write_event(outbox, {
+                                    "type": "worker_trace",
+                                    "job_id": job_id,
+                                    "node_id": node_id,
+                                    "injection_id": resolved_injection_id,
+                                    "event": "session_trace_armed",
+                                    "reason": session_trace_reason,
+                                    "turn_id": session_trace_turn_id,
+                                })
+
+                        if msg.get("method") == "item/tool/call":
+                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                            request_id = msg.get("id")
+                            call_id = params.get("callId")
+                            tool_name = params.get("tool")
+                            arguments = params.get("arguments")
+                            if (
+                                isinstance(request_id, int)
+                                and isinstance(call_id, str)
+                                and tool_name == "exec_command"
+                                and isinstance(arguments, dict)
+                            ):
+                                _mark_native_session_tool_call(call_id)
+                                pending_dynamic_tool_requests[request_id] = {
+                                    "call_id": call_id,
+                                    "arguments": arguments,
+                                    "injection_id": resolved_injection_id,
+                                }
+                                pending_dynamic_tool_calls[call_id] = request_id
+                                if arguments.get("sandbox_permissions") == "require_escalated":
+                                    _emit_dynamic_exec_approval_request(
+                                        request_id,
+                                        call_id,
+                                        arguments,
+                                        resolved_injection_id,
+                                    )
+                                else:
+                                    _handle_dynamic_exec_approval(request_id, True)
+
                         # After initialize response
                         if msg.get("id") == 0 and not initialized_sent:
                             send_notification("initialized", {})
@@ -299,54 +695,123 @@ def main():
 
             # ---- Inbox handling ----
             if inbox_path.exists() and thread_id:
-                lines = inbox_path.read_text().splitlines()
-                new_lines = lines[inbox_offset:]
+                try:
+                    inbox_size = inbox_path.stat().st_size
+                    if inbox_offset_bytes > inbox_size:
+                        # Inbox was truncated/rotated; restart tailing from beginning.
+                        inbox_offset_bytes = 0
 
-                for line in new_lines:
-                    try:
-                        event = json.loads(line)
-                    except:
-                        continue
+                    with inbox_path.open("rb") as inbox_file:
+                        inbox_file.seek(inbox_offset_bytes)
+                        while True:
+                            line_start = inbox_file.tell()
+                            raw_line = inbox_file.readline()
+                            if not raw_line:
+                                break
+                            # If writer hasn't flushed a full JSONL record yet, do not
+                            # consume this partial line; retry on next poll.
+                            if not raw_line.endswith(b"\n"):
+                                inbox_file.seek(line_start)
+                                break
+                            try:
+                                line = raw_line.decode("utf-8").strip()
+                            except Exception:
+                                inbox_offset_bytes = inbox_file.tell()
+                                continue
+                            if not line:
+                                inbox_offset_bytes = inbox_file.tell()
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except Exception:
+                                # Corrupt complete line; skip and continue.
+                                inbox_offset_bytes = inbox_file.tell()
+                                continue
 
-                    if event.get("type") == "user":
-                        injection_id = event.get("injection_id")
-                        last_injection_id = injection_id
-                        req_id = send_request("turn/start", {
-                            "threadId": thread_id,
-                            "input": [
-                                {
-                                    "type": "text",
-                                    "text": event.get("content", "")
-                                }
-                            ]
-                        })
-                        request_to_injection[req_id] = injection_id
-                        pending_injections.append(injection_id)
+                            if event.get("type") == "user":
+                                injection_id = event.get("injection_id")
+                                last_injection_id = injection_id
+                                req_id = send_request("turn/start", {
+                                    "threadId": thread_id,
+                                    "input": [
+                                        {
+                                            "type": "text",
+                                            "text": event.get("content", "")
+                                        }
+                                    ]
+                                })
+                                request_to_injection[req_id] = injection_id
+                                pending_injections.append(injection_id)
 
-                    elif event.get("type") == "control":
-                        payload = event.get("payload", {})
+                            elif event.get("type") == "control":
+                                payload = event.get("payload", {})
 
-                        if payload.get("type") == "rpc_response":
-                            response_id = payload.get("rpc_id")
-                            result = payload.get("result")
-                            # Preserve local request id counter type; inbox rpc ids can be
-                            # int or string depending on upstream request shape.
-                            send_response(response_id, result)
-                        else:
-                            method = payload.get("method")
-                            params = payload.get("params")
+                                if payload.get("type") == "rpc_response":
+                                    response_id = payload.get("rpc_id")
+                                    result = payload.get("result")
+                                    if response_id in pending_dynamic_tool_requests:
+                                        decision = result.get("decision") if isinstance(result, dict) else None
+                                        approved = decision in (
+                                            "accept",
+                                            "approved",
+                                            "acceptForSession",
+                                            "approved_for_session",
+                                        )
+                                        _handle_dynamic_exec_approval(response_id, approved)
+                                        inbox_offset_bytes = inbox_file.tell()
+                                        continue
+                                    # Preserve local request id counter type; inbox rpc ids can be
+                                    # int or string depending on upstream request shape.
+                                    send_response(response_id, result)
+                                else:
+                                    method = payload.get("method")
+                                    params = payload.get("params")
 
-                            if method:
-                                # Forward control notification directly to Codex app-server
-                                send_notification(method, params)
+                                    if method:
+                                        if method == "exec/approvalResponse" and isinstance(params, dict):
+                                            call_id = params.get("call_id") or params.get("callId")
+                                            if isinstance(call_id, str) and call_id in pending_dynamic_tool_calls:
+                                                request_id = pending_dynamic_tool_calls.get(call_id)
+                                                approved = bool(params.get("approved")) or params.get("decision") in (
+                                                    "accept",
+                                                    "approved",
+                                                    "acceptForSession",
+                                                    "approved_for_session",
+                                                )
+                                                if isinstance(request_id, int):
+                                                    _handle_dynamic_exec_approval(request_id, approved)
+                                                inbox_offset_bytes = inbox_file.tell()
+                                                continue
+                                            if isinstance(call_id, str) and call_id in pending_session_tool_calls:
+                                                approved = bool(params.get("approved")) or params.get("decision") in (
+                                                    "accept",
+                                                    "approved",
+                                                    "acceptForSession",
+                                                    "approved_for_session",
+                                                )
+                                                info = pending_session_tool_calls.get(call_id)
+                                                if isinstance(info, dict):
+                                                    info["approved"] = approved
+                                                    info["decision_received_ts"] = time.time()
+                                                    info["defer_until_ts"] = time.time() + SESSION_TOOL_NATIVE_GRACE_SECONDS
+                                                    info["state"] = "deferred"
+                                                inbox_offset_bytes = inbox_file.tell()
+                                                continue
+                                        # Forward control notification directly to Codex app-server
+                                        send_notification(method, params)
 
-                    elif event.get("type") == "shutdown":
-                        running = False
-                        break
+                            elif event.get("type") == "shutdown":
+                                running = False
+                                inbox_offset_bytes = inbox_file.tell()
+                                break
+                            inbox_offset_bytes = inbox_file.tell()
+                except Exception as e:
+                    write_event(outbox, {
+                        "type": "worker_error",
+                        "error": f"inbox_tail_error: {str(e)}"
+                    })
 
-                inbox_offset += len(new_lines)
-
-            # --- Session file tailing for function-call escalation requests ---
+            # --- Session file tailing for internal function_call artifacts ---
             if session_path and session_path.exists():
                 try:
                     session_lines = session_path.read_text().splitlines()
@@ -359,42 +824,109 @@ def main():
                         except Exception:
                             continue
 
+                        if capture_all_session or session_trace_lines_remaining > 0:
+                            write_event(outbox, {
+                                "type": "session_trace",
+                                "job_id": job_id,
+                                "node_id": node_id,
+                                "injection_id": last_injection_id,
+                                "reason": session_trace_reason or ("full_capture" if capture_all_session else None),
+                                "turn_id": session_trace_turn_id,
+                                "entry": entry,
+                            })
+                            if session_trace_lines_remaining > 0:
+                                session_trace_lines_remaining -= 1
+
                         if entry.get("type") != "response_item":
                             continue
+                        payload = entry.get("payload") if isinstance(entry.get("payload"), dict) else {}
+                        if payload:
+                            session_response_history.append(payload)
 
-                        payload = entry.get("payload", {})
-                        if payload.get("type") != "function_call":
+                        if payload.get("type") == "function_call_output":
+                            _finish_session_tool_call(payload.get("call_id"))
                             continue
 
-                        if payload.get("name") != "exec_command":
+                        if payload.get("type") == "custom_tool_call_output":
+                            _finish_session_tool_call(payload.get("call_id"))
                             continue
 
-                        call_id = payload.get("call_id")
-                        arguments_raw = payload.get("arguments")
-                        if not isinstance(arguments_raw, str):
+                        if msg.get("method") in (
+                            "item/fileChange/requestApproval",
+                            "item/commandExecution/requestApproval",
+                            "applyPatchApproval",
+                            "execCommandApproval",
+                            "codex/event/apply_patch_approval_request",
+                            "codex/event/exec_approval_request",
+                        ):
+                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                            native_call_id = (
+                                params.get("itemId")
+                                or params.get("callId")
+                                or params.get("call_id")
+                            )
+                            if isinstance(native_call_id, str):
+                                _mark_native_session_tool_call(native_call_id)
+
+                        if (
+                            payload.get("type") == "function_call"
+                            and payload.get("name") == "exec_command"
+                            and isinstance(payload.get("call_id"), str)
+                        ):
+                            call_id = payload.get("call_id")
+                            try:
+                                arguments = json.loads(payload.get("arguments") or "{}")
+                            except Exception:
+                                arguments = {}
+                            if (
+                                isinstance(arguments, dict)
+                                and arguments.get("sandbox_permissions") == "require_escalated"
+                                and call_id not in pending_session_tool_calls
+                                and call_id not in pending_dynamic_tool_calls
+                            ):
+                                pending_session_tool_calls[call_id] = {
+                                    "tool_type": "function_call_output",
+                                    "arguments": arguments,
+                                    "injection_id": last_injection_id,
+                                    "state": "pending",
+                                    "native_seen": False,
+                                }
                             continue
 
-                        try:
-                            arguments = json.loads(arguments_raw)
-                        except Exception:
-                            continue
-
-                        if not isinstance(arguments, dict):
-                            continue
-
-                        if arguments.get("sandbox_permissions") != "require_escalated":
-                            continue
-
-                        emit_escalation_request_from_function_call(
-                            call_id,
-                            arguments,
-                            last_injection_id,
-                        )
+                        if (
+                            payload.get("type") == "custom_tool_call"
+                            and payload.get("name") == "apply_patch"
+                            and isinstance(payload.get("call_id"), str)
+                        ):
+                            call_id = payload.get("call_id")
+                            if call_id not in pending_session_tool_calls:
+                                pending_session_tool_calls[call_id] = {
+                                    "tool_type": "custom_tool_call_output",
+                                    "input": payload.get("input") or "",
+                                    "injection_id": last_injection_id,
+                                    "state": "pending",
+                                    "native_seen": False,
+                                }
                 except Exception as e:
                     write_event(outbox, {
                         "type": "worker_error",
                         "error": f"session_tail_error: {str(e)}"
                     })
+
+            for deferred_call_id, info in list(pending_session_tool_calls.items()):
+                if not isinstance(info, dict):
+                    continue
+                if info.get("state") != "deferred":
+                    continue
+                if info.get("native_seen"):
+                    info["state"] = "native"
+                    continue
+                defer_until_ts = info.get("defer_until_ts")
+                if not isinstance(defer_until_ts, (int, float)):
+                    continue
+                if time.time() < float(defer_until_ts):
+                    continue
+                _fulfill_session_tool_call(deferred_call_id, bool(info.get("approved")))
 
             if proc.poll() is not None:
                 running = False
