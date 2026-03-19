@@ -94,6 +94,12 @@ function formatUsd(value: number) {
   })
 }
 
+type ApprovalChangeDetail = {
+  path: string
+  summary: string
+  diff?: string
+}
+
 export default function Home() {
   const swarms = useSwarmStore((s) => s.swarms)
   const setSwarms = useSwarmStore((s) => s.setSwarms)
@@ -493,7 +499,16 @@ export default function Home() {
       })
     })
     if (!res.ok) {
-      throw new Error(`Approval failed (${res.status})`)
+      const payload = await res.json().catch(() => null)
+      // Approval submit is best-effort; backend can return non-2xx while
+      // request is still in flight/racing with ack. Keep UI responsive.
+      console.warn('Approval submit non-OK response', {
+        status: res.status,
+        job_id,
+        call_id,
+        approved,
+        error: payload?.error
+      })
     }
 
     // Force an immediate approval-state refresh after each submit so
@@ -510,6 +525,8 @@ export default function Home() {
     setApprovalSubmitting((prev) => ({ ...prev, [callId]: true }))
     try {
       await action()
+    } catch (err) {
+      console.error('Approval submit failed', { call_id: callId, error: err })
     } finally {
       setTimeout(() => {
         setApprovalSubmitting((prev) => {
@@ -534,10 +551,28 @@ export default function Home() {
     )
   }
 
+  function isCompactPolicyAmendment(amendment: string[] | undefined) {
+    if (!Array.isArray(amendment) || amendment.length === 0) return false
+    if (amendment.length > 8) return false
+    let total = 0
+    for (const part of amendment) {
+      if (typeof part !== 'string') return false
+      if (part.includes('\n') || part.includes('\r')) return false
+      if (part.length > 200) return false
+      total += part.length
+      if (total > 400) return false
+    }
+    return true
+  }
+
   function buildPolicyDecision(
     availableDecisions: Array<string | Record<string, any>> | undefined,
     amendment: string[]
   ) {
+    if (!isCompactPolicyAmendment(amendment)) {
+      return approveToken(availableDecisions)
+    }
+
     const hasAcceptStyle = Array.isArray(availableDecisions) &&
       availableDecisions.some(
         (d) =>
@@ -594,14 +629,46 @@ export default function Home() {
     if (typeof command === 'string') return command
     if (command && typeof command === 'object') {
       const anyCmd = command as Record<string, any>
+      const collectChangeEntries = (value: unknown): Array<Record<string, unknown>> => {
+        const out: Array<Record<string, unknown>> = []
+        const visit = (node: unknown) => {
+          if (!node) return
+          if (Array.isArray(node)) {
+            for (const item of node) visit(item)
+            return
+          }
+          if (typeof node !== 'object') return
+          const rec = node as Record<string, unknown>
+          if (
+            typeof rec.path === 'string' ||
+            typeof rec.file === 'string' ||
+            typeof rec.target === 'string' ||
+            typeof rec.new_path === 'string' ||
+            typeof rec.old_path === 'string' ||
+            typeof rec.from === 'string' ||
+            typeof rec.to === 'string'
+          ) {
+            out.push(rec)
+          }
+          for (const value of Object.values(rec)) {
+            if (value && (Array.isArray(value) || typeof value === 'object')) visit(value)
+          }
+        }
+        visit(value)
+        return out
+      }
       if (anyCmd.type === 'file_changes' || anyCmd.type === 'file_changes_apply') {
         const changes = anyCmd.changes
+        const changeEntries = collectChangeEntries(changes)
+        if (changeEntries.length > 0) return `apply ${changeEntries.length} file change(s)`
         if (Array.isArray(changes)) return `apply ${changes.length} file change(s)`
-        if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+        if (changes && typeof changes === 'object') return 'apply file changes'
         return 'apply file changes'
       }
       const changes = anyCmd.changes
-      if (changes && typeof changes === 'object') return `apply ${Object.keys(changes).length} file change(s)`
+      const changeEntries = collectChangeEntries(changes)
+      if (changeEntries.length > 0) return `apply ${changeEntries.length} file change(s)`
+      if (changes && typeof changes === 'object') return 'apply file changes'
       try {
         return JSON.stringify(command)
       } catch {
@@ -609,6 +676,100 @@ export default function Home() {
       }
     }
     return String(command ?? '')
+  }
+
+  function extractApprovalChangeDetails(command: PendingApproval['command']): ApprovalChangeDetail[] {
+    const details = new Map<string, ApprovalChangeDetail>()
+
+    const inferPath = (rec: Record<string, unknown>) => {
+      const candidates = [
+        rec.path,
+        rec.file,
+        rec.target,
+        rec.new_path,
+        rec.old_path,
+        rec.from,
+        rec.to
+      ]
+      for (const candidate of candidates) {
+        if (typeof candidate === 'string' && candidate.trim()) return candidate.trim()
+      }
+      return ''
+    }
+
+    const inferSummary = (rec: Record<string, unknown>) => {
+      const kind = rec.kind
+      if (kind && typeof kind === 'object') {
+        const kindType = String((kind as Record<string, unknown>).type ?? '').trim()
+        if (kindType) return kindType
+      }
+      for (const key of ['op', 'action', 'type', 'status']) {
+        const value = rec[key]
+        if (typeof value === 'string' && value.trim()) return value.trim()
+      }
+      return 'update'
+    }
+
+    const visit = (node: unknown) => {
+      if (!node) return
+      if (Array.isArray(node)) {
+        for (const item of node) visit(item)
+        return
+      }
+      if (typeof node !== 'object') return
+      const rec = node as Record<string, unknown>
+      const path = inferPath(rec)
+      if (path) {
+        const summary = inferSummary(rec)
+        const diff = typeof rec.diff === 'string' && rec.diff.trim() ? rec.diff.trim() : undefined
+        details.set(path, { path, summary, diff })
+      }
+      for (const value of Object.values(rec)) {
+        if (value && (Array.isArray(value) || typeof value === 'object')) visit(value)
+      }
+    }
+
+    if (command && typeof command === 'object') {
+      visit(command)
+    }
+
+    return Array.from(details.values())
+  }
+
+  function extractApprovalFilePaths(command: PendingApproval['command']) {
+    return extractApprovalChangeDetails(command).map((detail) => detail.path)
+  }
+
+  function renderApprovalChangeSummary(command: PendingApproval['command']) {
+    const changes = extractApprovalChangeDetails(command)
+    if (changes.length === 0) return null
+
+    return (
+      <div className="mt-2 space-y-2">
+        <div className="text-[11px] text-slate-300">
+          Files: {changes.map((change) => change.path).join(', ')}
+        </div>
+        <div className="space-y-2">
+          {changes.map((change) => {
+            const diffLines = change.diff ? change.diff.split(/\r?\n/).slice(0, 8) : []
+            const hasMore = change.diff ? change.diff.split(/\r?\n/).length > diffLines.length : false
+            return (
+              <div key={change.path} className="rounded border border-slate-700 bg-slate-950 p-2">
+                <div className="text-[11px] text-amber-200 break-words">
+                  {change.summary}: {change.path}
+                </div>
+                {diffLines.length > 0 && (
+                  <pre className="mt-1 whitespace-pre-wrap break-words text-[10px] text-slate-300">
+                    {diffLines.join('\n')}
+                    {hasMore ? '\n...' : ''}
+                  </pre>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    )
   }
 
   function renderFallbackApprovals(
@@ -629,6 +790,7 @@ export default function Home() {
             <div className="text-slate-200">
               $ {formatApprovalCommand(approval.command)}
             </div>
+            {renderApprovalChangeSummary(approval.command)}
             <div className="mt-1 text-slate-300">{approval.reason}</div>
             {approval.status && (
               <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
@@ -654,7 +816,8 @@ export default function Home() {
               </button>
               {Array.isArray(approval.proposed_execpolicy_amendment) &&
                 approval.proposed_execpolicy_amendment.length > 0 &&
-                approvalHasPolicyOption(approval.available_decisions) && (
+                approvalHasPolicyOption(approval.available_decisions) &&
+                isCompactPolicyAmendment(approval.proposed_execpolicy_amendment) && (
                   <button
                     disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                     className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"
@@ -1107,6 +1270,7 @@ export default function Home() {
                       <div className="text-slate-200 break-words">
                         $ {formatApprovalCommand(approval.command)}
                       </div>
+                      {renderApprovalChangeSummary(approval.command)}
                       <div className="mt-1 text-slate-300">{approval.reason}</div>
                       {approval.status && (
                         <div className="mt-1 text-[11px] text-amber-200">Status: {approval.status}</div>
@@ -1132,7 +1296,8 @@ export default function Home() {
                         </button>
                         {Array.isArray(approval.proposed_execpolicy_amendment) &&
                           approval.proposed_execpolicy_amendment.length > 0 &&
-                          approvalHasPolicyOption(approval.available_decisions) && (
+                          approvalHasPolicyOption(approval.available_decisions) &&
+                          isCompactPolicyAmendment(approval.proposed_execpolicy_amendment) && (
                             <button
                               disabled={!!approvalSubmitting[approval.call_id] || approvalIsBusy(approval)}
                               className="px-2 py-1 bg-emerald-600 rounded text-xs hover:bg-emerald-500 disabled:opacity-60 disabled:cursor-not-allowed"

@@ -32,7 +32,7 @@ wss.on('connection', (ws: any) => {
     ws.send(
       JSON.stringify({
         type: 'approvals_snapshot',
-        payload: clonePendingApprovalsSnapshot()
+        payload: buildApprovalsSnapshotPayload()
       })
     );
   } catch {
@@ -87,7 +87,10 @@ const pendingProvidersRequests = new Map<
 const pendingApprovalsRequests = new Map<
   string,
   {
-    resolve: (approvals: Record<string, Record<number, ApprovalRecord[]>>) => void;
+    resolve: (snapshot: {
+      approvals_version: number;
+      approvals: Record<string, Record<number, ApprovalRecord[]>>;
+    }) => void;
     reject: (error: Error) => void;
     timer: NodeJS.Timeout;
   }
@@ -104,6 +107,8 @@ type ApprovalStatus =
   | 'timeout';
 type ApprovalRecord = {
   job_id?: string;
+  approval_id?: string;
+  approval_status?: string;
   call_id: string;
   injection_id?: string;
   created_at_ms: number;
@@ -119,6 +124,7 @@ type ApprovalRecord = {
   available_decisions?: any;
 };
 const pendingApprovalsBySwarm = new Map<string, Map<number, ApprovalRecord[]>>();
+let latestApprovalsVersion = 0;
 const waitingOnApprovalByNode = new Map<string, number>();
 const WAITING_APPROVAL_STALE_MS = 45_000;
 const implicitResolvedApprovalByKey = new Map<string, number>();
@@ -194,10 +200,118 @@ const approvalAckWaiters = new Map<
     resolve: (ack: ApprovalAck) => void;
   }
 >();
+type ApprovalLatencyStats = { count: number; total_ms: number; max_ms: number };
+type ApprovalAttemptMeta = {
+  job_id: string;
+  call_id: string;
+  node_id?: number;
+  attempt: number;
+  timeout_ms: number;
+  sent_at_ms: number;
+};
+const approvalAttemptByRequestId = new Map<string, ApprovalAttemptMeta>();
+const approvalMetrics = {
+  submit_total: 0,
+  attempt_total: 0,
+  router_unavailable_total: 0,
+  ack_resolved_total: 0,
+  ack_started_total: 0,
+  ack_rejected_total: 0,
+  ack_timeout_total: 0,
+  response_ok_total: 0,
+  response_pending_total: 0,
+  response_rejected_total: 0
+};
+const approvalLatencyByAckType: Record<ApprovalAckType, ApprovalLatencyStats> = {
+  resolved: { count: 0, total_ms: 0, max_ms: 0 },
+  started: { count: 0, total_ms: 0, max_ms: 0 },
+  rejected: { count: 0, total_ms: 0, max_ms: 0 },
+  timeout: { count: 0, total_ms: 0, max_ms: 0 }
+};
+
+function recordApprovalAckMetrics(
+  requestId: string,
+  ackType: ApprovalAckType,
+  fallback: { job_id: string; call_id: string; node_id?: number; attempt: number; timeout_ms: number }
+) {
+  const meta = approvalAttemptByRequestId.get(requestId);
+  const now = Date.now();
+  const sentAt = Number(meta?.sent_at_ms || now);
+  const latencyMs = Math.max(0, now - sentAt);
+  const bucket = approvalLatencyByAckType[ackType];
+  bucket.count += 1;
+  bucket.total_ms += latencyMs;
+  bucket.max_ms = Math.max(bucket.max_ms, latencyMs);
+
+  if (ackType === 'resolved') approvalMetrics.ack_resolved_total += 1;
+  if (ackType === 'started') approvalMetrics.ack_started_total += 1;
+  if (ackType === 'rejected') approvalMetrics.ack_rejected_total += 1;
+  if (ackType === 'timeout') approvalMetrics.ack_timeout_total += 1;
+
+  logApprovalTrace('ack_metrics', {
+    request_id: requestId,
+    ack_type: ackType,
+    latency_ms: latencyMs,
+    timeout_ms: Number(meta?.timeout_ms ?? fallback.timeout_ms),
+    attempt: Number(meta?.attempt ?? fallback.attempt),
+    job_id: String(meta?.job_id ?? fallback.job_id),
+    call_id: String(meta?.call_id ?? fallback.call_id),
+    node_id: Number.isFinite(Number(meta?.node_id))
+      ? Number(meta?.node_id)
+      : Number.isFinite(Number(fallback.node_id))
+      ? Number(fallback.node_id)
+      : undefined,
+    waiter_count: approvalAckWaiters.size,
+    inflight_count: approvalAttemptByRequestId.size
+  });
+  approvalAttemptByRequestId.delete(requestId);
+}
+
+function approvalMetricsSnapshot() {
+  const latency = Object.fromEntries(
+    (Object.keys(approvalLatencyByAckType) as ApprovalAckType[]).map((key) => {
+      const item = approvalLatencyByAckType[key];
+      return [
+        key,
+        {
+          count: item.count,
+          avg_ms: item.count > 0 ? Math.round(item.total_ms / item.count) : 0,
+          max_ms: item.max_ms
+        }
+      ];
+    })
+  );
+  return {
+    counters: { ...approvalMetrics },
+    ack_waiters: approvalAckWaiters.size,
+    inflight_attempts: approvalAttemptByRequestId.size,
+    latency
+  };
+}
 
 function normalizeNodeId(value: any): number | undefined {
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function compactApprovalLogValue(value: any, depth = 0): any {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    return value.length > 240 ? `${value.slice(0, 240)}…` : value;
+  }
+  if (typeof value !== 'object') return value;
+  if (depth >= 3) return '[truncated]';
+  if (Array.isArray(value)) {
+    const limit = 8;
+    const out = value.slice(0, limit).map((item) => compactApprovalLogValue(item, depth + 1));
+    if (value.length > limit) out.push(`[+${value.length - limit} more]`);
+    return out;
+  }
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = compactApprovalLogValue(v, depth + 1);
+  }
+  return out;
 }
 
 function logApprovalTrace(stage: string, payload: Record<string, any>) {
@@ -207,7 +321,7 @@ function logApprovalTrace(stage: string, payload: Record<string, any>) {
       JSON.stringify({
         stage,
         ts: new Date().toISOString(),
-        ...payload
+        ...compactApprovalLogValue(payload)
       })
     );
   } catch {
@@ -257,6 +371,59 @@ function waitForApprovalAck(
   });
 }
 
+function mapRouterApprovalStatusToUi(status: any): ApprovalStatus | undefined {
+  if (typeof status !== 'string') return undefined;
+  if (status === 'approved_pending_ack' || status === 'denied_pending_ack') {
+    return 'acknowledged';
+  }
+  if (status === 'pending') return 'pending';
+  return undefined;
+}
+
+function approvalCommandChangeCount(command: any): number {
+  if (!command || typeof command !== 'object') return 0;
+  const changes = (command as any).changes;
+  if (Array.isArray(changes)) return changes.length;
+  if (changes && typeof changes === 'object') {
+    const files = Array.isArray((changes as any).files) ? (changes as any).files.length : 0;
+    const list = Array.isArray((changes as any).changes) ? (changes as any).changes.length : 0;
+    return Math.max(files, list, Object.keys(changes).length);
+  }
+  return 0;
+}
+
+function approvalCommandLooksGeneric(command: any): boolean {
+  if (typeof command !== 'string') return false;
+  const normalized = command.trim().toLowerCase();
+  return normalized === 'apply file changes' || normalized === 'review file changes';
+}
+
+function chooseApprovalCommand(previous: any, next: any) {
+  if (next === undefined || next === null) return previous;
+  if (previous === undefined || previous === null) return next;
+
+  const previousChangeCount = approvalCommandChangeCount(previous);
+  const nextChangeCount = approvalCommandChangeCount(next);
+
+  if (nextChangeCount > previousChangeCount) return next;
+  if (previousChangeCount > nextChangeCount) return previous;
+
+  if (previousChangeCount > 0 && nextChangeCount > 0) {
+    const nextDiffLen = JSON.stringify(next).length;
+    const previousDiffLen = JSON.stringify(previous).length;
+    return nextDiffLen >= previousDiffLen ? next : previous;
+  }
+
+  if (approvalCommandLooksGeneric(next) && !approvalCommandLooksGeneric(previous)) {
+    return previous;
+  }
+  if (approvalCommandLooksGeneric(previous) && !approvalCommandLooksGeneric(next)) {
+    return next;
+  }
+
+  return next;
+}
+
 function clonePendingApprovalsSnapshot() {
   const snapshot: Record<string, Record<number, ApprovalRecord[]>> = {};
   for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
@@ -275,7 +442,24 @@ function clonePendingApprovalsSnapshot() {
   return snapshot;
 }
 
-function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
+function buildApprovalsSnapshotPayload() {
+  return {
+    approvals_version: latestApprovalsVersion,
+    approvals: clonePendingApprovalsSnapshot()
+  };
+}
+
+function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any, incomingVersion?: number) {
+  if (Number.isFinite(incomingVersion)) {
+    const normalized = Number(incomingVersion);
+    if (normalized < latestApprovalsVersion) {
+      return;
+    }
+    latestApprovalsVersion = normalized;
+  } else {
+    latestApprovalsVersion += 1;
+  }
+
   const existingByKey = new Map<string, ApprovalRecord>();
   for (const [swarmId, byNode] of pendingApprovalsBySwarm.entries()) {
     for (const [nodeId, approvals] of byNode.entries()) {
@@ -309,10 +493,17 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
         if (!callId) continue;
         if (isImplicitlyResolvedApproval(swarmId, parsedNodeId, callId)) continue;
         const previous = existingByKey.get(`${swarmId}:${parsedNodeId}:${callId}`);
-        const preservedStatus =
-          previous?.status === 'submitted' || previous?.status === 'acknowledged'
-            ? previous.status
-            : 'pending';
+        const routerStatus = mapRouterApprovalStatusToUi(rawApproval?.approval_status);
+        const preservedStatus = (
+          previous?.status === 'submitted' ||
+          previous?.status === 'acknowledged' ||
+          previous?.status === 'started' ||
+          previous?.status === 'resolved' ||
+          previous?.status === 'rejected' ||
+          previous?.status === 'timeout'
+        )
+          ? previous.status
+          : (routerStatus ?? 'pending');
         const createdAtMs =
           typeof rawApproval?.created_at_ms === 'number'
             ? rawApproval.created_at_ms
@@ -324,12 +515,20 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
 
         approvals.push({
           job_id: typeof rawApproval?.job_id === 'string' ? rawApproval.job_id : previous?.job_id,
+          approval_id:
+            typeof rawApproval?.approval_id === 'string'
+              ? rawApproval.approval_id
+              : previous?.approval_id,
+          approval_status:
+            typeof rawApproval?.approval_status === 'string'
+              ? rawApproval.approval_status
+              : previous?.approval_status,
           call_id: callId,
           injection_id:
             typeof rawApproval?.injection_id === 'string'
               ? rawApproval.injection_id
               : previous?.injection_id,
-          command: rawApproval?.command,
+          command: chooseApprovalCommand(previous?.command, rawApproval?.command),
           reason: typeof rawApproval?.reason === 'string' ? rawApproval.reason : '',
           cwd: typeof rawApproval?.cwd === 'string' ? rawApproval.cwd : undefined,
           proposed_execpolicy_amendment: rawApproval?.proposed_execpolicy_amendment,
@@ -405,7 +604,7 @@ function replacePendingApprovalsFromRouterSnapshot(rawSnapshot: any) {
 function broadcastApprovalsSnapshot() {
   hub.broadcast({
     type: 'approvals_snapshot',
-    payload: clonePendingApprovalsSnapshot()
+    payload: buildApprovalsSnapshotPayload()
   });
 }
 
@@ -425,9 +624,21 @@ function upsertPendingApproval(swarmId: string, nodeId: number, approval: any) {
   const existing = byNode.get(nodeId) ?? [];
   const idx = existing.findIndex((a) => a?.call_id === approval.call_id);
   const now = Date.now();
+  const existingStatus = idx >= 0 ? existing[idx]?.status : undefined;
+  const routerStatus = mapRouterApprovalStatusToUi(approval?.approval_status);
+  const nextStatus: ApprovalStatus =
+    existingStatus === 'submitted' ||
+    existingStatus === 'acknowledged' ||
+    existingStatus === 'started' ||
+    existingStatus === 'resolved' ||
+    existingStatus === 'rejected' ||
+    existingStatus === 'timeout'
+      ? existingStatus
+      : (routerStatus ?? 'pending');
   const nextApproval = {
     ...approval,
-    status: 'pending' as ApprovalStatus,
+    command: chooseApprovalCommand(idx >= 0 ? existing[idx]?.command : undefined, approval?.command),
+    status: nextStatus,
     updated_at_ms: now,
     approval_seq: nextApprovalSeq(),
     created_at_ms:
@@ -882,10 +1093,10 @@ function requestProvidersCatalog(timeoutMs = 5000): Promise<any[]> {
 
 function requestApprovalsSnapshot(
   timeoutMs = 2500
-): Promise<Record<string, Record<number, ApprovalRecord[]>>> {
+): Promise<{ approvals_version: number; approvals: Record<string, Record<number, ApprovalRecord[]>> }> {
   return new Promise((resolve, reject) => {
     if (!router.isConnected()) {
-      resolve(clonePendingApprovalsSnapshot());
+      resolve(buildApprovalsSnapshotPayload());
       return;
     }
     let request_id = '';
@@ -928,6 +1139,10 @@ function startApprovalsSyncLoop() {
     void syncOnce();
   }, 1000);
 }
+
+setInterval(() => {
+  logApprovalTrace('metrics_summary', approvalMetricsSnapshot());
+}, 30000);
 
 function fallbackProvidersCatalog(): any[] {
   return [
@@ -1062,6 +1277,8 @@ router.on('event', (msg: any) => {
       }
       upsertPendingApproval(swarmId, nodeId, {
         job_id: jobId,
+        approval_id: typeof data?.approval_id === 'string' ? data.approval_id : undefined,
+        approval_status: typeof data?.approval_status === 'string' ? data.approval_status : undefined,
         call_id: callId,
         injection_id: typeof data?.injection_id === 'string' ? data.injection_id : undefined,
         command: data?.command,
@@ -1274,14 +1491,17 @@ router.on('event', (msg: any) => {
 
   if (event === 'approvals_list') {
     const approvals = data?.approvals ?? {};
-    replacePendingApprovalsFromRouterSnapshot(approvals);
+    const approvalsVersionRaw = data?.approvals_version;
+    const approvalsVersion =
+      Number.isFinite(Number(approvalsVersionRaw)) ? Number(approvalsVersionRaw) : undefined;
+    replacePendingApprovalsFromRouterSnapshot(approvals, approvalsVersion);
     broadcastApprovalsSnapshot();
     const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
     if (requestId && pendingApprovalsRequests.has(requestId)) {
       const pending = pendingApprovalsRequests.get(requestId)!;
       clearTimeout(pending.timer);
       pendingApprovalsRequests.delete(requestId);
-      pending.resolve(clonePendingApprovalsSnapshot());
+      pending.resolve(buildApprovalsSnapshotPayload());
     }
     return;
   }
@@ -1679,7 +1899,11 @@ app.get('/queue', (req, res) => {
 
 app.get('/approvals', (req, res) => {
   // Serve the backend cache; a background router sync loop keeps this current.
-  return res.json(clonePendingApprovalsSnapshot());
+  return res.json(buildApprovalsSnapshotPayload());
+});
+
+app.get('/debug/approval-metrics', (req, res) => {
+  return res.json(approvalMetricsSnapshot());
 });
 
 app.get('/providers', async (req, res) => {
@@ -1712,6 +1936,7 @@ app.get('/providers', async (req, res) => {
 
 app.post('/approval', async (req, res) => {
   const { job_id, call_id, node_id, injection_id, approved, decision } = req.body;
+  approvalMetrics.submit_total += 1;
 
   if (!job_id || !call_id) {
     return res.status(400).json({ error: 'Missing job_id or call_id' });
@@ -1736,8 +1961,6 @@ app.post('/approval', async (req, res) => {
         call_id: String(call_id)
       };
 
-  const timeoutsMs = [1200, 1800, 4000];
-  let lastRequestId = '';
   logApprovalTrace('ui_submit_received', {
     job_id: String(job_id),
     call_id: String(call_id),
@@ -1746,48 +1969,70 @@ app.post('/approval', async (req, res) => {
     approved: normalizedApproved,
     decision: decision ?? null
   });
+  let request_id = '';
+  try {
+    request_id = sendRouterCommand('approve_execution', {
+      job_id,
+      call_id,
+      node_id,
+      injection_id,
+      approved: normalizedApproved,
+      decision
+    });
+  } catch {
+    approvalMetrics.router_unavailable_total += 1;
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
 
-  for (let attempt = 0; attempt < timeoutsMs.length; attempt += 1) {
-    let request_id = '';
-    try {
-      request_id = sendRouterCommand('approve_execution', {
-        job_id,
-        call_id,
-        node_id,
-        injection_id,
-        approved: normalizedApproved,
-        decision
-      });
-    } catch {
-      return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
-    }
-    lastRequestId = request_id;
-    logApprovalTrace('router_approve_execution_sent', {
-      request_id,
-      attempt: attempt + 1,
+  const attempt = 1;
+  // Native approval acks on local and remote workers are expected quickly.
+  // Keep the submit state short so unsupported/uncorrelated approvals do not
+  // linger in the UI for several seconds before timing out.
+  const timeoutMs = 1500;
+  approvalMetrics.attempt_total += 1;
+  approvalMetrics.response_ok_total += 1;
+  approvalAttemptByRequestId.set(request_id, {
+    job_id: String(job_id),
+    call_id: String(call_id),
+    node_id: criteria.node_id,
+    attempt,
+    timeout_ms: timeoutMs,
+    sent_at_ms: Date.now()
+  });
+  logApprovalTrace('router_approve_execution_sent', {
+    request_id,
+    attempt,
+    job_id: String(job_id),
+    call_id: String(call_id),
+    node_id: criteria.node_id,
+    approved: normalizedApproved,
+    decision: decision ?? null
+  });
+  transitionApprovalStatus(
+    {
+      jobId: String(job_id),
+      callId: String(call_id),
+      nodeId: criteria.node_id,
+      requestId: request_id
+    },
+    'submitted',
+    { submit_attempts: attempt, last_request_id: request_id }
+  );
+  broadcastApprovalsSnapshot();
+
+  // Track downstream ack asynchronously to keep approval submit latency low.
+  void (async () => {
+    const ack = await waitForApprovalAck(request_id, criteria, timeoutMs);
+    recordApprovalAckMetrics(request_id, ack.type, {
       job_id: String(job_id),
       call_id: String(call_id),
       node_id: criteria.node_id,
-      approved: normalizedApproved,
-      decision: decision ?? null
+      attempt,
+      timeout_ms: timeoutMs
     });
-    transitionApprovalStatus(
-      {
-        jobId: String(job_id),
-        callId: String(call_id),
-        nodeId: criteria.node_id,
-        requestId: request_id
-      },
-      'submitted',
-      { submit_attempts: attempt + 1, last_request_id: request_id }
-    );
-    broadcastApprovalsSnapshot();
-
-    const timeoutMs = timeoutsMs[attempt] ?? 4000;
-    const ack = await waitForApprovalAck(request_id, criteria, timeoutMs);
     logApprovalTrace('router_approve_execution_ack', {
       request_id,
-      attempt: attempt + 1,
+      attempt,
       ack_type: ack.type,
       ack_reason: ack.reason ?? null,
       ack_request_id: ack.request_id ?? null,
@@ -1795,6 +2040,7 @@ app.post('/approval', async (req, res) => {
       call_id: String(call_id),
       node_id: criteria.node_id
     });
+
     if (ack.type === 'resolved' || ack.type === 'started') {
       transitionApprovalStatus(
         {
@@ -1807,13 +2053,11 @@ app.post('/approval', async (req, res) => {
         { last_request_id: request_id }
       );
       broadcastApprovalsSnapshot();
-      return res.json({
-        request_id,
-        status: ack.type,
-        attempts: attempt + 1
-      });
+      return;
     }
+
     if (ack.type === 'rejected') {
+      approvalMetrics.response_rejected_total += 1;
       transitionApprovalStatus(
         {
           jobId: String(job_id),
@@ -1825,27 +2069,27 @@ app.post('/approval', async (req, res) => {
         { last_request_id: request_id }
       );
       broadcastApprovalsSnapshot();
-      return res.status(409).json({
-        request_id,
-        error: ack.reason || 'Approval rejected'
-      });
+      return;
     }
-  }
 
-  transitionApprovalStatus(
-    {
-      jobId: String(job_id),
-      callId: String(call_id),
-      nodeId: criteria.node_id,
-      requestId: lastRequestId
-    },
-    'timeout',
-    { last_request_id: lastRequestId }
-  );
-  broadcastApprovalsSnapshot();
-  return res.status(504).json({
-    request_id: lastRequestId,
-    error: 'Timed out waiting for approval acknowledgement'
+    approvalMetrics.response_pending_total += 1;
+    transitionApprovalStatus(
+      {
+        jobId: String(job_id),
+        callId: String(call_id),
+        nodeId: criteria.node_id,
+        requestId: request_id
+      },
+      'timeout',
+      { last_request_id: request_id }
+    );
+    broadcastApprovalsSnapshot();
+  })();
+
+  return res.json({
+    request_id,
+    status: 'submitted',
+    attempts: attempt
   });
 });
 
