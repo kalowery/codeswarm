@@ -172,6 +172,199 @@ def _to_appserver_approval_decision(decision, approved_flag):
     return "accept" if bool(approved_flag) else "decline"
 
 
+def _approval_extract_amendment_from_decision(decision, proposed_execpolicy_amendment=None):
+    if not isinstance(decision, dict):
+        if isinstance(proposed_execpolicy_amendment, list):
+            return proposed_execpolicy_amendment
+        return None
+    if isinstance(decision.get("approved_execpolicy_amendment"), dict):
+        inner = decision["approved_execpolicy_amendment"]
+        if isinstance(inner.get("proposed_execpolicy_amendment"), list):
+            return inner["proposed_execpolicy_amendment"]
+    if isinstance(decision.get("acceptWithExecpolicyAmendment"), dict):
+        inner = decision["acceptWithExecpolicyAmendment"]
+        if isinstance(inner.get("execpolicy_amendment"), list):
+            return inner["execpolicy_amendment"]
+    if isinstance(proposed_execpolicy_amendment, list):
+        return proposed_execpolicy_amendment
+    return None
+
+
+def _approval_available_flags(available):
+    flags = {
+        "accept": False,
+        "cancel": False,
+        "approved": False,
+        "approved_for_session": False,
+        "denied": False,
+        "abort": False,
+        "accept_with_amendment": False,
+        "approved_with_amendment": False,
+    }
+    for entry in (available or []):
+        if isinstance(entry, str):
+            if entry in flags:
+                flags[entry] = True
+        elif isinstance(entry, dict):
+            if "acceptWithExecpolicyAmendment" in entry:
+                flags["accept_with_amendment"] = True
+            if "approved_execpolicy_amendment" in entry:
+                flags["approved_with_amendment"] = True
+    return flags
+
+
+def _normalize_decision_for_available(
+    decision,
+    approved_flag,
+    available,
+    prefer_native_dialect=False,
+    proposed_execpolicy_amendment=None,
+):
+    flags = _approval_available_flags(available)
+    amendment = _approval_extract_amendment_from_decision(
+        decision,
+        proposed_execpolicy_amendment,
+    )
+
+    def _approved_plain():
+        if prefer_native_dialect:
+            if flags["approved"]:
+                return "approved"
+            if flags["approved_for_session"]:
+                return "approved_for_session"
+            return "approved" if approved_flag else "abort"
+        if flags["accept"]:
+            return "accept"
+        if flags["approved"]:
+            return "approved"
+        return "accept" if approved_flag else "cancel"
+
+    def _denied_plain():
+        if prefer_native_dialect:
+            if flags["denied"]:
+                return "denied"
+            if flags["abort"]:
+                return "abort"
+            return "abort" if not approved_flag else "approved"
+        if flags["cancel"]:
+            return "cancel"
+        if flags["abort"]:
+            return "abort"
+        return "cancel" if not approved_flag else "accept"
+
+    if approved_flag:
+        if isinstance(decision, str):
+            if prefer_native_dialect:
+                if decision == "accept":
+                    decision = "approved"
+                elif decision == "cancel":
+                    decision = "abort"
+                elif decision == "acceptForSession":
+                    decision = "approved_for_session"
+            if decision in ("accept", "approved", "approved_for_session") and flags.get(decision, False):
+                return decision
+            if decision == "cancel" and flags["cancel"]:
+                return "cancel"
+            if decision == "denied" and flags["denied"]:
+                return "denied"
+            if decision == "abort" and flags["abort"]:
+                return "abort"
+
+        if (
+            prefer_native_dialect
+            and isinstance(decision, dict)
+            and isinstance(decision.get("acceptWithExecpolicyAmendment"), dict)
+        ):
+            native_amendment = decision["acceptWithExecpolicyAmendment"].get("execpolicy_amendment")
+            if isinstance(native_amendment, list):
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": native_amendment
+                    }
+                }
+
+        if amendment:
+            if prefer_native_dialect and flags["approved_with_amendment"]:
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": amendment
+                    }
+                }
+            if flags["accept_with_amendment"]:
+                return {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }
+            if flags["approved_with_amendment"]:
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": amendment
+                    }
+                }
+        return _approved_plain()
+
+    if isinstance(decision, str):
+        if prefer_native_dialect:
+            if decision == "accept":
+                decision = "approved"
+            elif decision == "cancel":
+                decision = "abort"
+            elif decision == "decline":
+                decision = "denied"
+        if decision in ("cancel", "abort", "denied") and flags.get(decision, False):
+            return decision
+        if decision == "accept" and flags["accept"]:
+            return "accept"
+        if decision == "approved" and flags["approved"]:
+            return "approved"
+    return _denied_plain()
+
+
+def _coerce_to_advertised_decision(candidate, available, approved_flag, prefer_native_dialect=False):
+    def _decision_token(value):
+        if isinstance(value, str):
+            return ("s", value)
+        if isinstance(value, dict):
+            try:
+                return ("j", json.dumps(value, sort_keys=True))
+            except Exception:
+                return ("o", str(value))
+        return ("x", str(value))
+
+    advertised = list(available or [])
+    if not advertised:
+        return candidate
+
+    advertised_keys = {_decision_token(entry) for entry in advertised}
+    if _decision_token(candidate) in advertised_keys:
+        return candidate
+
+    if bool(approved_flag):
+        preferred = (
+            ("approved", "approved_for_session", "accept", "acceptForSession")
+            if prefer_native_dialect
+            else ("accept", "approved", "acceptForSession")
+        )
+    else:
+        preferred = (
+            ("denied", "abort", "cancel", "decline")
+            if prefer_native_dialect
+            else ("cancel", "decline", "abort")
+        )
+
+    for token in preferred:
+        if token in advertised:
+            return token
+
+    if bool(approved_flag):
+        for entry in advertised:
+            if isinstance(entry, dict):
+                return entry
+
+    return advertised[0]
+
+
 def _approval_lookup(job_id, call_id, node_id=None, injection_id=None):
     norm_job_id = str(job_id)
     norm_call_id = str(call_id)
@@ -2347,84 +2540,98 @@ def translate_event(event):
                 pending_decision
                 and existing_status in ("approved_pending_ack", "denied_pending_ack")
             ):
-                approval_provider = _provider_for_swarm(swarm_id)
-                if approval_provider is None:
-                    approval_provider = ACTIVE_PROVIDER
-                approved_flag = bool(pending_decision.get("approved"))
-                raw_decision = pending_decision.get("decision")
-                rpc_decision = _normalize_decision_for_available(
-                    raw_decision,
-                    approved_flag,
-                    merged_available,
-                    native_approval_method or has_native_approval,
-                )
-                rpc_decision = _coerce_to_advertised_decision(
-                    rpc_decision,
-                    merged_available,
-                    approved_flag,
-                    native_approval_method or has_native_approval,
-                )
-                notify_decision = rpc_decision
-                notify_params = {
-                    "call_id": call_id,
-                    "callId": call_id,
-                    "approved": approved_flag,
-                    "decision": notify_decision,
-                    **(notify_decision if isinstance(notify_decision, dict) else {}),
-                }
-                if event_turn_id:
-                    notify_params["id"] = event_turn_id
-                    notify_params["turn_id"] = event_turn_id
-                    notify_params["turnId"] = event_turn_id
-                compat_notify_payload = {
-                    "method": "exec/approvalResponse",
-                    "params": notify_params,
-                }
-                primary_control_payload = (
-                    {
-                        "type": "rpc_response",
-                        "rpc_id": merged_rpc_id,
-                        "result": {
-                            "decision": rpc_decision,
-                        },
-                    }
-                    if merged_rpc_id is not None
-                    else compat_notify_payload
-                )
-                compat_rpc_payload = None
-                if approval_provider is not None:
-                    _send_approval_decision(
-                        approval_provider,
-                        job_id,
-                        node_id,
-                        primary_control_payload,
-                        compat_rpc_payload,
-                        compat_notify_payload,
+                try:
+                    approval_provider = _provider_for_swarm(swarm_id)
+                    if approval_provider is None:
+                        approval_provider = ACTIVE_PROVIDER
+                    approved_flag = bool(pending_decision.get("approved"))
+                    raw_decision = pending_decision.get("decision")
+                    rpc_decision = _normalize_decision_for_available(
+                        raw_decision,
+                        approved_flag,
+                        merged_available,
+                        native_approval_method or has_native_approval,
+                        proposed_execpolicy_amendment,
                     )
+                    rpc_decision = _coerce_to_advertised_decision(
+                        rpc_decision,
+                        merged_available,
+                        approved_flag,
+                        native_approval_method or has_native_approval,
+                    )
+                    notify_decision = rpc_decision
+                    notify_params = {
+                        "call_id": call_id,
+                        "callId": call_id,
+                        "approved": approved_flag,
+                        "decision": notify_decision,
+                        **(notify_decision if isinstance(notify_decision, dict) else {}),
+                    }
+                    if event_turn_id:
+                        notify_params["id"] = event_turn_id
+                        notify_params["turn_id"] = event_turn_id
+                        notify_params["turnId"] = event_turn_id
+                    compat_notify_payload = {
+                        "method": "exec/approvalResponse",
+                        "params": notify_params,
+                    }
+                    primary_control_payload = (
+                        {
+                            "type": "rpc_response",
+                            "rpc_id": merged_rpc_id,
+                            "result": {
+                                "decision": rpc_decision,
+                            },
+                        }
+                        if merged_rpc_id is not None
+                        else compat_notify_payload
+                    )
+                    compat_rpc_payload = None
+                    if approval_provider is not None:
+                        target_node_id = existing.get("node_id", node_id)
+                        _send_approval_decision(
+                            approval_provider,
+                            job_id,
+                            target_node_id,
+                            primary_control_payload,
+                            compat_rpc_payload,
+                            compat_notify_payload,
+                        )
+                        approval_trace(
+                            "required_autoreplay_sent",
+                            job_id=str(job_id),
+                            swarm_id=str(swarm_id),
+                            node_id=_normalize_node_id(target_node_id),
+                            call_id=str(call_id),
+                            approval_id=approval_id,
+                            rpc_id=merged_rpc_id,
+                            fallback_notify=True,
+                            native_request=bool(rpc_id is not None),
+                        )
+                        pending_decision["control_payload"] = primary_control_payload
+                        pending_decision["compat_rpc_payload"] = compat_rpc_payload
+                        pending_decision["compat_notify_payload"] = compat_notify_payload
+                        pending_decision["job_id"] = str(job_id)
+                        pending_decision["node_id"] = target_node_id
+                        pending_decision["send_attempts"] = int(pending_decision.get("send_attempts", 0) or 0) + 1
+                        pending_decision["last_sent_ts"] = time.time()
+                        PENDING_APPROVAL_DECISIONS[key] = pending_decision
+                        PENDING_APPROVALS[key]["approval_status"] = (
+                            "approved_pending_ack" if approved_flag else "denied_pending_ack"
+                        )
+                        PENDING_APPROVALS[key]["updated_at_ts"] = time.time()
+                        _bump_approvals_version()
+                except Exception as e:
                     approval_trace(
-                        "required_autoreplay_sent",
+                        "required_autoreplay_error",
                         job_id=str(job_id),
                         swarm_id=str(swarm_id),
                         node_id=_normalize_node_id(node_id),
                         call_id=str(call_id),
                         approval_id=approval_id,
                         rpc_id=merged_rpc_id,
-                        fallback_notify=True,
-                        native_request=bool(rpc_id is not None),
+                        error=str(e),
                     )
-                    pending_decision["control_payload"] = primary_control_payload
-                    pending_decision["compat_rpc_payload"] = compat_rpc_payload
-                    pending_decision["compat_notify_payload"] = compat_notify_payload
-                    pending_decision["job_id"] = str(job_id)
-                    pending_decision["node_id"] = int(node_id)
-                    pending_decision["send_attempts"] = int(pending_decision.get("send_attempts", 0) or 0) + 1
-                    pending_decision["last_sent_ts"] = time.time()
-                    PENDING_APPROVAL_DECISIONS[key] = pending_decision
-                    PENDING_APPROVALS[key]["approval_status"] = (
-                        "approved_pending_ack" if approved_flag else "denied_pending_ack"
-                    )
-                    PENDING_APPROVALS[key]["updated_at_ts"] = time.time()
-                    _bump_approvals_version()
 
         return (
             "exec_approval_required",
