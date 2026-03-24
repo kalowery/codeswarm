@@ -1237,6 +1237,78 @@ async function runWebStack(opts: any) {
     });
   }
 
+  async function probeRouterHealth(
+    host: string,
+    port: number,
+    timeoutMs = 1500
+  ): Promise<boolean> {
+    return await new Promise<boolean>((resolve) => {
+      const socket = new net.Socket();
+      const requestId = `health-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      let settled = false;
+      let buffer = "";
+
+      const finish = (result: boolean) => {
+        if (settled) return;
+        settled = true;
+        try {
+          socket.destroy();
+        } catch {}
+        resolve(result);
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once("connect", () => {
+        const envelope = {
+          protocol: "codeswarm.router.v1",
+          type: "command",
+          command: "providers_list",
+          request_id: requestId,
+          payload: {},
+        };
+        socket.write(JSON.stringify(envelope) + "\n");
+      });
+      socket.on("data", (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+            if (
+              msg?.type === "event" &&
+              msg?.event === "providers_list" &&
+              msg?.data?.request_id === requestId
+            ) {
+              finish(true);
+              return;
+            }
+          } catch {}
+        }
+      });
+      socket.once("timeout", () => finish(false));
+      socket.once("error", () => finish(false));
+      socket.once("close", () => finish(false));
+      socket.connect(port, host);
+    });
+  }
+
+  async function waitForRouterHealthy(
+    host: string,
+    port: number,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (await probeRouterHealth(host, port, 1200)) {
+        return true;
+      }
+      await sleep(300);
+    }
+    return false;
+  }
+
   async function checkHttpReady(url: string, timeoutMs: number): Promise<boolean> {
     try {
       const controller = new AbortController();
@@ -1295,15 +1367,48 @@ async function runWebStack(opts: any) {
   const routerPort = 8765;
   const routerAlreadyListening = await isTcpPortListening(routerHost, routerPort);
   if (routerAlreadyListening) {
-    console.log(
-      `[web] Router already listening on ${routerHost}:${routerPort}; reusing existing process.`
-    );
+    const healthy = await probeRouterHealth(routerHost, routerPort, 1500);
+    if (healthy) {
+      console.log(
+        `[web] Router already listening on ${routerHost}:${routerPort}; reusing existing process.`
+      );
+    } else {
+      console.warn(
+        `[web] Existing router on ${routerHost}:${routerPort} failed health probe; attempting restart.`
+      );
+      await stopRouterProcess({ config: configPath });
+      const restartDeadline = Date.now() + 5000;
+      while (Date.now() < restartDeadline) {
+        if (!(await isTcpPortListening(routerHost, routerPort, 300))) {
+          break;
+        }
+        await sleep(250);
+      }
+      if (await isTcpPortListening(routerHost, routerPort, 300)) {
+        throw new Error(
+          `Router port ${routerHost}:${routerPort} is occupied by an unhealthy process.`
+        );
+      }
+      spawnWithPrefix(
+        "router",
+        pythonCmd,
+        ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
+        repoRoot
+      );
+    }
   } else {
     spawnWithPrefix(
       "router",
       pythonCmd,
       ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
       repoRoot
+    );
+  }
+
+  const routerHealthy = await waitForRouterHealthy(routerHost, routerPort, 15000);
+  if (!routerHealthy) {
+    throw new Error(
+      `Router on ${routerHost}:${routerPort} did not become healthy within 15s.`
     );
   }
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import sys
 import time
 from pathlib import Path
@@ -11,7 +12,54 @@ def main():
 
     outbox_dir = Path(sys.argv[1])
     archive_dir = outbox_dir.parent / "archive"
+    offsets_path = outbox_dir.parent / ".outbox_follower_offsets.json"
     offsets = {}
+
+    def load_offsets():
+        if not offsets_path.exists():
+            return {}
+        try:
+            data = json.loads(offsets_path.read_text())
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        normalized = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not isinstance(value, dict):
+                continue
+            try:
+                normalized[key] = {
+                    "offset": int(value.get("offset", 0)),
+                    "inode": value.get("inode"),
+                }
+            except Exception:
+                continue
+        return normalized
+
+    def save_offsets():
+        tmp = offsets_path.with_suffix(offsets_path.suffix + ".tmp")
+        serializable = {
+            path.name: {
+                "offset": int(meta.get("offset", 0)),
+                "inode": meta.get("inode"),
+            }
+            for path, meta in offsets.items()
+        }
+        try:
+            tmp.write_text(json.dumps(serializable))
+            tmp.replace(offsets_path)
+        except Exception:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    offsets = {
+        outbox_dir / name: meta
+        for name, meta in load_offsets().items()
+    }
 
     def drain_path(path: Path, start_offset: int) -> int:
         """Stream unread bytes from a JSONL file and return the new offset."""
@@ -48,6 +96,7 @@ def main():
                             # Best effort: if archive disappears concurrently, drop offset.
                             pass
                     del offsets[tracked]
+                    save_offsets()
 
             for path in files:
                 stat = path.stat()
@@ -68,6 +117,7 @@ def main():
                     tracked["inode"] = inode
 
                 tracked["offset"] = drain_path(path, int(tracked.get("offset", 0)))
+                save_offsets()
 
             time.sleep(0.1)
 

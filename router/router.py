@@ -7,6 +7,7 @@ import shlex
 import os
 import select
 import copy
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 import threading
@@ -43,6 +44,7 @@ NODE_THREAD_ACTIVE = defaultdict(bool)
 FINAL_ANSWER_SEEN = set()
 INTER_SWARM_QUEUE = defaultdict(deque)
 SCHEDULER_LOCK = threading.Lock()
+STATE_SAVE_LOCK = threading.Lock()
 TERMINATION_IN_PROGRESS = set()
 FORCE_TERMINATION_REQUESTED = set()
 
@@ -237,7 +239,105 @@ def _normalize_decision_for_available(
             return "accept"
         if flags["approved"]:
             return "approved"
-    return "accept" if approved_flag else "cancel"
+        return "accept" if approved_flag else "cancel"
+
+    def _denied_plain():
+        if prefer_native_dialect:
+            if flags["denied"]:
+                return "denied"
+            if flags["abort"]:
+                return "abort"
+            return "abort" if not approved_flag else "approved"
+        if flags["cancel"]:
+            return "cancel"
+        if flags["abort"]:
+            return "abort"
+        return "cancel" if not approved_flag else "accept"
+
+    if approved_flag:
+        if isinstance(decision, str):
+            if prefer_native_dialect:
+                if decision == "accept":
+                    decision = "approved"
+                elif decision == "cancel":
+                    decision = "abort"
+                elif decision == "acceptForSession":
+                    decision = "approved_for_session"
+            if decision in ("accept", "approved", "approved_for_session") and flags.get(decision, False):
+                return decision
+            if decision == "cancel" and flags["cancel"]:
+                return "cancel"
+            if decision == "denied" and flags["denied"]:
+                return "denied"
+            if decision == "abort" and flags["abort"]:
+                return "abort"
+
+        if (
+            prefer_native_dialect
+            and isinstance(decision, dict)
+            and isinstance(decision.get("acceptWithExecpolicyAmendment"), dict)
+        ):
+            native_amendment = decision["acceptWithExecpolicyAmendment"].get("execpolicy_amendment")
+            if isinstance(native_amendment, list):
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": native_amendment
+                    }
+                }
+
+        if amendment:
+            if prefer_native_dialect and flags["approved_with_amendment"]:
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": amendment
+                    }
+                }
+            if flags["accept_with_amendment"]:
+                return {
+                    "acceptWithExecpolicyAmendment": {
+                        "execpolicy_amendment": amendment
+                    }
+                }
+            if flags["approved_with_amendment"]:
+                return {
+                    "approved_execpolicy_amendment": {
+                        "proposed_execpolicy_amendment": amendment
+                    }
+                }
+        return _approved_plain()
+
+    if isinstance(decision, str):
+        if prefer_native_dialect:
+            if decision == "accept":
+                decision = "approved"
+            elif decision == "cancel":
+                decision = "abort"
+            elif decision == "decline":
+                decision = "denied"
+        if decision in ("cancel", "abort", "denied") and flags.get(decision, False):
+            return decision
+        if decision == "accept" and flags["accept"]:
+            return "accept"
+        if decision == "approved" and flags["approved"]:
+            return "approved"
+    return _denied_plain()
+
+
+def _approval_prefers_native_dialect(approval_method, has_native_approval=False):
+    method = str(approval_method or "")
+    if method in (
+        "codex/event/exec_approval_request",
+        "codex/event/apply_patch_approval_request",
+        "execCommandApproval",
+        "applyPatchApproval",
+    ):
+        return True
+    if method in (
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+    ):
+        return False
+    return bool(has_native_approval)
 
 
 def _choose_richer_approval_command(previous, new):
@@ -553,6 +653,7 @@ def _send_duplicate_approval_replay(
     decision,
     approval_method=None,
     has_native_approval=False,
+    available_decisions=None,
     turn_id=None,
 ):
     # Replay resolved approvals using the exact stored decision token/object.
@@ -560,6 +661,25 @@ def _send_duplicate_approval_replay(
         replay_decision = decision
         if replay_decision is None:
             replay_decision = "approved" if bool(approved) else "abort"
+
+        prefer_native_dialect = _approval_prefers_native_dialect(
+            approval_method,
+            has_native_approval,
+        )
+        route_available_decisions = list(available_decisions or [])
+        if route_available_decisions:
+            replay_decision = _normalize_decision_for_available(
+                replay_decision,
+                bool(approved),
+                route_available_decisions,
+                prefer_native_dialect,
+            )
+            replay_decision = _coerce_to_advertised_decision(
+                replay_decision,
+                route_available_decisions,
+                bool(approved),
+                prefer_native_dialect,
+            )
 
         sent_rpc = False
         if rpc_id is not None:
@@ -862,35 +982,51 @@ def _retry_unacked_approvals():
 
 def save_state():
     try:
-        # Snapshot mutable in-memory structures while holding the scheduler lock
-        # so serialization cannot race with concurrent updates.
-        with SCHEDULER_LOCK:
-            swarms_snapshot = copy.deepcopy(SWARMS)
-            queue_snapshot = []
-            for target_swarm_id, q in INTER_SWARM_QUEUE.items():
-                for item in q:
-                    queue_snapshot.append({
-                        "queue_id": item.get("queue_id"),
-                        "request_id": item.get("request_id"),
-                        "source_swarm_id": item.get("source_swarm_id"),
-                        "target_swarm_id": str(target_swarm_id),
-                        "selector": item.get("selector"),
-                        "nodes": item.get("nodes"),
-                        "content": item.get("content"),
-                        "created_at": item.get("created_at"),
-                    })
+        # Serialize save operations so concurrent callers cannot race on the
+        # temporary file/rename path.
+        with STATE_SAVE_LOCK:
+            # Snapshot mutable in-memory structures while holding the scheduler lock
+            # so serialization cannot race with concurrent updates.
+            with SCHEDULER_LOCK:
+                swarms_snapshot = copy.deepcopy(SWARMS)
+                queue_snapshot = []
+                for target_swarm_id, q in INTER_SWARM_QUEUE.items():
+                    for item in q:
+                        queue_snapshot.append({
+                            "queue_id": item.get("queue_id"),
+                            "request_id": item.get("request_id"),
+                            "source_swarm_id": item.get("source_swarm_id"),
+                            "target_swarm_id": str(target_swarm_id),
+                            "selector": item.get("selector"),
+                            "nodes": item.get("nodes"),
+                            "content": item.get("content"),
+                            "created_at": item.get("created_at"),
+                        })
 
-        data = {
-            "swarms": swarms_snapshot,
-            "inter_swarm_queue": queue_snapshot,
-        }
+            data = {
+                "swarms": swarms_snapshot,
+                "inter_swarm_queue": queue_snapshot,
+            }
 
-        tmp_path = STATE_FILE.with_name(f"{STATE_FILE.name}.tmp")
-        with open(tmp_path, "w") as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, STATE_FILE)
+            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{STATE_FILE.name}.",
+                suffix=".tmp",
+                dir=str(STATE_FILE.parent),
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, STATE_FILE)
+            finally:
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
     except Exception as e:
         print(f"[router ERROR] failed to save state to {STATE_FILE}: {e}", file=sys.stderr, flush=True)
 
@@ -2411,6 +2547,7 @@ def translate_event(event):
                             recent.get("decision"),
                             approval_method=method if method else existing.get("approval_method"),
                             has_native_approval=bool(existing.get("has_native_approval")),
+                            available_decisions=available_decisions,
                             turn_id=event_turn_id if event_turn_id else existing.get("turn_id"),
                         )
                     approval_trace(
@@ -2655,18 +2792,27 @@ def translate_event(event):
                         approval_provider = ACTIVE_PROVIDER
                     approved_flag = bool(pending_decision.get("approved"))
                     raw_decision = pending_decision.get("decision")
+                    prefer_native_dialect = _approval_prefers_native_dialect(
+                        method,
+                        has_native_approval,
+                    )
+                    route_available_decisions = (
+                        merged_native_available
+                        if prefer_native_dialect
+                        else merged_item_available
+                    ) or merged_available
                     rpc_decision = _normalize_decision_for_available(
                         raw_decision,
                         approved_flag,
-                        merged_available,
-                        native_approval_method or has_native_approval,
+                        route_available_decisions,
+                        prefer_native_dialect,
                         proposed_execpolicy_amendment,
                     )
                     rpc_decision = _coerce_to_advertised_decision(
                         rpc_decision,
-                        merged_available,
+                        route_available_decisions,
                         approved_flag,
-                        native_approval_method or has_native_approval,
+                        prefer_native_dialect,
                     )
                     notify_decision = rpc_decision
                     notify_params = {
@@ -3715,7 +3861,10 @@ def run_daemon(config, providers):
                         "execCommandApproval",
                         "applyPatchApproval",
                     )
-                    prefer_native_dialect = native_approval_method or has_native_approval
+                    prefer_native_dialect = _approval_prefers_native_dialect(
+                        approval_method,
+                        has_native_approval,
+                    )
                     # item/* approvals are still JSON-RPC requests when they carry
                     # a top-level id. A companion native codex/event/* approval, if
                     # present, only affects decision dialect selection, not whether

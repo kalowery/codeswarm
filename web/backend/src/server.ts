@@ -2072,18 +2072,19 @@ app.post('/approval', async (req, res) => {
       return;
     }
 
+    // A short local ack timeout only means we did not observe an explicit
+    // downstream ack quickly. Router remains authoritative for approval
+    // lifecycle, so do not hide the approval from the UI here. Keep the last
+    // submitted/acknowledged state visible until router resolves or removes it.
     approvalMetrics.response_pending_total += 1;
-    transitionApprovalStatus(
-      {
-        jobId: String(job_id),
-        callId: String(call_id),
-        nodeId: criteria.node_id,
-        requestId: request_id
-      },
-      'timeout',
-      { last_request_id: request_id }
-    );
-    broadcastApprovalsSnapshot();
+    logApprovalTrace('router_approve_execution_ack_deferred', {
+      request_id,
+      attempt,
+      job_id: String(job_id),
+      call_id: String(call_id),
+      node_id: criteria.node_id,
+      note: 'keeping approval visible pending router resolution'
+    });
   })();
 
   return res.json({

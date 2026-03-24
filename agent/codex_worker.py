@@ -11,6 +11,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 
+CODEX_ROLLOUT_CHANNEL_CLOSED_MARKER = "failed to record rollout items: failed to queue rollout items: channel closed"
+CODEX_MAX_RESTARTS = 5
+CODEX_RESTART_BACKOFF_SECONDS = 1.0
+
+
 def write_event(f, obj):
     f.write(json.dumps(obj) + "\n")
     f.flush()
@@ -75,31 +80,36 @@ def main():
     codex_home = str(Path.home() / ".codex")
     workspace_dir = os.getcwd()
 
-    proc = subprocess.Popen(
-        [
-            str(codex_bin),
-            "--cd", workspace_dir,
-            "--sandbox", sandbox_mode,
-            "--ask-for-approval", approval_policy,
-            "--add-dir", codex_home,
-            "--add-dir", workspace_dir,
-            "app-server",
-            "--listen", "stdio://"
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1
-    )
+    def launch_codex_proc():
+        return subprocess.Popen(
+            [
+                str(codex_bin),
+                "--cd", workspace_dir,
+                "--sandbox", sandbox_mode,
+                "--ask-for-approval", approval_policy,
+                "--add-dir", codex_home,
+                "--add-dir", workspace_dir,
+                "app-server",
+                "--listen", "stdio://"
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+
+    proc = launch_codex_proc()
 
     rpc_id = 0
     thread_id = None
+    current_active_turn_id = None
     session_path = None
     shutdown_requested = False
     last_injection_id = None
     turn_to_injection = {}
     request_to_injection = {}
+    pending_user_requests = {}
     pending_injections = deque()
     session_offset = 0
     pending_dynamic_tool_requests = {}
@@ -110,6 +120,9 @@ def main():
     session_trace_reason = None
     session_trace_turn_id = None
     SESSION_TOOL_NATIVE_GRACE_SECONDS = 1.0
+    restart_count = 0
+    last_restart_ts = 0.0
+    rehydrate_history_on_thread_start = None
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -119,7 +132,7 @@ def main():
     signal.signal(signal.SIGINT, handle_shutdown)
 
     def send_request(method, params=None):
-        nonlocal rpc_id
+        nonlocal rpc_id, proc
         request_id = rpc_id
         msg = jsonrpc_request(request_id, method, params)
         proc.stdin.write(msg + "\n")
@@ -127,12 +140,52 @@ def main():
         rpc_id += 1
         return request_id
 
+    def _send_user_turn_start(injection_id, content):
+        req_id = send_request("turn/start", {
+            "threadId": thread_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": content,
+                }
+            ],
+        })
+        request_to_injection[req_id] = injection_id
+        pending_injections.append(injection_id)
+        pending_user_requests[req_id] = {
+            "kind": "turn_start",
+            "injection_id": injection_id,
+            "content": content,
+        }
+        return req_id
+
+    def _send_user_turn_steer(injection_id, content):
+        req_id = send_request("turn/steer", {
+            "threadId": thread_id,
+            "expectedTurnId": current_active_turn_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": content,
+                }
+            ],
+        })
+        pending_user_requests[req_id] = {
+            "kind": "turn_steer",
+            "injection_id": injection_id,
+            "content": content,
+            "expected_turn_id": current_active_turn_id,
+        }
+        return req_id
+
     def send_notification(method, params=None):
+        nonlocal proc
         msg = jsonrpc_notification(method, params)
         proc.stdin.write(msg + "\n")
         proc.stdin.flush()
 
     def send_response(id_, result=None):
+        nonlocal proc
         msg = {
             "jsonrpc": "2.0",
             "id": id_
@@ -434,6 +487,118 @@ def main():
         if isinstance(call_id, str):
             pending_dynamic_tool_calls.pop(call_id, None)
 
+    def _extract_approval_call_id_from_rpc(msg):
+        if not isinstance(msg, dict):
+            return None
+        method = msg.get("method")
+        if method not in (
+            "item/fileChange/requestApproval",
+            "item/commandExecution/requestApproval",
+            "applyPatchApproval",
+            "execCommandApproval",
+            "codex/event/apply_patch_approval_request",
+            "codex/event/exec_approval_request",
+        ):
+            return None
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        if not isinstance(params, dict):
+            return None
+        native_call_id = (
+            params.get("itemId")
+            or params.get("callId")
+            or params.get("call_id")
+        )
+        return native_call_id if isinstance(native_call_id, str) else None
+
+    def restart_codex(reason, outbox):
+        nonlocal proc, rpc_id, thread_id, current_active_turn_id, session_path, session_offset
+        nonlocal request_to_injection, turn_to_injection, pending_injections, pending_user_requests
+        nonlocal pending_dynamic_tool_requests, pending_dynamic_tool_calls
+        nonlocal pending_session_tool_calls, initialized_sent
+        nonlocal restart_count, last_restart_ts, rehydrate_history_on_thread_start
+        nonlocal session_trace_lines_remaining, session_trace_reason, session_trace_turn_id
+
+        if shutdown_requested:
+            return False
+        now = time.time()
+        if restart_count >= CODEX_MAX_RESTARTS:
+            write_event(outbox, {
+                "type": "worker_error",
+                "job_id": job_id,
+                "node_id": node_id,
+                "injection_id": last_injection_id,
+                "error": f"codex_restart_limit_exceeded: {reason}",
+            })
+            return False
+        if now - last_restart_ts < CODEX_RESTART_BACKOFF_SECONDS:
+            time.sleep(CODEX_RESTART_BACKOFF_SECONDS - (now - last_restart_ts))
+
+        restart_count += 1
+        last_restart_ts = time.time()
+        rehydrate_history_on_thread_start = list(session_response_history)
+        write_event(outbox, {
+            "type": "worker_trace",
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": last_injection_id,
+            "event": "codex_restart_requested",
+            "reason": reason,
+            "restart_count": restart_count,
+            "rehydrate_items": len(rehydrate_history_on_thread_start),
+        })
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                    proc.wait(timeout=2)
+        except Exception:
+            pass
+
+        proc = launch_codex_proc()
+        rpc_id = 0
+        thread_id = None
+        session_path = None
+        session_offset = 0
+        request_to_injection = {}
+        pending_user_requests = {}
+        turn_to_injection = {}
+        pending_injections = deque()
+        current_active_turn_id = None
+        pending_dynamic_tool_requests = {}
+        pending_dynamic_tool_calls = {}
+        pending_session_tool_calls = {}
+        initialized_sent = False
+        session_trace_lines_remaining = 0
+        session_trace_reason = None
+        session_trace_turn_id = None
+
+        write_event(outbox, {
+            "type": "worker_trace",
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": last_injection_id,
+            "event": "codex_restarted",
+            "reason": reason,
+            "restart_count": restart_count,
+            "pid": proc.pid,
+        })
+        send_request("initialize", {
+            "processId": None,
+            "rootUri": None,
+            "capabilities": {
+                "experimentalApi": True,
+            },
+            "clientInfo": {
+                "name": "codeswarm-worker",
+                "title": "Codeswarm Worker",
+                "version": "0.1.0"
+            }
+        })
+        return True
+
     def _send_dynamic_tool_result(request_id, success, text, call_id):
         send_response(request_id, {
             "success": bool(success),
@@ -583,7 +748,9 @@ def main():
                             and isinstance(msg["result"]["turn"].get("id"), str)
                         ):
                             resolved_injection = request_to_injection[msg_id]
-                            turn_to_injection[msg["result"]["turn"]["id"]] = resolved_injection
+                            current_turn_id = msg["result"]["turn"]["id"]
+                            turn_to_injection[current_turn_id] = resolved_injection
+                            current_active_turn_id = current_turn_id
                             del request_to_injection[msg_id]
 
                         # Fallback: bind from turn/started notifications if still pending.
@@ -594,6 +761,30 @@ def main():
                             and msg.get("method") == "turn/started"
                         ):
                             turn_to_injection[turn_id] = pending_injections.popleft()
+                            current_active_turn_id = turn_id
+
+                        if msg.get("method") == "turn/started" and turn_id:
+                            current_active_turn_id = turn_id
+
+                        if msg.get("method") == "turn/completed" and turn_id and turn_id == current_active_turn_id:
+                            current_active_turn_id = None
+
+                        if isinstance(msg_id, int) and msg_id in pending_user_requests:
+                            pending_request = pending_user_requests.pop(msg_id, None)
+                            if msg.get("error") and pending_request and pending_request.get("kind") == "turn_steer":
+                                fallback_injection_id = pending_request.get("injection_id")
+                                fallback_content = pending_request.get("content", "")
+                                write_event(outbox, {
+                                    "type": "worker_trace",
+                                    "job_id": job_id,
+                                    "node_id": node_id,
+                                    "injection_id": fallback_injection_id,
+                                    "event": "turn_steer_failed_fallback_start",
+                                    "error": msg.get("error"),
+                                    "expected_turn_id": pending_request.get("expected_turn_id"),
+                                })
+                                _send_user_turn_start(fallback_injection_id, fallback_content)
+                                continue
 
                         resolved_injection_id = _resolve_injection_id(msg)
 
@@ -605,10 +796,17 @@ def main():
                             "payload": msg
                         })
 
+                        native_call_id = _extract_approval_call_id_from_rpc(msg)
+                        if native_call_id:
+                            _mark_native_session_tool_call(native_call_id)
+
                         if msg.get("method") == "thread/status/changed":
                             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
                             status = params.get("status") if isinstance(params.get("status"), dict) else {}
                             active_flags = status.get("activeFlags") if isinstance(status.get("activeFlags"), list) else []
+                            status_type = str(status.get("type") or "").lower()
+                            if status_type in ("idle", "complete", "completed"):
+                                current_active_turn_id = None
                             if "waitingOnApproval" in active_flags:
                                 session_trace_lines_remaining = max(session_trace_lines_remaining, 120)
                                 session_trace_reason = "waitingOnApproval"
@@ -669,6 +867,27 @@ def main():
                                 if isinstance(thread_path, str) and thread_path:
                                     session_path = Path(thread_path)
                                     session_offset = 0
+                            if (
+                                thread_id
+                                and rehydrate_history_on_thread_start is not None
+                                and msg.get("id") != 0
+                            ):
+                                history = rehydrate_history_on_thread_start
+                                rehydrate_history_on_thread_start = None
+                                if history:
+                                    send_request("thread/resume", {
+                                        "threadId": thread_id,
+                                        "history": history,
+                                        "persistExtendedHistory": True,
+                                    })
+                                    write_event(outbox, {
+                                        "type": "worker_trace",
+                                        "job_id": job_id,
+                                        "node_id": node_id,
+                                        "injection_id": last_injection_id,
+                                        "event": "codex_rehydrate_sent",
+                                        "items": len(history),
+                                    })
                         # Fallback: some app-server flows emit thread status before/without thread/start response.
                         if not thread_id and msg.get("method") == "thread/status/changed":
                             params = msg.get("params")
@@ -686,12 +905,17 @@ def main():
             if ready_err:
                 err_line = proc.stderr.readline()
                 if err_line:
+                    stripped_err = err_line.strip()
                     write_event(outbox, {
                         "type": "codex_stderr",
                         "job_id": job_id,
                         "node_id": node_id,
-                        "line": err_line.strip()
+                        "line": stripped_err
                     })
+                    if CODEX_ROLLOUT_CHANNEL_CLOSED_MARKER in stripped_err:
+                        if not restart_codex("rollout_channel_closed", outbox):
+                            running = False
+                            continue
 
             # ---- Inbox handling ----
             if inbox_path.exists() and thread_id:
@@ -731,17 +955,26 @@ def main():
                             if event.get("type") == "user":
                                 injection_id = event.get("injection_id")
                                 last_injection_id = injection_id
-                                req_id = send_request("turn/start", {
-                                    "threadId": thread_id,
-                                    "input": [
-                                        {
-                                            "type": "text",
-                                            "text": event.get("content", "")
-                                        }
-                                    ]
-                                })
-                                request_to_injection[req_id] = injection_id
-                                pending_injections.append(injection_id)
+                                content = event.get("content", "")
+                                if current_active_turn_id:
+                                    _send_user_turn_steer(injection_id, content)
+                                    write_event(outbox, {
+                                        "type": "worker_trace",
+                                        "job_id": job_id,
+                                        "node_id": node_id,
+                                        "injection_id": injection_id,
+                                        "event": "turn_steer_sent",
+                                        "turn_id": current_active_turn_id,
+                                    })
+                                else:
+                                    _send_user_turn_start(injection_id, content)
+                                    write_event(outbox, {
+                                        "type": "worker_trace",
+                                        "job_id": job_id,
+                                        "node_id": node_id,
+                                        "injection_id": injection_id,
+                                        "event": "turn_start_sent",
+                                    })
 
                             elif event.get("type") == "control":
                                 payload = event.get("payload", {})
@@ -851,23 +1084,6 @@ def main():
                             _finish_session_tool_call(payload.get("call_id"))
                             continue
 
-                        if msg.get("method") in (
-                            "item/fileChange/requestApproval",
-                            "item/commandExecution/requestApproval",
-                            "applyPatchApproval",
-                            "execCommandApproval",
-                            "codex/event/apply_patch_approval_request",
-                            "codex/event/exec_approval_request",
-                        ):
-                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-                            native_call_id = (
-                                params.get("itemId")
-                                or params.get("callId")
-                                or params.get("call_id")
-                            )
-                            if isinstance(native_call_id, str):
-                                _mark_native_session_tool_call(native_call_id)
-
                         if (
                             payload.get("type") == "function_call"
                             and payload.get("name") == "exec_command"
@@ -929,7 +1145,11 @@ def main():
                 _fulfill_session_tool_call(deferred_call_id, bool(info.get("approved")))
 
             if proc.poll() is not None:
-                running = False
+                if shutdown_requested:
+                    running = False
+                else:
+                    if not restart_codex("proc_exited", outbox):
+                        running = False
 
         write_event(outbox, {
             "type": "complete",

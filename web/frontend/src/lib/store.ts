@@ -2,10 +2,12 @@ import { create } from 'zustand'
 import { persist } from 'zustand/middleware'
 
 const MAX_TURNS_PER_NODE = 300
-const STREAM_IDLE_COMPLETE_MS = 1500
 const RESOLVED_APPROVAL_TTL_MS = 120000
 const PENDING_APPROVAL_STICKY_MS = 10000
 const RESOLVED_APPROVAL_STICKY_MS = 5000
+const MAX_EXEC_OUTPUT_CHARS = 16000
+const EXEC_OUTPUT_HEAD_CHARS = 10000
+const EXEC_OUTPUT_TAIL_CHARS = 5000
 
 export type TurnPhase =
   | 'idle'
@@ -21,6 +23,8 @@ export interface ExecutionState {
   cwd?: string
   stdout?: string
   stderr?: string
+  stdout_truncated?: boolean
+  stderr_truncated?: boolean
   exit_code?: number
   started_at?: number
   completed_at?: number
@@ -80,15 +84,45 @@ export interface PendingApproval {
   available_decisions?: Array<string | Record<string, any>>
 }
 
+export interface NodeSystemEvent {
+  id: string
+  ts: number
+  level: 'info' | 'warn' | 'error'
+  message: string
+}
+
 export interface NodeState {
   node_id: number
   turns: NodeTurn[]
+  system_events?: NodeSystemEvent[]
 }
 
 const capTurns = (turns: NodeTurn[]) =>
   turns.length > MAX_TURNS_PER_NODE
     ? turns.slice(-MAX_TURNS_PER_NODE)
     : turns
+
+const MAX_SYSTEM_EVENTS_PER_NODE = 20
+
+const capSystemEvents = (events: NodeSystemEvent[] | undefined) =>
+  (events ?? []).length > MAX_SYSTEM_EVENTS_PER_NODE
+    ? (events ?? []).slice(-MAX_SYSTEM_EVENTS_PER_NODE)
+    : (events ?? [])
+
+const truncateExecutionOutput = (value: unknown): { text?: string; truncated?: boolean } => {
+  if (typeof value !== 'string') return {}
+  if (value.length <= MAX_EXEC_OUTPUT_CHARS) {
+    return { text: value, truncated: false }
+  }
+  const head = value.slice(0, EXEC_OUTPUT_HEAD_CHARS)
+  const tail = value.slice(-EXEC_OUTPUT_TAIL_CHARS)
+  const omitted = value.length - head.length - tail.length
+  return {
+    text:
+      `${head}\n\n[... truncated ${omitted.toLocaleString()} characters ...]\n\n${tail}`,
+    truncated: true
+  }
+}
 
 export interface SwarmRecord {
   swarm_id: string
@@ -154,10 +188,65 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
   const pendingReasoningDeltas: Record<string, string[]> = {}
   const pendingReasoning: Record<string, string> = {}
   const pendingTaskComplete: Record<string, { content?: string }> = {}
-  const idleCompletionTimers: Record<string, ReturnType<typeof setTimeout>> = {}
+  const recentEventFingerprints = new Map<string, number>()
   let latestApprovalsSnapshot: Record<string, any> = {}
   let latestApprovalsVersion = 0
   const resolvedApprovalsUntil: Record<string, number> = {}
+  const RECENT_EVENT_TTL_MS = 60_000
+
+  const pruneRecentEventFingerprints = () => {
+    const cutoff = Date.now() - RECENT_EVENT_TTL_MS
+    for (const [key, ts] of recentEventFingerprints.entries()) {
+      if (ts < cutoff) {
+        recentEventFingerprints.delete(key)
+      }
+    }
+  }
+
+  const stableSerialize = (value: unknown): string => {
+    if (value === null || value === undefined) return String(value)
+    if (typeof value !== 'object') return JSON.stringify(value)
+    if (Array.isArray(value)) return `[${value.map((v) => stableSerialize(v)).join(',')}]`
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a.localeCompare(b)
+    )
+    return `{${entries
+      .map(([k, v]) => `${JSON.stringify(k)}:${stableSerialize(v)}`)
+      .join(',')}}`
+  }
+
+  const eventFingerprint = (type: string, payload: any): string | null => {
+    if (!payload || typeof payload !== 'object') return null
+    const swarmId = String(payload.swarm_id ?? payload.job_id ?? '')
+    const nodeId = Number.isFinite(Number(payload.node_id)) ? Number(payload.node_id) : ''
+    const injectionId = typeof payload.injection_id === 'string' ? payload.injection_id : ''
+    const callId = typeof payload.call_id === 'string' ? payload.call_id : ''
+
+    if (type === 'turn_started' || type === 'turn_complete' || type === 'task_complete') {
+      return `${type}:${swarmId}:${nodeId}:${injectionId}`
+    }
+    if (type === 'command_started' || type === 'command_completed') {
+      return `${type}:${swarmId}:${nodeId}:${injectionId}:${callId}:${stableSerialize(payload.command)}:${stableSerialize(payload.exit_code)}:${stableSerialize(payload.status)}`
+    }
+    if (type === 'exec_approval_required') {
+      return `${type}:${String(payload.job_id ?? '')}:${nodeId}:${callId}:${String(payload.approval_id ?? '')}:${stableSerialize(payload.command)}:${stableSerialize(payload.available_decisions)}`
+    }
+    if (type === 'exec_approval_resolved') {
+      return `${type}:${String(payload.job_id ?? '')}:${nodeId}:${callId}:${stableSerialize(payload.decision)}:${stableSerialize(payload.approved)}`
+    }
+    return null
+  }
+
+  const shouldSuppressDuplicateEvent = (type: string, payload: any) => {
+    const fingerprint = eventFingerprint(type, payload)
+    if (!fingerprint) return false
+    pruneRecentEventFingerprints()
+    if (recentEventFingerprints.has(fingerprint)) {
+      return true
+    }
+    recentEventFingerprints.set(fingerprint, Date.now())
+    return false
+  }
 
   const approvalResolutionKey = (swarmId: string, nodeId: number, callId: string) =>
     `${swarmId}:${nodeId}:${callId}`
@@ -184,60 +273,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     const key = approvalResolutionKey(swarmId, nodeId, callId)
     const expiresAt = resolvedApprovalsUntil[key]
     return typeof expiresAt === 'number' && expiresAt > Date.now()
-  }
-
-  const shouldKeepApprovalFromCache = (approval: PendingApproval) => {
-    const updatedAt = typeof approval.updated_at_ms === 'number' ? approval.updated_at_ms : 0
-    const ageMs = Date.now() - updatedAt
-    const status = approval.status
-    if (status === 'pending' || status === 'submitted' || status === 'acknowledged') {
-      return ageMs <= PENDING_APPROVAL_STICKY_MS
-    }
-    if (status === 'started' || status === 'resolved' || status === 'rejected' || status === 'timeout') {
-      return ageMs <= RESOLVED_APPROVAL_STICKY_MS
-    }
-    return ageMs <= PENDING_APPROVAL_STICKY_MS
-  }
-
-  const mergeSnapshotWithStickyPending = (
-    swarmId: string,
-    snapshotPending: Record<number, PendingApproval[]>,
-    existingPending: Record<number, PendingApproval[]> | undefined
-  ): Record<number, PendingApproval[]> => {
-    const merged: Record<number, PendingApproval[]> = {}
-    const existing = existingPending ?? {}
-    const approvalKey = (approval: PendingApproval) =>
-      String(approval.approval_id || approval.call_id || '')
-
-    const upsert = (nodeId: number, approval: PendingApproval) => {
-      const current = merged[nodeId] ?? []
-      const key = approvalKey(approval)
-      const prior = current.find((a) => approvalKey(a) === key)
-      if (!prior || isIncomingApprovalNewer(prior, approval)) {
-        merged[nodeId] = [...current.filter((a) => approvalKey(a) !== key), approval]
-      }
-    }
-
-    for (const [nodeIdRaw, approvals] of Object.entries(snapshotPending)) {
-      const nodeId = Number(nodeIdRaw)
-      if (!Number.isFinite(nodeId)) continue
-      for (const approval of approvals ?? []) {
-        upsert(nodeId, approval)
-      }
-    }
-
-    for (const [nodeIdRaw, approvals] of Object.entries(existing)) {
-      const nodeId = Number(nodeIdRaw)
-      if (!Number.isFinite(nodeId)) continue
-      for (const approval of approvals ?? []) {
-        if (!approval || !approval.call_id) continue
-        if (isApprovalRecentlyResolved(swarmId, nodeId, approval.call_id)) continue
-        if (!shouldKeepApprovalFromCache(approval)) continue
-        upsert(nodeId, approval)
-      }
-    }
-
-    return merged
   }
 
   const markPendingApprovalStatus = (
@@ -310,48 +345,39 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     return nextPending
   }
 
-  const timerKey = (swarmId: string, nodeId: number, injectionId: string) =>
-    `${swarmId}:${nodeId}:${injectionId}`
-
-  const clearIdleCompletionTimer = (swarmId: string, nodeId: number, injectionId: string) => {
-    const key = timerKey(String(swarmId), Number(nodeId), String(injectionId))
-    const timer = idleCompletionTimers[key]
-    if (timer) {
-      clearTimeout(timer)
-      delete idleCompletionTimers[key]
+  const clearIdleCompletionTimer = (_swarmId: string, _nodeId: number, _injectionId: string) => {}
+  const scheduleIdleCompletion = (_swarmId: string, _nodeId: number, _injectionId: string) => {}
+  const findSwarmForPayload = (payload: any): SwarmRecord | undefined => {
+    if (typeof payload?.swarm_id === 'string' && get().swarms[payload.swarm_id]) {
+      return get().swarms[payload.swarm_id]
     }
+    if (typeof payload?.job_id === 'string') {
+      return Object.values(get().swarms).find((s) => s.job_id === payload.job_id)
+    }
+    return undefined
   }
-
-  const scheduleIdleCompletion = (swarmId: string, nodeId: number, injectionId: string) => {
-    clearIdleCompletionTimer(swarmId, nodeId, injectionId)
-    const key = timerKey(String(swarmId), Number(nodeId), String(injectionId))
-    idleCompletionTimers[key] = setTimeout(() => {
-      const swarm = get().swarms[String(swarmId)]
-      if (!swarm) return
-      const node = swarm.nodes[Number(nodeId)]
-      if (!node) return
-
-      let changed = false
-      const updatedTurns: NodeTurn[] = node.turns.map((t) => {
-        if (t.injection_id !== injectionId) return t
-        if (t.phase === 'streaming') {
-          changed = true
-          return ({ ...t, phase: 'completed' } as NodeTurn)
+  const appendNodeSystemEvent = (
+    swarm: SwarmRecord,
+    nodeId: number,
+    event: NodeSystemEvent
+  ) => {
+    const node = swarm.nodes[nodeId]
+    if (!node) return
+    const existing = node.system_events ?? []
+    const last = existing[existing.length - 1]
+    if (last && last.message === event.message && event.ts - last.ts < 5000) {
+      return
+    }
+    get().addOrUpdateSwarm({
+      ...swarm,
+      nodes: {
+        ...swarm.nodes,
+        [nodeId]: {
+          ...node,
+          system_events: capSystemEvents([...existing, event])
         }
-        return t
-      })
-
-      delete idleCompletionTimers[key]
-
-      if (!changed) return
-      get().addOrUpdateSwarm({
-        ...swarm,
-        nodes: {
-          ...swarm.nodes,
-          [Number(nodeId)]: { ...node, turns: capTurns(updatedTurns) }
-        }
-      })
-    }, STREAM_IDLE_COMPLETE_MS)
+      }
+    })
   }
   const extractExecPolicyAmendment = (decision: unknown): string[] | undefined => {
     if (!decision || typeof decision !== 'object') return undefined
@@ -411,6 +437,107 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       if (filtered.length > 0) next[currentNodeId] = filtered
     }
     return next
+  }
+
+  const attachApprovalToNodeTurns = (
+    node: NodeState,
+    approval: PendingApproval
+  ): NodeState => {
+    let matched = false
+    const turns = node.turns.map((t) => {
+      const injectionMatches =
+        approval.injection_id &&
+        typeof t.injection_id === 'string' &&
+        t.injection_id === approval.injection_id
+      const alreadyMatches = t.approval?.call_id === approval.call_id
+      if (!injectionMatches && !alreadyMatches) return t
+      matched = true
+      return {
+        ...t,
+        phase: t.phase === 'completed' ? t.phase : 'awaiting_approval',
+        approval: {
+          call_id: approval.call_id,
+          command: approval.command,
+          reason: approval.reason,
+          cwd: approval.cwd,
+          proposed_execpolicy_amendment: approval.proposed_execpolicy_amendment,
+          available_decisions: approval.available_decisions
+        }
+      } as NodeTurn
+    })
+
+    if (matched) {
+      return { ...node, turns: capTurns(turns) }
+    }
+
+    const syntheticTurn: NodeTurn = {
+      injection_id: `approval-${approval.call_id}`,
+      prompt: '',
+      deltas: [],
+      reasoning: '',
+      phase: 'awaiting_approval',
+      has_final_answer: false,
+      approval: {
+        call_id: approval.call_id,
+        command: approval.command,
+        reason: approval.reason,
+        cwd: approval.cwd,
+        proposed_execpolicy_amendment: approval.proposed_execpolicy_amendment,
+        available_decisions: approval.available_decisions
+      }
+    }
+    return { ...node, turns: capTurns([...node.turns, syntheticTurn]) }
+  }
+
+  const clearApprovalFromNodeTurns = (
+    node: NodeState,
+    callId: string | undefined
+  ): NodeState => {
+    if (!callId) return node
+    const turns = node.turns
+      .map((t) => {
+        if (t.approval?.call_id !== callId) return t
+        return {
+          ...t,
+          phase: t.phase === 'awaiting_approval' ? 'streaming' : t.phase,
+          approval: undefined
+        } as NodeTurn
+      })
+      .filter((t) => {
+        const isSynthetic = t.injection_id.startsWith('approval-')
+        const hasContent =
+          (t.prompt ?? '').trim().length > 0 ||
+          (t.reasoning ?? '').trim().length > 0 ||
+          (t.deltas ?? []).some((d) => String(d ?? '').trim().length > 0)
+        return !(isSynthetic && !t.approval && !hasContent)
+      })
+    return { ...node, turns: capTurns(turns) }
+  }
+
+  const syncNodeTurnApprovals = (
+    node: NodeState,
+    approvals: PendingApproval[] | undefined
+  ): NodeState => {
+    const activeCallIds = new Set((approvals ?? []).map((a) => a.call_id).filter(Boolean))
+    const turns = node.turns
+      .map((t) => {
+        if (!t.approval?.call_id) return t
+        if (activeCallIds.has(t.approval.call_id)) return t
+        return {
+          ...t,
+          phase: t.phase === 'awaiting_approval' ? 'streaming' : t.phase,
+          approval: undefined
+        } as NodeTurn
+      })
+      .filter((t) => {
+        const isSynthetic = t.injection_id.startsWith('approval-')
+        const hasContent =
+          (t.prompt ?? '').trim().length > 0 ||
+          (t.reasoning ?? '').trim().length > 0 ||
+          (t.deltas ?? []).some((d) => String(d ?? '').trim().length > 0)
+        return !(isSynthetic && !t.approval && !hasContent)
+      })
+    return { ...node, turns: capTurns(turns) }
   }
 
   const approvalFreshness = (approval: PendingApproval) => {
@@ -597,6 +724,10 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     handleMessage: (msg) => {
       const { type, payload } = msg
 
+      if (shouldSuppressDuplicateEvent(type, payload)) {
+        return
+      }
+
       if (type === 'swarm_added') {
         get().addOrUpdateSwarm(payload)
       }
@@ -690,43 +821,11 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         for (const [swarmId, swarm] of Object.entries(state.swarms)) {
           const parsedPending = parsePendingSnapshotForSwarm(swarmId)
-          const nextPending = mergeSnapshotWithStickyPending(
-            swarmId,
-            parsedPending,
-            swarm.pending_approvals
-          )
-
-          // Pending approvals are rendered from pending_approvals only. Clear any
-          // stale per-turn approval state to avoid dual truth sources.
-          const nextNodes: Record<number, NodeState> = { ...swarm.nodes }
-          for (const [nodeIdRaw, node] of Object.entries(nextNodes)) {
-            const nodeId = Number(nodeIdRaw)
-            if (!Number.isFinite(nodeId)) continue
-            let changed = false
-            const turns = node.turns.map((t) => {
-              if (!t.approval) return t
-              changed = true
-              return ({
-                ...t,
-                phase: t.phase === 'awaiting_approval' ? 'streaming' : t.phase,
-                approval: undefined
-                } as NodeTurn)
-            })
-            if (changed) {
-              nextNodes[nodeId] = {
-                ...node,
-                turns: capTurns(
-                  turns.filter((t) => {
-                    const isSynthetic = t.injection_id.startsWith('approval-')
-                    const hasContent =
-                      (t.prompt ?? '').trim().length > 0 ||
-                      (t.reasoning ?? '').trim().length > 0 ||
-                      (t.deltas ?? []).some((d) => String(d ?? '').trim().length > 0)
-                    return !(isSynthetic && !hasContent)
-                  })
-                )
-              }
-            }
+          const nextPending = parsedPending
+          const nextNodes: Record<number, NodeState> = {}
+          for (const [nodeKey, node] of Object.entries(swarm.nodes)) {
+            const nodeId = Number(nodeKey)
+            nextNodes[nodeId] = syncNodeTurnApprovals(node, nextPending[nodeId] ?? [])
           }
 
           updatedSwarms[swarmId] = {
@@ -745,108 +844,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         if (!swarm) return
         const nodeId = Number(payload.node_id)
         if (!Number.isFinite(nodeId)) return
-        const node = swarm.nodes[nodeId]
-        if (!node) return
-
-        const status = payload?.status as { type?: string; activeFlags?: string[] } | undefined
-        const activeFlags = Array.isArray(status?.activeFlags) ? status!.activeFlags : []
-        const waitingOnApproval = activeFlags.includes('waitingOnApproval')
-        const statusType = String(status?.type ?? '').toLowerCase()
-        const isIdleStatus =
-          statusType === 'idle' || statusType === 'complete' || statusType === 'completed'
-        const targetInjectionId =
-          typeof payload?.injection_id === 'string' && payload.injection_id
-            ? payload.injection_id
-            : undefined
-
-        let turnsChanged = false
-        let updatedTurns: NodeTurn[] = node.turns
-
-        // Some runtimes emit idle/complete without assistant/task_complete.
-        // Finalize the in-flight turn so the UI does not remain stuck.
-        if (isIdleStatus && !waitingOnApproval) {
-          let matchedByInjection = false
-          updatedTurns = updatedTurns.map((t) => {
-            if (t.phase === 'completed' || t.phase === 'error') return t
-            if (targetInjectionId && t.injection_id === targetInjectionId) {
-              matchedByInjection = true
-              turnsChanged = true
-              clearIdleCompletionTimer(payload.swarm_id, nodeId, t.injection_id)
-              if (t.phase === 'awaiting_approval' || t.approval) {
-                return ({
-                  ...t,
-                  phase: 'error',
-                  approval: undefined,
-                  error: 'Agent exited before approval flow completed.'
-                } as NodeTurn)
-              }
-              if (!t.has_final_answer) {
-                return ({
-                  ...t,
-                  phase: 'error',
-                  approval: undefined,
-                  error: 'Agent exited before sending a final answer.'
-                } as NodeTurn)
-              }
-              return ({ ...t, phase: 'completed', approval: undefined } as NodeTurn)
-            }
-            return t
-          })
-
-          if (!matchedByInjection) {
-            for (let i = updatedTurns.length - 1; i >= 0; i -= 1) {
-              const turn = updatedTurns[i]
-              if (turn.phase === 'completed' || turn.phase === 'error') continue
-              const nextTurn =
-                turn.phase === 'awaiting_approval' || turn.approval
-                  ? ({
-                      ...turn,
-                      phase: 'error',
-                      approval: undefined,
-                      error: 'Agent exited before approval flow completed.'
-                    } as NodeTurn)
-                  : !turn.has_final_answer
-                  ? ({
-                      ...turn,
-                      phase: 'error',
-                      approval: undefined,
-                      error: 'Agent exited before sending a final answer.'
-                    } as NodeTurn)
-                  : ({
-                      ...turn,
-                      phase: 'completed',
-                      approval: undefined
-                    } as NodeTurn)
-              const turnsCopy = [...updatedTurns]
-              turnsCopy[i] = nextTurn
-              updatedTurns = turnsCopy
-              turnsChanged = true
-              clearIdleCompletionTimer(payload.swarm_id, nodeId, turn.injection_id)
-              break
-            }
-          }
-        }
-
-        const pending = { ...(swarm.pending_approvals ?? {}) }
-        let pendingChanged = false
-        if (isIdleStatus && !waitingOnApproval) {
-          if (Object.prototype.hasOwnProperty.call(pending, nodeId)) {
-            delete pending[nodeId]
-            pendingChanged = true
-          }
-        }
-
-        if (turnsChanged || pendingChanged) {
-          get().addOrUpdateSwarm({
-            ...swarm,
-            pending_approvals: pendingChanged ? pending : swarm.pending_approvals,
-            nodes: {
-              ...swarm.nodes,
-              [nodeId]: { ...node, turns: capTurns(updatedTurns) }
-            }
-          })
-        }
-
         return
       }
 
@@ -951,7 +948,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         }
 
         turn.deltas = [...turn.deltas, payload.content]
-        // If stream resumes after an idle auto-complete, reopen as streaming.
+        // A late delta should restore streaming if earlier terminal markers
+        // arrived out of order.
         if (turn.phase === 'completed') {
           turn.phase = 'streaming'
         }
@@ -990,6 +988,16 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         const snapshot = typeof payload.content === 'string' ? payload.content : ''
         const streamed = turn.deltas.join('')
+        const isFinalAnswer = payload?.final_answer === true
+
+        if (
+          snapshot &&
+          streamed === snapshot &&
+          ((isFinalAnswer && turn.phase === 'completed') || (!isFinalAnswer && turn.phase !== 'completed'))
+        ) {
+          return
+        }
+
         // Prefer the terminal assistant snapshot when it is more complete than
         // accumulated deltas (which can occasionally miss chunks under load).
         if (!streamed) {
@@ -997,7 +1005,6 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         } else if (snapshot && snapshot.length > streamed.length) {
           turn.deltas = [snapshot]
         }
-        const isFinalAnswer = payload?.final_answer === true
         if (isFinalAnswer) {
           turn.phase = 'completed'
           turn.approval = undefined
@@ -1037,6 +1044,10 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         )
 
         if (!turn) {
+          return
+        }
+
+        if (turn.phase === 'completed' && turn.has_final_answer === true && !turn.approval) {
           return
         }
 
@@ -1097,6 +1108,15 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         if (turnIndex >= 0) {
           const existing = turns[turnIndex]
+          const existingRaw = existing.deltas.join('')
+          if (
+            existing.phase === 'completed' &&
+            existing.has_final_answer === true &&
+            (!content || !existingRaw || existingRaw === content)
+          ) {
+            clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
+            return
+          }
           turns[turnIndex] = ({
             ...existing,
             phase: 'completed',
@@ -1218,6 +1238,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
         const nodeId = Number(payload.node_id)
         if (!Number.isFinite(nodeId)) return
+        const node = swarm.nodes[nodeId]
+        if (!node) return
         const callId = typeof payload.call_id === 'string' ? payload.call_id : ''
         if (!callId) return
         if (isApprovalRecentlyResolved(swarm.swarm_id, nodeId, callId)) {
@@ -1240,18 +1262,30 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           status: 'pending'
         }
         const existing = existingPendingForNode.find((a) => a.call_id === payload.call_id)
+        if (
+          existing &&
+          !isIncomingApprovalNewer(existing, incomingPending) &&
+          node.turns.some((t) => t.approval?.call_id === callId)
+        ) {
+          return
+        }
         const nextPendingForNode = isIncomingApprovalNewer(existing, incomingPending)
           ? [
               ...existingPendingForNode.filter((a) => a.call_id !== payload.call_id),
               incomingPending
             ]
           : existingPendingForNode
+        const updatedNode = attachApprovalToNodeTurns(node, incomingPending)
 
         get().addOrUpdateSwarm({
           ...swarm,
           pending_approvals: {
             ...(swarm.pending_approvals ?? {}),
             [nodeId]: nextPendingForNode
+          },
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: updatedNode
           }
         })
         clearIdleCompletionTimer(swarm.swarm_id, nodeId, payload.injection_id)
@@ -1294,6 +1328,20 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           'resolved',
           hasResolvedNode ? resolvedNodeId : undefined
         )
+        if (typeof payload.call_id === 'string' && payload.call_id) {
+          if (hasResolvedNode && updatedNodes[resolvedNodeId]) {
+            updatedNodes[resolvedNodeId] = clearApprovalFromNodeTurns(
+              updatedNodes[resolvedNodeId],
+              payload.call_id
+            )
+          } else {
+            for (const [nodeKey, node] of Object.entries(updatedNodes)) {
+              const nodeId = Number(nodeKey)
+              if (!Number.isFinite(nodeId)) continue
+              updatedNodes[nodeId] = clearApprovalFromNodeTurns(node, payload.call_id)
+            }
+          }
+        }
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -1313,23 +1361,42 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           markApprovalResolved(swarm.swarm_id, nodeId, payload.call_id)
         }
 
-        const updatedTurns = node.turns.map((t) =>
-          t.injection_id === payload.injection_id
-            ? ({
-                ...t,
-                // Command start is definitive that approval has been granted.
-                phase: 'executing',
-                approval:
-                  t.approval?.call_id === payload.call_id ? undefined : t.approval,
-                execution: {
-                  call_id: payload.call_id,
-                  command: payload.command,
-                  cwd: payload.cwd,
-                  started_at: Date.now(),
-                  status: 'running'
-                }
-              } as NodeTurn)
-            : t
+        let changed = false
+        const updatedTurns = node.turns.map((t) => {
+          if (t.injection_id !== payload.injection_id) return t
+          const existingExecution = t.execution
+          const sameExecution =
+            existingExecution?.call_id === payload.call_id &&
+            existingExecution?.status === 'running' &&
+            JSON.stringify(existingExecution?.command) === JSON.stringify(payload.command) &&
+            existingExecution?.cwd === payload.cwd
+          const approvalAlreadyCleared = t.approval?.call_id !== payload.call_id
+          if (sameExecution && approvalAlreadyCleared && t.phase === 'executing') {
+            return t
+          }
+          changed = true
+          return ({
+            ...t,
+            // Command start is definitive that approval has been granted.
+            phase: 'executing',
+            approval:
+              t.approval?.call_id === payload.call_id ? undefined : t.approval,
+            execution: {
+              call_id: payload.call_id,
+              command: payload.command,
+              cwd: payload.cwd,
+              started_at:
+                existingExecution && existingExecution.call_id === payload.call_id
+                  ? existingExecution.started_at ?? Date.now()
+                  : Date.now(),
+              status: 'running'
+            }
+          } as NodeTurn)
+        })
+        if (!changed) return
+        const clearedNode = clearApprovalFromNodeTurns(
+          { ...node, turns: updatedTurns },
+          payload.call_id
         )
 
         get().addOrUpdateSwarm({
@@ -1342,7 +1409,7 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           ),
           nodes: {
             ...swarm.nodes,
-            [nodeId]: { ...node, turns: updatedTurns }
+            [nodeId]: clearedNode
           }
         })
         clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
@@ -1355,10 +1422,24 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         const node = swarm.nodes[nodeId]
         if (!node) return
 
+        let changed = false
         const updatedTurns: NodeTurn[] = node.turns.map((t) => {
           if (t.injection_id !== payload.injection_id) return t
           if (!t.execution) return t
 
+          const alreadyApplied =
+            t.execution.call_id === payload.call_id &&
+            t.execution.status === 'completed' &&
+            t.execution.stdout === payload.stdout &&
+            t.execution.stderr === payload.stderr &&
+            t.execution.exit_code === payload.exit_code
+          if (alreadyApplied) {
+            return t
+          }
+
+          changed = true
+          const stdout = truncateExecutionOutput(payload.stdout)
+          const stderr = truncateExecutionOutput(payload.stderr)
           return ({
             ...t,
             // Do not hide pending approval on command completion unless we
@@ -1368,12 +1449,16 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
               ...t.execution,
               status: 'completed',
               completed_at: Date.now(),
-              stdout: payload.stdout,
-              stderr: payload.stderr,
+              stdout: stdout.text,
+              stderr: stderr.text,
+              stdout_truncated: stdout.truncated,
+              stderr_truncated: stderr.truncated,
               exit_code: payload.exit_code
             }
           } as NodeTurn)
         })
+
+        if (!changed) return
 
         get().addOrUpdateSwarm({
           ...swarm,
@@ -1405,6 +1490,50 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           }
         })
         clearIdleCompletionTimer(payload.swarm_id, nodeId, payload.injection_id)
+      }
+
+      if (type === 'worker_trace') {
+        const swarm = findSwarmForPayload(payload)
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        if (!Number.isFinite(nodeId)) return
+        const eventName = String(payload.event ?? '')
+        let message: string | null = null
+        let level: NodeSystemEvent['level'] = 'info'
+        if (eventName === 'codex_restart_requested') {
+          message = `Codex session restart requested: ${String(payload.reason ?? 'unknown reason')}`
+          level = 'warn'
+        } else if (eventName === 'codex_restarted') {
+          message = 'Codex session restarted'
+        } else if (eventName === 'codex_rehydrate_sent') {
+          message = 'Codex session rehydrated'
+        }
+        if (!message) return
+        appendNodeSystemEvent(swarm, nodeId, {
+          id: `${eventName}:${payload.restart_count ?? ''}:${Date.now()}`,
+          ts: Date.now(),
+          level,
+          message
+        })
+        return
+      }
+
+      if (type === 'codex_stderr') {
+        const swarm = findSwarmForPayload(payload)
+        if (!swarm) return
+        const nodeId = Number(payload.node_id)
+        if (!Number.isFinite(nodeId)) return
+        const line = String(payload.line ?? '')
+        if (!line) return
+        if (line.includes('failed to record rollout items: failed to queue rollout items: channel closed')) {
+          appendNodeSystemEvent(swarm, nodeId, {
+            id: `codex_stderr_rollout_closed:${Date.now()}`,
+            ts: Date.now(),
+            level: 'warn',
+            message: 'Codex internal rollout channel closed'
+          })
+        }
+        return
       }
 
       if (type === 'usage') {
