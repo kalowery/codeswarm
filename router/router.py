@@ -3154,7 +3154,8 @@ def perform_injection(config, provider, request_id, swarm_id, job_id, node_id, c
         "request_id": request_id,
         "swarm_id": swarm_id,
         "injection_id": injection_id,
-        "node_id": node_id
+        "node_id": node_id,
+        "prompt": content,
     })
 
     try:

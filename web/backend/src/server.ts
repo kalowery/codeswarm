@@ -1426,7 +1426,11 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'inject_ack') {
-    const prompt = typeof data?.request_id === 'string' ? requestPromptMap.get(data.request_id) : undefined;
+    const mappedPrompt =
+      typeof data?.request_id === 'string' ? requestPromptMap.get(data.request_id) : undefined;
+    const prompt =
+      mappedPrompt ??
+      (typeof data?.prompt === 'string' && data.prompt.trim().length > 0 ? data.prompt : undefined);
     if (prompt && typeof data?.injection_id === 'string') {
       data.prompt = prompt;
       injectionPromptMap.set(data.injection_id, prompt);
