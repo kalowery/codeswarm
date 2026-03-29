@@ -380,7 +380,7 @@ def run_probe_variant(
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Probe Codex app-server approval response semantics.")
     p.add_argument("--codex-bin", default=os.environ.get("CODESWARM_CODEX_BIN", "codex"))
-    p.add_argument("--sandbox", default="workspace-write")
+    p.add_argument("--sandbox", default="danger-full-access" if sys.platform == "darwin" else "workspace-write")
     p.add_argument("--ask-for-approval", default="never")
     p.add_argument(
         "--scenario",

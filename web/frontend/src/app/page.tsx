@@ -4,9 +4,17 @@ import { useEffect, useState, useRef } from 'react'
 import { useSwarmStore } from '@/lib/store'
 import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
+import ProjectModal from '@/components/ProjectModal'
 import Image from 'next/image'
 import ReactMarkdown from 'react-markdown'
-import type { NodeTurn, PendingApproval, TokenUsage, NodeSystemEvent } from '@/lib/store'
+import type {
+  NodeTurn,
+  PendingApproval,
+  TokenUsage,
+  NodeSystemEvent,
+  ProjectRecord,
+  ProjectTaskRecord
+} from '@/lib/store'
 import remarkGfm from 'remark-gfm'
 
 type SwarmViewMode = 'tabs' | 'grid'
@@ -102,9 +110,13 @@ type ApprovalChangeDetail = {
 
 export default function Home() {
   const swarms = useSwarmStore((s) => s.swarms)
+  const projects = useSwarmStore((s) => s.projects)
   const setSwarms = useSwarmStore((s) => s.setSwarms)
+  const setProjects = useSwarmStore((s) => s.setProjects)
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
+  const selectProject = useSwarmStore((s) => s.selectProject)
   const selected = useSwarmStore((s) => s.selectedSwarm)
+  const selectedProject = useSwarmStore((s) => s.selectedProject)
   const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
   const activeNodeBySwarm = useSwarmStore((s) => s.activeNodeBySwarm)
   const setActiveNode = useSwarmStore((s) => s.setActiveNode)
@@ -138,10 +150,17 @@ export default function Home() {
       .catch((err) => {
         console.warn('Failed to fetch queue:', err)
       })
-  }, [setSwarms, setInterSwarmQueue])
+    fetchJson(`${apiBase}/projects`)
+      .then((data) => setProjects(data))
+      .catch((err) => {
+        console.warn('Failed to fetch projects:', err)
+      })
+  }, [setProjects, setSwarms, setInterSwarmQueue])
 
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
+  const projectList = Object.values(projects)
   const swarmList = Object.values(swarms)
+  const activeProject = selectedProject ? projects[selectedProject] : undefined
   const active = selected ? swarms[selected] : undefined
   const activeIsTerminating = (active?.status ?? '').toLowerCase() === 'terminating'
   const activePendingApprovals = active
@@ -219,7 +238,63 @@ export default function Home() {
     return Object.keys(swarm.nodes).some((id) => nodeIsWorking(swarmId, Number(id)))
   }
 
+  function projectTaskStatusTone(status: string) {
+    switch ((status || '').toLowerCase()) {
+      case 'completed':
+        return 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10'
+      case 'running':
+      case 'assigned':
+      case 'starting':
+        return 'text-sky-300 border-sky-500/40 bg-sky-500/10'
+      case 'attention':
+      case 'failed':
+        return 'text-rose-300 border-rose-500/40 bg-rose-500/10'
+      default:
+        return 'text-amber-300 border-amber-500/40 bg-amber-500/10'
+    }
+  }
+
+  function beadsStatusTone(status: string | undefined) {
+    switch ((status || '').toLowerCase()) {
+      case 'synced':
+      case 'closed':
+        return 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10'
+      case 'partial':
+      case 'warning':
+        return 'text-amber-300 border-amber-500/40 bg-amber-500/10'
+      case 'disabled':
+      case 'unavailable':
+        return 'text-slate-300 border-slate-600/40 bg-slate-700/20'
+      default:
+        return 'text-sky-300 border-sky-500/40 bg-sky-500/10'
+    }
+  }
+
+  function projectReadyCount(project: ProjectRecord) {
+    return Number(project.task_counts?.ready ?? 0)
+  }
+
+  function projectAssignedCount(project: ProjectRecord) {
+    return Number(project.task_counts?.assigned ?? 0)
+  }
+
+  function projectCompletedCount(project: ProjectRecord) {
+    return Number(project.task_counts?.completed ?? 0)
+  }
+
+  function selectedProjectTask(project: ProjectRecord | undefined): ProjectTaskRecord | undefined {
+    if (!project) return undefined
+    const taskId =
+      selectedTaskByProject[project.project_id] ??
+      project.task_order?.[0] ??
+      Object.keys(project.tasks ?? {})[0]
+    return taskId ? project.tasks?.[taskId] : undefined
+  }
+
   const [showLaunch, setShowLaunch] = useState(false)
+  const [showProjectModal, setShowProjectModal] = useState(false)
+  const [startingProjectId, setStartingProjectId] = useState<string | null>(null)
+  const [selectedTaskByProject, setSelectedTaskByProject] = useState<Record<string, string>>({})
   const [viewModeBySwarm, setViewModeBySwarm] = useState<Record<string, SwarmViewMode>>({})
   const nodeScrollRef = useRef<HTMLDivElement | null>(null)
   const tabsPanelRef = useRef<HTMLDivElement | null>(null)
@@ -1092,7 +1167,10 @@ export default function Home() {
               WS: {wsStatus}
             </span>
 
-            <button onClick={() => setShowLaunch(true)} className="px-2 py-1 bg-indigo-600 rounded text-sm">+ Launch</button>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setShowProjectModal(true)} className="px-2 py-1 bg-cyan-600 rounded text-sm">+ Project</button>
+              <button onClick={() => setShowLaunch(true)} className="px-2 py-1 bg-indigo-600 rounded text-sm">+ Launch</button>
+            </div>
           </div>
         </div>
 
@@ -1129,61 +1207,111 @@ export default function Home() {
             </div>
           ))}
 
-          {swarmList.map((swarm) => (
-            (() => {
-              const swarmSessionCost = Object.values(swarm.nodes).reduce((sum, node) => {
-                return sum + estimateUsageUsd(latestSessionUsage(node.turns))
-              }, 0)
-              const swarmIsTerminating = (swarm.status ?? '').toLowerCase() === 'terminating'
-
-              return (
-                <div
-                  key={swarm.swarm_id}
-                  onClick={() => selectSwarm(swarm.swarm_id)}
-                  className={`p-3 rounded cursor-pointer border transition relative ${
-                    selected === swarm.swarm_id
-                      ? 'bg-slate-800 border-indigo-500'
-                      : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
-                  }`}
-                >
-                  {swarmNeedsAttention(swarm.swarm_id) && (
-                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                  )}
-                  {!swarmNeedsAttention(swarm.swarm_id) && swarmHasWorking(swarm.swarm_id) && (
-                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
-                  )}
-                  {!swarmNeedsAttention(swarm.swarm_id) && !swarmHasWorking(swarm.swarm_id) && swarmIsReady(swarm.swarm_id) && (
-                    <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-400" />
-                  )}
-                  {swarmIsTerminating && (
-                    <span className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] border border-amber-500/40 uppercase tracking-wide animate-pulse">
-                      Shutting down
-                    </span>
-                  )}
-                  <div className="font-medium">{swarm.alias}</div>
-                  <div className="text-sm text-slate-400">
-                  {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
-                </div>
-                  {swarmIsTerminating && swarm.termination_message && (
-                    <div className="text-xs text-amber-300 mt-1 whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
-                      {swarm.termination_message}
+          <div className="pt-3 mt-3 border-t border-slate-800">
+            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+              Projects ({projectList.length})
+            </div>
+            {projectList.length === 0 ? (
+              <div className="text-xs text-slate-600">No orchestrated projects.</div>
+            ) : (
+              <div className="space-y-2">
+                {projectList.map((project) => (
+                  <div
+                    key={project.project_id}
+                    onClick={() => selectProject(project.project_id)}
+                    className={`p-3 rounded cursor-pointer border transition ${
+                      selectedProject === project.project_id
+                        ? 'bg-slate-800 border-cyan-500'
+                        : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="font-medium text-sm">{project.title}</div>
+                      <span className={`px-2 py-0.5 rounded border text-[10px] uppercase tracking-wide ${projectTaskStatusTone(project.status)}`}>
+                        {project.status}
+                      </span>
                     </div>
-                  )}
-                  {(swarm.provider_id || swarm.provider) && (
-                    <div className="text-xs text-slate-500 mt-1">
-                      Provider: {swarm.provider_id || swarm.provider}
+                    <div className="text-[11px] text-slate-500 mt-1 truncate">{project.repo_path}</div>
+                    <div className="text-[11px] text-slate-500 mt-1">
+                      ready {projectReadyCount(project)} · running {projectAssignedCount(project)} · done {projectCompletedCount(project)}
                     </div>
-                  )}
-                  <div className="text-xs text-slate-500 mt-1">
-                    Est. spend: {formatUsd(swarmSessionCost)}
+                    <div className="mt-2 flex items-center gap-2">
+                      <span className={`px-2 py-0.5 rounded border text-[10px] uppercase tracking-wide ${beadsStatusTone(project.beads_sync_status)}`}>
+                        Beads {project.beads_sync_status || 'pending'}
+                      </span>
+                      {project.beads_root_id && (
+                        <span className="text-[11px] text-slate-500 truncate">{project.beads_root_id}</span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              )
-            })()
-          ))}
-          {swarmList.length === 0 && (
-            <div className="text-slate-500 text-sm">No active swarms</div>
-          )}
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="pt-3 mt-3 border-t border-slate-800">
+            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
+              Swarms ({swarmList.length})
+            </div>
+            {swarmList.map((swarm) => (
+              (() => {
+                const swarmSessionCost = Object.values(swarm.nodes).reduce((sum, node) => {
+                  return sum + estimateUsageUsd(latestSessionUsage(node.turns))
+                }, 0)
+                const swarmIsTerminating = (swarm.status ?? '').toLowerCase() === 'terminating'
+
+                return (
+                  <div
+                    key={swarm.swarm_id}
+                    onClick={() => {
+                      selectSwarm(swarm.swarm_id)
+                      selectProject(undefined)
+                    }}
+                    className={`p-3 rounded cursor-pointer border transition relative ${
+                      selected === swarm.swarm_id
+                        ? 'bg-slate-800 border-indigo-500'
+                        : 'bg-slate-900 border-slate-800 hover:bg-slate-800'
+                    }`}
+                  >
+                    {swarmNeedsAttention(swarm.swarm_id) && (
+                      <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+                    )}
+                    {!swarmNeedsAttention(swarm.swarm_id) && swarmHasWorking(swarm.swarm_id) && (
+                      <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
+                    )}
+                    {!swarmNeedsAttention(swarm.swarm_id) && !swarmHasWorking(swarm.swarm_id) && swarmIsReady(swarm.swarm_id) && (
+                      <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-emerald-400" />
+                    )}
+                    {swarmIsTerminating && (
+                      <span className="absolute top-2 right-2 px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] border border-amber-500/40 uppercase tracking-wide animate-pulse">
+                        Shutting down
+                      </span>
+                    )}
+                    <div className="font-medium">{swarm.alias}</div>
+                    <div className="text-sm text-slate-400">
+                    {(swarm.status ?? 'unknown').toUpperCase()} · {swarm.node_count} agent{swarm.node_count === 1 ? '' : 's'}
+                  </div>
+                    {swarmIsTerminating && swarm.termination_message && (
+                      <div className="text-xs text-amber-300 mt-1 whitespace-pre-wrap break-words max-h-20 overflow-y-auto">
+                        {swarm.termination_message}
+                      </div>
+                    )}
+                    {(swarm.provider_id || swarm.provider) && (
+                      <div className="text-xs text-slate-500 mt-1">
+                        Provider: {swarm.provider_id || swarm.provider}
+                      </div>
+                    )}
+                    <div className="text-xs text-slate-500 mt-1">
+                      Est. spend: {formatUsd(swarmSessionCost)}
+                    </div>
+                  </div>
+                )
+              })()
+            ))}
+            {swarmList.length === 0 && (
+              <div className="text-slate-500 text-sm">No active swarms</div>
+            )}
+          </div>
 
           <div className="pt-3 mt-3 border-t border-slate-800">
             <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
@@ -1224,9 +1352,227 @@ export default function Home() {
       </div>
 
       <div className="flex-1 min-w-0 p-6">
-        {!active && <div className="text-slate-500">Select a swarm to view details</div>}
+        {!activeProject && !active && <div className="text-slate-500">Select a project or swarm to view details</div>}
 
-        {active && (
+        {activeProject && (
+          (() => {
+            const selectedTask = selectedProjectTask(activeProject)
+            const assignedSwarm = selectedTask?.assigned_swarm_id ? swarms[selectedTask.assigned_swarm_id] : undefined
+            const assignedNodeId =
+              typeof selectedTask?.assigned_node_id === 'number' ? selectedTask.assigned_node_id : undefined
+            const assignedNode =
+              assignedSwarm && typeof assignedNodeId === 'number'
+                ? assignedSwarm.nodes[assignedNodeId]
+                : undefined
+
+            return (
+              <div>
+                <div className="flex items-start justify-between gap-4 mb-4">
+                  <div>
+                    <div className="text-xs uppercase tracking-wide text-cyan-400 mb-1">Orchestrated Project</div>
+                    <h1 className="text-xl font-semibold">{activeProject.title}</h1>
+                    <div className="text-sm text-slate-400">
+                      Status: {activeProject.status} · Base branch: {activeProject.base_branch || 'main'}
+                    </div>
+                    <div className="text-xs text-slate-500 mt-1">{activeProject.repo_path}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
+                      <span className={`px-2 py-0.5 rounded border uppercase tracking-wide ${beadsStatusTone(activeProject.beads_sync_status)}`}>
+                        Beads {activeProject.beads_sync_status || 'pending'}
+                      </span>
+                      {activeProject.beads_root_id && (
+                        <span className="text-slate-400">root {activeProject.beads_root_id}</span>
+                      )}
+                      {activeProject.beads_prefix && (
+                        <span className="text-slate-500">prefix {activeProject.beads_prefix}</span>
+                      )}
+                    </div>
+                    {activeProject.beads_repo_path && (
+                      <div className="text-[11px] text-slate-500 mt-1">Beads repo: {activeProject.beads_repo_path}</div>
+                    )}
+                    {activeProject.beads_last_error && (
+                      <div className="mt-1 text-xs text-amber-300">{activeProject.beads_last_error}</div>
+                    )}
+                    {activeProject.last_error && (
+                      <div className="mt-2 text-xs text-rose-300">{activeProject.last_error}</div>
+                    )}
+                  </div>
+                  <button
+                    disabled={
+                      startingProjectId === activeProject.project_id ||
+                      activeProject.status === 'running' ||
+                      activeProject.status === 'starting' ||
+                      activeProject.status === 'completed'
+                    }
+                    onClick={async () => {
+                      try {
+                        setStartingProjectId(activeProject.project_id)
+                        const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                        await fetch(`${apiBase}/projects/${activeProject.project_id}/start`, {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' }
+                        })
+                      } finally {
+                        setTimeout(() => setStartingProjectId(null), 300)
+                      }
+                    }}
+                    className={`px-3 py-1 rounded text-sm ${
+                      startingProjectId === activeProject.project_id ||
+                      activeProject.status === 'running' ||
+                      activeProject.status === 'starting' ||
+                      activeProject.status === 'completed'
+                        ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                        : 'bg-cyan-600 hover:bg-cyan-500'
+                    }`}
+                  >
+                    {activeProject.status === 'running'
+                      ? 'Running'
+                      : activeProject.status === 'starting'
+                      ? 'Starting...'
+                      : activeProject.status === 'completed'
+                      ? 'Completed'
+                      : startingProjectId === activeProject.project_id
+                      ? 'Starting...'
+                      : 'Start Project'}
+                  </button>
+                </div>
+
+                <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+                  <div className="rounded border border-slate-800 bg-slate-900 p-3">
+                    <div className="text-xs uppercase tracking-wide text-slate-500 mb-3">
+                      Tasks ({Object.keys(activeProject.tasks ?? {}).length})
+                    </div>
+                    <div className="space-y-2 max-h-[calc(100vh-240px)] overflow-y-auto pr-1">
+                      {(activeProject.task_order ?? Object.keys(activeProject.tasks ?? {})).map((taskId) => {
+                        const task = activeProject.tasks?.[taskId]
+                        if (!task) return null
+                        const isSelected = selectedTask?.task_id === task.task_id
+                        return (
+                          <button
+                            key={task.task_id}
+                            onClick={() => setSelectedTaskByProject((prev) => ({ ...prev, [activeProject.project_id]: task.task_id }))}
+                            className={`w-full text-left rounded border p-3 transition ${
+                              isSelected
+                                ? 'border-cyan-500 bg-slate-800'
+                                : 'border-slate-800 bg-slate-950 hover:bg-slate-800'
+                            }`}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="font-medium text-sm">{task.title}</div>
+                              <span className={`px-2 py-0.5 rounded border text-[10px] uppercase tracking-wide ${projectTaskStatusTone(task.status)}`}>
+                                {task.status}
+                              </span>
+                            </div>
+                            <div className="text-[11px] text-slate-500 mt-1">{task.task_id}</div>
+                            <div className="mt-1 flex items-center gap-2">
+                              <span className={`px-2 py-0.5 rounded border text-[10px] uppercase tracking-wide ${beadsStatusTone(task.beads_sync_status)}`}>
+                                Beads {task.beads_sync_status || 'pending'}
+                              </span>
+                              {task.beads_id && (
+                                <span className="text-[11px] text-slate-500 truncate">{task.beads_id}</span>
+                              )}
+                            </div>
+                            {task.branch && (
+                              <div className="text-[11px] text-slate-500 mt-1 truncate">{task.branch}</div>
+                            )}
+                            {typeof task.assigned_node_id === 'number' && task.assigned_swarm_id && (
+                              <div className="text-[11px] text-sky-300 mt-1">
+                                {swarms[task.assigned_swarm_id]?.alias ?? task.assigned_swarm_id} · agent {task.assigned_node_id}
+                              </div>
+                            )}
+                            {task.last_error && (
+                              <div className="text-[11px] text-rose-300 mt-1 line-clamp-2">{task.last_error}</div>
+                            )}
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="space-y-4 min-w-0">
+                    {selectedTask ? (
+                      <>
+                        <div className="rounded border border-slate-800 bg-slate-900 p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-xs uppercase tracking-wide text-slate-500">{selectedTask.task_id}</div>
+                              <h2 className="text-lg font-semibold">{selectedTask.title}</h2>
+                            </div>
+                            <span className={`px-2 py-1 rounded border text-xs uppercase tracking-wide ${projectTaskStatusTone(selectedTask.status)}`}>
+                              {selectedTask.status}
+                            </span>
+                          </div>
+                          <div className="mt-3 text-sm text-slate-300 whitespace-pre-wrap">{selectedTask.prompt}</div>
+                          {selectedTask.acceptance_criteria && selectedTask.acceptance_criteria.length > 0 && (
+                            <div className="mt-4">
+                              <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Acceptance Criteria</div>
+                              <ul className="space-y-1 text-sm text-slate-300 list-disc list-inside">
+                                {selectedTask.acceptance_criteria.map((item, idx) => (
+                                  <li key={`${selectedTask.task_id}-ac-${idx}`}>{item}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                          <div className="mt-4 grid gap-3 md:grid-cols-2 text-xs text-slate-400">
+                            <div>
+                              <div>Depends on: {(selectedTask.depends_on ?? []).length > 0 ? selectedTask.depends_on?.join(', ') : 'none'}</div>
+                              <div>Attempts: {selectedTask.attempts ?? 0}</div>
+                              <div>Result: {selectedTask.result_status ?? 'n/a'}</div>
+                              <div>Beads issue: {selectedTask.beads_id ?? 'n/a'}</div>
+                            </div>
+                            <div>
+                              <div>Assigned swarm: {selectedTask.assigned_swarm_id ? (swarms[selectedTask.assigned_swarm_id]?.alias ?? selectedTask.assigned_swarm_id) : 'unassigned'}</div>
+                              <div>Assigned agent: {typeof selectedTask.assigned_node_id === 'number' ? selectedTask.assigned_node_id : 'n/a'}</div>
+                              <div>Branch: {selectedTask.branch ?? 'n/a'}</div>
+                              <div>Beads sync: {selectedTask.beads_sync_status ?? 'pending'}</div>
+                            </div>
+                          </div>
+                          {selectedTask.beads_last_error && (
+                            <div className="mt-3 text-xs text-amber-300">{selectedTask.beads_last_error}</div>
+                          )}
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900 p-4">
+                          <div className="flex items-center justify-between mb-3">
+                            <div className="text-xs uppercase tracking-wide text-slate-500">Live Worker View</div>
+                            {assignedSwarm && typeof assignedNodeId === 'number' && (
+                              <button
+                                className="px-2 py-1 rounded bg-slate-800 border border-slate-700 text-xs hover:bg-slate-700"
+                                onClick={() => {
+                                  selectSwarm(assignedSwarm.swarm_id)
+                                  setActiveNode(assignedSwarm.swarm_id, assignedNodeId)
+                                }}
+                              >
+                                Focus Swarm
+                              </button>
+                            )}
+                          </div>
+                          {assignedSwarm && assignedNode && typeof assignedNodeId === 'number' ? (
+                            <div className="max-h-[420px] overflow-y-auto pr-1">
+                              {renderTurns(
+                                assignedNode.turns,
+                                assignedSwarm.pending_approvals?.[assignedNodeId],
+                                assignedSwarm.job_id,
+                                assignedNodeId,
+                                assignedSwarm.known_exec_policies,
+                                assignedNode.system_events
+                              )}
+                            </div>
+                          ) : (
+                            <div className="text-sm text-slate-500">This task is not currently assigned to a live worker.</div>
+                          )}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="text-slate-500">No task selected.</div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )
+          })()
+        )}
+
+        {!activeProject && active && (
           <div>
             {(() => {
               const agentSessionCost = Object.values(active.nodes).reduce((sum, node) => {
@@ -1711,6 +2057,7 @@ export default function Home() {
         )}
       </div>
 
+      {showProjectModal && <ProjectModal onClose={() => setShowProjectModal(false)} />}
       {showLaunch && <LaunchModal onClose={() => setShowLaunch(false)} />}
     </div>
   )

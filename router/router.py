@@ -14,6 +14,7 @@ import threading
 import re
 import time
 import atexit
+import shutil
 from collections import defaultdict, deque
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -43,6 +44,8 @@ NODE_OUTSTANDING = defaultdict(int)
 NODE_THREAD_ACTIVE = defaultdict(bool)
 FINAL_ANSWER_SEEN = set()
 INTER_SWARM_QUEUE = defaultdict(deque)
+PROJECTS = {}
+PENDING_PROJECT_PLANS = {}
 SCHEDULER_LOCK = threading.Lock()
 STATE_SAVE_LOCK = threading.Lock()
 TERMINATION_IN_PROGRESS = set()
@@ -63,6 +66,16 @@ APPROVAL_ACK_RETRY_SECONDS = 2.0
 # confirms delivery. Short outages can exceed fixed retry windows and otherwise
 # deadlock a turn until a new prompt re-triggers approval flow.
 APPROVAL_ACK_MAX_BACKOFF_SECONDS = 15.0
+
+
+def _pid_file_path():
+    raw = str(os.environ.get("CODESWARM_ROUTER_PID_FILE") or "").strip()
+    return Path(raw).expanduser() if raw else PID_FILE
+
+
+def _state_file_path():
+    raw = str(os.environ.get("CODESWARM_ROUTER_STATE_FILE") or "").strip()
+    return Path(raw).expanduser() if raw else STATE_FILE
 
 
 def _bump_approvals_version():
@@ -982,6 +995,7 @@ def _retry_unacked_approvals():
 
 def save_state():
     try:
+        state_file = _state_file_path()
         # Serialize save operations so concurrent callers cannot race on the
         # temporary file/rename path.
         with STATE_SAVE_LOCK:
@@ -989,6 +1003,8 @@ def save_state():
             # so serialization cannot race with concurrent updates.
             with SCHEDULER_LOCK:
                 swarms_snapshot = copy.deepcopy(SWARMS)
+                projects_snapshot = copy.deepcopy(PROJECTS)
+                plans_snapshot = copy.deepcopy(PENDING_PROJECT_PLANS)
                 queue_snapshot = []
                 for target_swarm_id, q in INTER_SWARM_QUEUE.items():
                     for item in q:
@@ -1005,14 +1021,16 @@ def save_state():
 
             data = {
                 "swarms": swarms_snapshot,
+                "projects": projects_snapshot,
+                "pending_project_plans": plans_snapshot,
                 "inter_swarm_queue": queue_snapshot,
             }
 
-            STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            state_file.parent.mkdir(parents=True, exist_ok=True)
             fd, tmp_name = tempfile.mkstemp(
-                prefix=f"{STATE_FILE.name}.",
+                prefix=f"{state_file.name}.",
                 suffix=".tmp",
-                dir=str(STATE_FILE.parent),
+                dir=str(state_file.parent),
             )
             tmp_path = Path(tmp_name)
             try:
@@ -1020,7 +1038,7 @@ def save_state():
                     json.dump(data, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp_path, STATE_FILE)
+                os.replace(tmp_path, state_file)
             finally:
                 try:
                     if tmp_path.exists():
@@ -1028,16 +1046,38 @@ def save_state():
                 except Exception:
                     pass
     except Exception as e:
-        print(f"[router ERROR] failed to save state to {STATE_FILE}: {e}", file=sys.stderr, flush=True)
+        print(f"[router ERROR] failed to save state to {_state_file_path()}: {e}", file=sys.stderr, flush=True)
 
 
 def load_state():
-    global SWARMS, INTER_SWARM_QUEUE
+    global SWARMS, INTER_SWARM_QUEUE, PROJECTS, PENDING_PROJECT_PLANS
     try:
-        if STATE_FILE.exists():
-            with open(STATE_FILE) as f:
+        state_file = _state_file_path()
+        if state_file.exists():
+            with open(state_file) as f:
                 data = json.load(f)
                 SWARMS = data.get("swarms", {})
+                PROJECTS = data.get("projects", {}) if isinstance(data.get("projects"), dict) else {}
+                PENDING_PROJECT_PLANS = (
+                    data.get("pending_project_plans", {})
+                    if isinstance(data.get("pending_project_plans"), dict)
+                    else {}
+                )
+                for project in PROJECTS.values():
+                    if not isinstance(project, dict):
+                        continue
+                    tasks = project.get("tasks")
+                    if not isinstance(tasks, dict):
+                        continue
+                    for task in tasks.values():
+                        if not isinstance(task, dict):
+                            continue
+                        if task.get("status") == "assigned":
+                            task["status"] = "pending"
+                            task["assigned_swarm_id"] = None
+                            task["assigned_node_id"] = None
+                            task["assignment_injection_id"] = None
+                            task["updated_at"] = time.time()
                 restored_queue = defaultdict(deque)
                 for item in data.get("inter_swarm_queue", []):
                     if not isinstance(item, dict):
@@ -1058,22 +1098,25 @@ def load_state():
                 INTER_SWARM_QUEUE = restored_queue
     except Exception:
         SWARMS = {}
+        PROJECTS = {}
+        PENDING_PROJECT_PLANS = {}
         INTER_SWARM_QUEUE = defaultdict(deque)
 
 
 def write_pid_file():
     try:
-        PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
+        _pid_file_path().write_text(f"{os.getpid()}\n", encoding="utf-8")
     except Exception:
         pass
 
 
 def remove_pid_file():
     try:
-        if PID_FILE.exists():
-            raw = PID_FILE.read_text(encoding="utf-8").strip()
+        path = _pid_file_path()
+        if path.exists():
+            raw = path.read_text(encoding="utf-8").strip()
             if raw == str(os.getpid()):
-                PID_FILE.unlink()
+                path.unlink()
     except Exception:
         pass
 
@@ -1226,16 +1269,20 @@ def emit_event(event_name, data):
     line = json.dumps(envelope) + "\n"
 
     dead = []
+    with TCP_CLIENTS_LOCK:
+        clients = list(TCP_CLIENTS)
 
-    for conn in TCP_CLIENTS:
+    for conn in clients:
         try:
             conn.sendall(line.encode())
         except:
             dead.append(conn)
 
-    for conn in dead:
-        if conn in TCP_CLIENTS:
-            TCP_CLIENTS.remove(conn)
+    if dead:
+        with TCP_CLIENTS_LOCK:
+            for conn in dead:
+                if conn in TCP_CLIENTS:
+                    TCP_CLIENTS.remove(conn)
 
     if DEBUG:
         print(line, end="", flush=True)
@@ -1298,6 +1345,1088 @@ def _emit_queue_updated():
     })
 
 
+def _project_task_paths(task):
+    for key in ("owned_paths", "expected_touch_paths"):
+        value = task.get(key)
+        if isinstance(value, list):
+            return [str(item).strip("/") for item in value if isinstance(item, str) and item.strip("/")]
+    return []
+
+
+def _paths_overlap(left_paths, right_paths):
+    for left in left_paths:
+        for right in right_paths:
+            if left == right:
+                return True
+            if left.startswith(f"{right}/") or right.startswith(f"{left}/"):
+                return True
+    return False
+
+
+def _sanitize_branch_token(value):
+    text = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip())
+    text = text.strip("-._")
+    return text or "task"
+
+
+def _project_task_is_ready(project, task_id):
+    task = (project.get("tasks") or {}).get(task_id) or {}
+    if task.get("status") not in ("pending", "ready"):
+        return False
+    for dep_id in task.get("depends_on") or []:
+        dep = (project.get("tasks") or {}).get(dep_id) or {}
+        if dep.get("status") != "completed":
+            return False
+    candidate_paths = _project_task_paths(task)
+    if not candidate_paths:
+        return True
+    for other_id, other_task in (project.get("tasks") or {}).items():
+        if other_id == task_id or other_task.get("status") != "assigned":
+            continue
+        other_paths = _project_task_paths(other_task)
+        if other_paths and _paths_overlap(candidate_paths, other_paths):
+            return False
+    return True
+
+
+def _project_task_counts(project):
+    counts = {
+        "pending": 0,
+        "ready": 0,
+        "assigned": 0,
+        "completed": 0,
+        "failed": 0,
+        "blocked": 0,
+    }
+    tasks = project.get("tasks") or {}
+    for task_id, task in tasks.items():
+        status = str(task.get("status") or "pending")
+        if status == "assigned":
+            counts["assigned"] += 1
+        elif status == "completed":
+            counts["completed"] += 1
+        elif status == "failed":
+            counts["failed"] += 1
+        else:
+            if _project_task_is_ready(project, task_id):
+                counts["ready"] += 1
+            else:
+                counts["blocked"] += 1
+            counts["pending"] += 1
+    return counts
+
+
+def _refresh_project_status(project):
+    counts = _project_task_counts(project)
+    project["task_counts"] = counts
+    project["updated_at"] = time.time()
+    current = str(project.get("status") or "draft")
+    if current in ("draft", "starting", "error"):
+        return
+    total = len(project.get("tasks") or {})
+    if total > 0 and counts["completed"] == total:
+        project["status"] = "completed"
+    elif counts["failed"] > 0 and counts["assigned"] == 0 and counts["ready"] == 0:
+        project["status"] = "attention"
+    else:
+        project["status"] = "running"
+
+
+def _project_snapshot():
+    with SCHEDULER_LOCK:
+        snapshot = copy.deepcopy(PROJECTS)
+    for project in snapshot.values():
+        _refresh_project_status(project)
+    return snapshot
+
+
+def _emit_projects_updated():
+    emit_event("projects_updated", {
+        "projects": _project_snapshot()
+    })
+
+
+def _normalize_graph_from_parsed_payload(parsed):
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("tasks"), list):
+            return parsed
+        if isinstance(parsed.get("graph"), dict) and isinstance(parsed["graph"].get("tasks"), list):
+            return parsed["graph"]
+    if isinstance(parsed, list):
+        return {"tasks": parsed}
+    return None
+
+
+def _beads_cli_path():
+    return shutil.which("bd") or shutil.which("beads")
+
+
+def _beads_env():
+    env = os.environ.copy()
+    home_override = str(os.environ.get("CODESWARM_BEADS_HOME") or "").strip()
+    if home_override:
+        env["HOME"] = home_override
+    return env
+
+
+def _run_beads(repo_path, args, input_text=None):
+    cli = _beads_cli_path()
+    if not cli:
+        return None, "bd CLI not installed"
+    try:
+        completed = subprocess.run(
+            [cli, *args],
+            cwd=str(repo_path),
+            input=input_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=_beads_env(),
+        )
+    except Exception as e:
+        return None, str(e)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+        return None, detail
+    return completed, None
+
+
+def _parse_json_output(text):
+    if not isinstance(text, str):
+        return None
+    snippet = text.strip()
+    if not snippet:
+        return None
+    for start_char in ("{", "["):
+        start = snippet.find(start_char)
+        if start >= 0:
+            try:
+                return json.loads(snippet[start:])
+            except Exception:
+                continue
+    return None
+
+
+def _beads_safe_prefix(repo_path):
+    name = Path(str(repo_path or "")).name or "codeswarm"
+    token = re.sub(r"[^a-zA-Z0-9]+", "-", name.lower()).strip("-")
+    if not token:
+        token = "codeswarm"
+    if not token[0].isalpha():
+        token = f"p-{token}"
+    return token[:40]
+
+
+def _project_beads_status(project):
+    status = str(project.get("beads_sync_status") or "").strip()
+    return status or "disabled"
+
+
+def _project_beads_available(project):
+    return _project_beads_status(project) not in ("disabled", "unavailable")
+
+
+def _set_project_beads_status(project, status, error=None):
+    project["beads_sync_status"] = str(status)
+    project["beads_last_error"] = str(error).strip() if error else None
+    project["updated_at"] = time.time()
+
+
+def _set_task_beads_status(task, status, error=None):
+    task["beads_sync_status"] = str(status)
+    task["beads_last_error"] = str(error).strip() if error else None
+    task["updated_at"] = time.time()
+
+
+def _ensure_beads_repo(project):
+    repo_path = str(project.get("repo_path") or "").strip()
+    if not repo_path:
+        return None, "missing repo_path"
+    repo_dir = Path(repo_path)
+    if not repo_dir.exists() or not repo_dir.is_dir():
+        return None, f"repo_path does not exist: {repo_path}"
+    where_result, where_error = _run_beads(repo_dir, ["where", "--json"])
+    if where_result:
+        parsed = _parse_json_output(where_result.stdout)
+        if isinstance(parsed, dict):
+            return parsed, None
+    init_args = [
+        "init",
+        "--skip-hooks",
+        "--skip-agents",
+        "-p",
+        _beads_safe_prefix(repo_dir),
+    ]
+    _, init_error = _run_beads(repo_dir, init_args)
+    if init_error:
+        return None, init_error if where_error is None else f"{where_error}; {init_error}"
+    where_result, where_error = _run_beads(repo_dir, ["where", "--json"])
+    if not where_result:
+        return None, where_error or "beads repo initialized but location lookup failed"
+    parsed = _parse_json_output(where_result.stdout)
+    if not isinstance(parsed, dict):
+        return None, "unable to parse `bd where --json` output"
+    return parsed, None
+
+
+def _build_project_beads_description(project):
+    repo_path = str(project.get("repo_path") or "").strip()
+    base_branch = str(project.get("base_branch") or "main").strip() or "main"
+    workspace_subdir = str(project.get("workspace_subdir") or "repo").strip() or "repo"
+    return (
+        "Codeswarm orchestrated project.\n\n"
+        f"Project ID: {project.get('project_id')}\n"
+        f"Repository: {repo_path}\n"
+        f"Base branch: {base_branch}\n"
+        f"Worker workspace subdir: {workspace_subdir}\n"
+    )
+
+
+def _build_task_beads_description(task):
+    prompt = str(task.get("prompt") or "").strip()
+    acceptance = task.get("acceptance_criteria") or []
+    depends_on = task.get("depends_on") or []
+    owned_paths = task.get("owned_paths") or []
+    expected_touch_paths = task.get("expected_touch_paths") or []
+    sections = [
+        f"Codeswarm task ID: {task.get('task_id')}",
+        "",
+        "Prompt:",
+        prompt or "(no prompt provided)",
+    ]
+    if acceptance:
+        sections.extend(["", "Acceptance criteria:"])
+        sections.extend(f"- {item}" for item in acceptance if str(item).strip())
+    if depends_on:
+        sections.extend(["", "Depends on:"])
+        sections.extend(f"- {item}" for item in depends_on if str(item).strip())
+    if owned_paths:
+        sections.extend(["", "Owned paths:"])
+        sections.extend(f"- {item}" for item in owned_paths if str(item).strip())
+    if expected_touch_paths:
+        sections.extend(["", "Expected touch paths:"])
+        sections.extend(f"- {item}" for item in expected_touch_paths if str(item).strip())
+    return "\n".join(sections)
+
+
+def _create_beads_issue(repo_path, title, issue_type, description, metadata, parent_id=None):
+    args = [
+        "create",
+        "--title",
+        str(title),
+        "--type",
+        str(issue_type),
+        "--description",
+        str(description),
+        "--metadata",
+        json.dumps(metadata, sort_keys=True),
+        "--json",
+    ]
+    if parent_id:
+        args.extend(["--parent", str(parent_id)])
+    result, error = _run_beads(repo_path, args)
+    if not result:
+        return None, error
+    parsed = _parse_json_output(result.stdout)
+    if not isinstance(parsed, dict) or not parsed.get("id"):
+        return None, "unable to parse `bd create --json` output"
+    return parsed, None
+
+
+def _sync_project_to_beads(project):
+    if str(os.environ.get("CODESWARM_DISABLE_BEADS_SYNC") or "").strip().lower() in ("1", "true", "yes", "on"):
+        _set_project_beads_status(project, "disabled")
+        return
+    cli = _beads_cli_path()
+    if not cli:
+        _set_project_beads_status(project, "unavailable", "bd CLI not installed")
+        return
+
+    location, location_error = _ensure_beads_repo(project)
+    if location_error:
+        _set_project_beads_status(project, "warning", location_error)
+        return
+
+    project["beads_repo_path"] = location.get("path")
+    project["beads_prefix"] = location.get("prefix")
+    project["beads_db_path"] = location.get("database_path")
+
+    root_id = str(project.get("beads_root_id") or "").strip()
+    if not root_id:
+        created, create_error = _create_beads_issue(
+            project.get("repo_path"),
+            project.get("title") or f"Project {project.get('project_id')}",
+            "epic",
+            _build_project_beads_description(project),
+            {
+                "codeswarm_project_id": project.get("project_id"),
+                "repo_path": project.get("repo_path"),
+                "base_branch": project.get("base_branch"),
+                "workspace_subdir": project.get("workspace_subdir"),
+            },
+        )
+        if create_error:
+            _set_project_beads_status(project, "warning", create_error)
+            return
+        root_id = str(created.get("id") or "").strip()
+        project["beads_root_id"] = root_id
+
+    task_errors = []
+    tasks = project.get("tasks") or {}
+    for task_id in project.get("task_order") or list(tasks.keys()):
+        task = tasks.get(task_id)
+        if not isinstance(task, dict):
+            continue
+        beads_id = str(task.get("beads_id") or "").strip()
+        if not beads_id:
+            created, create_error = _create_beads_issue(
+                project.get("repo_path"),
+                task.get("title") or task_id,
+                "task",
+                _build_task_beads_description(task),
+                {
+                    "codeswarm_project_id": project.get("project_id"),
+                    "codeswarm_task_id": task_id,
+                    "base_branch": project.get("base_branch"),
+                },
+                parent_id=root_id or None,
+            )
+            if create_error:
+                task_errors.append(f"{task_id}: {create_error}")
+                _set_task_beads_status(task, "warning", create_error)
+                continue
+            beads_id = str(created.get("id") or "").strip()
+            task["beads_id"] = beads_id
+        synced_deps = set()
+        raw_synced_deps = task.get("beads_dependencies_synced")
+        if isinstance(raw_synced_deps, list):
+            synced_deps = {str(item) for item in raw_synced_deps if str(item).strip()}
+        for dep_id in task.get("depends_on") or []:
+            blocker = tasks.get(dep_id) or {}
+            blocker_beads_id = str(blocker.get("beads_id") or "").strip()
+            if not blocker_beads_id or not beads_id or dep_id in synced_deps:
+                continue
+            _, dep_error = _run_beads(project.get("repo_path"), ["dep", blocker_beads_id, "--blocks", beads_id])
+            if dep_error:
+                task_errors.append(f"{task_id}: {dep_error}")
+                _set_task_beads_status(task, "warning", dep_error)
+                continue
+            synced_deps.add(str(dep_id))
+        task["beads_dependencies_synced"] = sorted(synced_deps)
+        if task.get("beads_id"):
+            _set_task_beads_status(task, "synced")
+
+    if task_errors:
+        _set_project_beads_status(project, "partial", "; ".join(task_errors[:3]))
+    else:
+        _set_project_beads_status(project, "synced")
+
+
+def _sync_task_status_to_beads(project, task):
+    if not project or not task or not _project_beads_available(project):
+        return
+    beads_id = str(task.get("beads_id") or "").strip()
+    if not beads_id:
+        return
+    repo_path = project.get("repo_path")
+    task_status = str(task.get("status") or "").strip().lower()
+    result_status = str(task.get("result_status") or "").strip().lower()
+    branch = str(task.get("branch") or "").strip()
+
+    if task_status == "assigned":
+        _, error = _run_beads(repo_path, ["update", beads_id, "--status", "in_progress"])
+        if error:
+            _set_task_beads_status(task, "warning", error)
+        else:
+            _set_task_beads_status(task, "synced")
+        return
+
+    if task_status == "completed":
+        reason = f"Completed by Codeswarm on branch {branch or 'n/a'}"
+        _, error = _run_beads(repo_path, ["close", beads_id, "--reason", reason])
+        if error:
+            _set_task_beads_status(task, "warning", error)
+        else:
+            _set_task_beads_status(task, "closed")
+        return
+
+    if task_status == "failed":
+        note = str(task.get("last_error") or result_status or "Task requires attention").strip()
+        _, error = _run_beads(repo_path, ["update", beads_id, "--status", "blocked", "--append-notes", note])
+        if error:
+            _set_task_beads_status(task, "warning", error)
+        else:
+            _set_task_beads_status(task, "synced")
+
+
+def _parse_task_graph_json_block(text):
+    if not isinstance(text, str):
+        return None
+    marker = "TASK_GRAPH_JSON"
+    marker_positions = [match.start() for match in re.finditer(re.escape(marker), text)]
+    if not marker_positions:
+        return None
+
+    best_graph = None
+    for idx, marker_idx in enumerate(marker_positions):
+        next_idx = marker_positions[idx + 1] if idx + 1 < len(marker_positions) else len(text)
+        snippet = text[marker_idx + len(marker):next_idx].strip()
+        if not snippet:
+            continue
+
+        candidates = []
+        fence_matches = list(re.finditer(r"```json\s*([\s\S]+?)```", snippet, re.IGNORECASE))
+        for fence_match in fence_matches:
+            fenced = fence_match.group(1).strip()
+            if fenced:
+                candidates.append(fenced)
+        if not candidates:
+            candidates.append(snippet)
+
+        for raw_json in candidates:
+            try:
+                parsed = json.loads(raw_json)
+            except Exception:
+                continue
+            graph = _normalize_graph_from_parsed_payload(parsed)
+            if not graph:
+                continue
+            tasks = graph.get("tasks")
+            if isinstance(tasks, list) and tasks:
+                best_graph = graph
+            elif best_graph is None:
+                best_graph = graph
+
+    return best_graph
+
+
+def _create_project_record(
+    title,
+    repo_path,
+    worker_swarm_ids,
+    raw_tasks,
+    base_branch="main",
+    workspace_subdir="repo",
+):
+    if not title or not repo_path:
+        raise RuntimeError("project requires title and repo_path")
+    if not isinstance(worker_swarm_ids, list) or not worker_swarm_ids:
+        raise RuntimeError("project requires worker_swarm_ids")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise RuntimeError("project requires at least one task")
+
+    normalized_swarm_ids = []
+    missing_swarms = []
+    for item in worker_swarm_ids:
+        swarm_id = str(item)
+        if swarm_id not in SWARMS:
+            missing_swarms.append(swarm_id)
+        else:
+            normalized_swarm_ids.append(swarm_id)
+    if missing_swarms:
+        raise RuntimeError(f"unknown worker_swarm_ids: {', '.join(missing_swarms)}")
+
+    tasks = {}
+    task_order = []
+    for idx, raw_task in enumerate(raw_tasks):
+        task = _normalize_task_payload(raw_task, idx)
+        task_id = task["task_id"]
+        if task_id in tasks:
+            raise RuntimeError(f"Duplicate task_id: {task_id}")
+        tasks[task_id] = task
+        task_order.append(task_id)
+    for task_id, task in tasks.items():
+        missing = [dep_id for dep_id in task.get("depends_on") or [] if dep_id not in tasks]
+        if missing:
+            raise RuntimeError(f"Task {task_id} references unknown dependencies: {', '.join(missing)}")
+
+    project_id = str(uuid.uuid4())
+    now = time.time()
+    project = {
+        "project_id": project_id,
+        "title": str(title),
+        "repo_path": str(repo_path),
+        "base_branch": str(base_branch or "main"),
+        "worker_swarm_ids": normalized_swarm_ids,
+        "status": "draft",
+        "workspace_subdir": str(workspace_subdir or "repo"),
+        "repo_preparation": {},
+        "task_order": task_order,
+        "tasks": tasks,
+        "beads_sync_status": "pending",
+        "beads_last_error": None,
+        "beads_repo_path": None,
+        "beads_prefix": None,
+        "beads_db_path": None,
+        "beads_root_id": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    _refresh_project_status(project)
+    _sync_project_to_beads(project)
+    with SCHEDULER_LOCK:
+        PROJECTS[project_id] = project
+    save_state()
+    _emit_projects_updated()
+    return project
+
+
+def _build_project_plan_prompt(title, repo_path, spec_text, base_branch):
+    return (
+        "You are the planning swarm for an orchestrated project.\n"
+        "Decompose the specification into implementation-ready tasks for the referenced repository.\n"
+        "Each task must include task_id, title, prompt, acceptance_criteria, depends_on, and optional owned_paths.\n"
+        "Do not return an empty task list.\n"
+        "If the specification requires an exact task count, produce exactly that many tasks.\n"
+        "Do not use generic graph schemas such as `nodes` and `edges`.\n"
+        "Your final answer must begin with `TASK_GRAPH_JSON` on its own line.\n"
+        "The JSON top-level object must contain a `tasks` array.\n\n"
+        f"Project title: {title}\n"
+        f"Repository path: {repo_path}\n"
+        f"Base branch: {base_branch or 'main'}\n\n"
+        "Specification:\n"
+        f"{spec_text}\n\n"
+        "Return the task graph as JSON using this exact header and a JSON code fence:\n"
+        "TASK_GRAPH_JSON\n"
+        "```json\n"
+        "{\n"
+        "  \"tasks\": [\n"
+        "    {\n"
+        "      \"task_id\": \"T-001\",\n"
+        "      \"title\": \"...\",\n"
+        "      \"prompt\": \"...\",\n"
+        "      \"acceptance_criteria\": [\"...\"],\n"
+        "      \"depends_on\": [],\n"
+        "      \"owned_paths\": [\"optional/path\"]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```\n"
+    )
+
+
+def _record_project_plan_result(plan_id, data):
+    with SCHEDULER_LOCK:
+        plan = PENDING_PROJECT_PLANS.get(str(plan_id))
+    if not plan:
+        return
+    raw_text = _extract_text_content(data.get("last_agent_message")) or ""
+    graph = _parse_task_graph_json_block(raw_text)
+    if not graph or not isinstance(graph.get("tasks"), list):
+        with SCHEDULER_LOCK:
+            current = PENDING_PROJECT_PLANS.get(str(plan_id))
+            if current:
+                current["status"] = "failed"
+                current["last_error"] = "TASK_GRAPH_JSON block missing or malformed"
+                current["updated_at"] = time.time()
+        emit_event("project_plan_failed", {
+            "plan_id": plan_id,
+            "reason": "TASK_GRAPH_JSON block missing or malformed",
+        })
+        save_state()
+        return
+    if not graph.get("tasks"):
+        with SCHEDULER_LOCK:
+            current = PENDING_PROJECT_PLANS.get(str(plan_id))
+            if current:
+                current["status"] = "failed"
+                current["last_error"] = "TASK_GRAPH_JSON must contain at least one task"
+                current["updated_at"] = time.time()
+        emit_event("project_plan_failed", {
+            "plan_id": plan_id,
+            "reason": "TASK_GRAPH_JSON must contain at least one task",
+        })
+        save_state()
+        return
+    try:
+        project = _create_project_record(
+            plan.get("title"),
+            plan.get("repo_path"),
+            plan.get("worker_swarm_ids") or [],
+            graph.get("tasks") or [],
+            base_branch=plan.get("base_branch") or "main",
+            workspace_subdir=plan.get("workspace_subdir") or "repo",
+        )
+        emit_event("project_created", {
+            "request_id": plan.get("request_id"),
+            "project_id": project.get("project_id"),
+            "title": project.get("title"),
+        })
+        emit_event("project_plan_completed", {
+            "plan_id": plan_id,
+            "project_id": project.get("project_id"),
+        })
+        auto_start = bool(plan.get("auto_start"))
+        with SCHEDULER_LOCK:
+            PENDING_PROJECT_PLANS.pop(str(plan_id), None)
+        save_state()
+        if auto_start:
+            with SCHEDULER_LOCK:
+                project_ref = PROJECTS.get(str(project.get("project_id")))
+                if project_ref:
+                    project_ref["status"] = "starting"
+                    project_ref["updated_at"] = time.time()
+            _emit_projects_updated()
+            save_state()
+            _start_project_async(project.get("project_id"), plan.get("request_id") or str(uuid.uuid4()))
+    except Exception as e:
+        with SCHEDULER_LOCK:
+            current = PENDING_PROJECT_PLANS.get(str(plan_id))
+            if current:
+                current["status"] = "failed"
+                current["last_error"] = str(e)
+                current["updated_at"] = time.time()
+        emit_event("project_plan_failed", {
+            "plan_id": plan_id,
+            "reason": str(e),
+        })
+        save_state()
+
+
+def _dispatch_pending_project_plans(config):
+    with SCHEDULER_LOCK:
+        pending_ids = [
+            plan_id
+            for plan_id, plan in PENDING_PROJECT_PLANS.items()
+            if isinstance(plan, dict) and str(plan.get("status") or "").strip().lower() == "queued"
+        ]
+
+    for plan_id in pending_ids:
+        with SCHEDULER_LOCK:
+            plan = PENDING_PROJECT_PLANS.get(str(plan_id))
+            if not isinstance(plan, dict) or str(plan.get("status") or "").strip().lower() != "queued":
+                continue
+        planner_swarm_id = str(plan.get("planner_swarm_id") or "").strip()
+        planner_swarm = SWARMS.get(planner_swarm_id)
+        if not planner_swarm:
+            with SCHEDULER_LOCK:
+                current = PENDING_PROJECT_PLANS.get(str(plan_id))
+                if current:
+                    current["status"] = "failed"
+                    current["last_error"] = "unknown planner_swarm_id"
+                    current["updated_at"] = time.time()
+            emit_event("project_plan_failed", {
+                "plan_id": plan_id,
+                "reason": "unknown planner_swarm_id",
+            })
+            save_state()
+            continue
+        planner_provider = _provider_for_swarm(planner_swarm_id)
+        if not planner_provider:
+            continue
+        planner_node_id = _first_quiescent_node_id(planner_swarm_id)
+        if planner_node_id is None:
+            continue
+
+        prompt = str(plan.get("prompt") or "").strip()
+        if not prompt:
+            prompt = _build_project_plan_prompt(
+                plan.get("title"),
+                plan.get("repo_path"),
+                plan.get("spec"),
+                plan.get("base_branch") or "main",
+            )
+
+        _mark_outstanding(planner_swarm_id, planner_node_id, +1)
+        success, injection_id, error = perform_injection(
+            config,
+            planner_provider,
+            plan.get("request_id") or str(uuid.uuid4()),
+            planner_swarm_id,
+            str(planner_swarm.get("job_id")),
+            int(planner_node_id),
+            prompt,
+            count_outstanding=False,
+        )
+        if not success:
+            _mark_outstanding(planner_swarm_id, planner_node_id, -1)
+            with SCHEDULER_LOCK:
+                current = PENDING_PROJECT_PLANS.get(str(plan_id))
+                if current:
+                    current["status"] = "failed"
+                    current["last_error"] = error or "planner injection failed"
+                    current["updated_at"] = time.time()
+            emit_event("project_plan_failed", {
+                "plan_id": plan_id,
+                "reason": error or "planner injection failed",
+            })
+            save_state()
+            continue
+
+        with SCHEDULER_LOCK:
+            current = PENDING_PROJECT_PLANS.get(str(plan_id))
+            if current:
+                current["status"] = "planning"
+                current["planner_node_id"] = planner_node_id
+                current["injection_id"] = injection_id
+                current["updated_at"] = time.time()
+                current["prompt"] = prompt
+        save_state()
+        emit_event("project_plan_started", {
+            "request_id": plan.get("request_id"),
+            "plan_id": plan_id,
+            "planner_swarm_id": planner_swarm_id,
+            "planner_node_id": planner_node_id,
+            "injection_id": injection_id,
+        })
+
+
+def _normalize_task_payload(raw_task, index):
+    if not isinstance(raw_task, dict):
+        raise RuntimeError(f"Task #{index + 1} must be an object")
+    task_id = raw_task.get("task_id") or raw_task.get("id") or f"T-{index + 1:03d}"
+    title = str(raw_task.get("title") or "").strip()
+    prompt = str(raw_task.get("prompt") or "").strip()
+    if not title:
+        raise RuntimeError(f"Task {task_id} is missing title")
+    if not prompt:
+        raise RuntimeError(f"Task {task_id} is missing prompt")
+    acceptance = raw_task.get("acceptance_criteria")
+    depends_on = raw_task.get("depends_on")
+    owned_paths = raw_task.get("owned_paths")
+    expected_touch_paths = raw_task.get("expected_touch_paths")
+    now = time.time()
+    return {
+        "task_id": str(task_id),
+        "title": title,
+        "prompt": prompt,
+        "acceptance_criteria": acceptance if isinstance(acceptance, list) else [],
+        "depends_on": [str(item) for item in (depends_on if isinstance(depends_on, list) else [])],
+        "owned_paths": [str(item) for item in (owned_paths if isinstance(owned_paths, list) else [])],
+        "expected_touch_paths": [str(item) for item in (expected_touch_paths if isinstance(expected_touch_paths, list) else [])],
+        "status": "pending",
+        "attempts": 0,
+        "assigned_swarm_id": None,
+        "assigned_node_id": None,
+        "assignment_injection_id": None,
+        "branch": None,
+        "result_status": None,
+        "result_raw": None,
+        "last_error": None,
+        "beads_id": None,
+        "beads_sync_status": "pending",
+        "beads_last_error": None,
+        "beads_dependencies_synced": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _extract_text_content(value):
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "content"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested
+        parts = []
+        for item in value.values():
+            text = _extract_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            text = _extract_text_content(item)
+            if text:
+                parts.append(text)
+        return "\n".join(part for part in parts if part)
+    return ""
+
+
+def _parse_task_result_block(text):
+    if not isinstance(text, str):
+        return None
+    lines = text.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        if line.strip() == "TASK_RESULT":
+            start = idx + 1
+            break
+    if start is None:
+        return None
+    parsed = {}
+    current_key = None
+    for raw_line in lines[start:]:
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        if re.match(r"^[A-Z_]+$", line.strip()):
+            break
+        if line.lstrip().startswith("- ") and current_key:
+            parsed.setdefault(current_key, [])
+            parsed[current_key].append(line.lstrip()[2:].strip())
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        current_key = key.strip().lower().replace("-", "_")
+        value = value.strip()
+        if current_key in ("files_changed", "verification"):
+            parsed[current_key] = [value] if value else []
+        else:
+            parsed[current_key] = value
+    return parsed if parsed else None
+
+
+def _build_project_task_prompt(project, task):
+    project_token = _sanitize_branch_token(project.get("project_id"))
+    task_token = _sanitize_branch_token(task.get("task_id"))
+    branch_name = f"codeswarm/{project_token}/{task_token}"
+    acceptance_lines = "\n".join(
+        f"- {item}" for item in (task.get("acceptance_criteria") or []) if str(item).strip()
+    ) or "- Satisfy the task prompt and describe any verification you ran."
+    dependency_lines = "\n".join(
+        f"- {item}" for item in (task.get("depends_on") or []) if str(item).strip()
+    ) or "- none"
+    repo_subdir = str(project.get("workspace_subdir") or "repo").strip() or "repo"
+    prompt = str(task.get("prompt") or "").strip()
+    return (
+        f"You are executing orchestrated project task {task.get('task_id')}.\n\n"
+        f"Project: {project.get('title')}\n"
+        f"Repository workspace: ./{repo_subdir}\n"
+        f"Base branch: {project.get('base_branch') or 'current checkout'}\n"
+        f"Working branch to create/use: {branch_name}\n\n"
+        f"Task title: {task.get('title')}\n"
+        f"Task prompt:\n{prompt}\n\n"
+        f"Dependencies:\n{dependency_lines}\n\n"
+        f"Acceptance criteria:\n{acceptance_lines}\n\n"
+        "Operate only on this task's scope. If you need to run commands or edit files, work inside the repository workspace.\n"
+        f"Use or create the branch `{branch_name}` in the repository workspace before making changes.\n"
+        "Commit your changes on that branch. If git user identity is missing, configure repository-local user.name and user.email first.\n"
+        "If the repository has an origin remote, push the branch with upstream tracking before you finish.\n"
+        "Your final answer must be the TASK_RESULT block only, with no extra prose before or after it.\n"
+        "Return a structured result using this exact header and keys:\n\n"
+        "TASK_RESULT\n"
+        f"task_id: {task.get('task_id')}\n"
+        "status: done|blocked|failed|needs_followups\n"
+        f"branch: {branch_name}\n"
+        "base_commit: <commit>\n"
+        "head_commit: <commit>\n"
+        "files_changed:\n"
+        "- <path>\n"
+        "verification:\n"
+        "- <command or check>\n"
+        "notes: <short summary>\n"
+    )
+
+
+def _find_project_and_task_by_injection(injection_id):
+    if not isinstance(injection_id, str) or not injection_id:
+        return None, None
+    with SCHEDULER_LOCK:
+        for project_id, project in PROJECTS.items():
+            for task_id, task in (project.get("tasks") or {}).items():
+                if task.get("assignment_injection_id") == injection_id:
+                    return project_id, task_id
+    return None, None
+
+
+def _find_pending_project_plan_by_injection(injection_id):
+    if not isinstance(injection_id, str) or not injection_id:
+        return None
+    with SCHEDULER_LOCK:
+        for plan_id, plan in PENDING_PROJECT_PLANS.items():
+            if isinstance(plan, dict) and plan.get("injection_id") == injection_id:
+                return plan_id
+    return None
+
+
+def _project_first_idle_target(project):
+    worker_swarm_ids = project.get("worker_swarm_ids") or []
+    for swarm_id in worker_swarm_ids:
+        swarm = SWARMS.get(str(swarm_id))
+        if not swarm or swarm.get("status") in ("terminating", "terminated"):
+            continue
+        node_id = _first_idle_node_id(str(swarm_id))
+        if node_id is not None:
+            return str(swarm_id), int(node_id)
+    return None, None
+
+
+def _record_project_task_result(project_id, task_id, data):
+    project_ref = None
+    task_ref = None
+    with SCHEDULER_LOCK:
+        project = PROJECTS.get(str(project_id))
+        if not project:
+            return
+        task = (project.get("tasks") or {}).get(str(task_id))
+        if not task:
+            return
+        raw_text = _extract_text_content(data.get("last_agent_message")) or ""
+        parsed = _parse_task_result_block(raw_text)
+        task["result_raw"] = raw_text
+        task["updated_at"] = time.time()
+        task["assigned_swarm_id"] = None
+        task["assigned_node_id"] = None
+        task["assignment_injection_id"] = None
+        task["branch"] = parsed.get("branch") if isinstance(parsed, dict) else task.get("branch")
+        if not parsed:
+            task["status"] = "failed"
+            task["result_status"] = "invalid_result"
+            task["last_error"] = "TASK_RESULT block missing or malformed"
+        else:
+            result_status = str(parsed.get("status") or "").strip().lower()
+            task["result_status"] = result_status or "unknown"
+            if result_status == "done":
+                task["status"] = "completed"
+                task["last_error"] = None
+            elif result_status in ("blocked", "failed", "needs_followups"):
+                task["status"] = "failed"
+                task["last_error"] = parsed.get("notes") or result_status
+            else:
+                task["status"] = "failed"
+                task["last_error"] = "Unrecognized TASK_RESULT status"
+        _refresh_project_status(project)
+        project_ref = project
+        task_ref = task
+    _sync_task_status_to_beads(project_ref, task_ref)
+    _emit_projects_updated()
+    save_state()
+
+
+def _start_project_async(project_id, request_id):
+    project = PROJECTS.get(str(project_id))
+    if not project:
+        emit_event("command_rejected", {
+            "request_id": request_id,
+            "reason": "unknown project_id",
+        })
+        return
+
+    def _run_project_start():
+        try:
+            current = PROJECTS.get(str(project_id))
+            if current:
+                _sync_project_to_beads(current)
+            preparation = {}
+            for swarm_id in project.get("worker_swarm_ids") or []:
+                swarm = SWARMS.get(str(swarm_id))
+                provider = _provider_for_swarm(str(swarm_id))
+                if not swarm or not provider:
+                    raise RuntimeError(f"worker swarm unavailable: {swarm_id}")
+                prepared = provider.prepare_repository(
+                    str(swarm.get("job_id")),
+                    str(project.get("repo_path")),
+                    branch=project.get("base_branch"),
+                    subdir=project.get("workspace_subdir") or "repo",
+                )
+                preparation[str(swarm_id)] = prepared
+            with SCHEDULER_LOCK:
+                current = PROJECTS.get(str(project_id))
+                if not current:
+                    return
+                current["repo_preparation"] = preparation
+                current["status"] = "running"
+                _refresh_project_status(current)
+            emit_event("project_started", {
+                "request_id": request_id,
+                "project_id": project_id,
+                "status": "running",
+            })
+            _emit_projects_updated()
+            save_state()
+            _dispatch_project_tasks(config=None)
+        except Exception as e:
+            with SCHEDULER_LOCK:
+                current = PROJECTS.get(str(project_id))
+                if current:
+                    current["status"] = "error"
+                    current["last_error"] = str(e)
+                    current["updated_at"] = time.time()
+            emit_event("command_rejected", {
+                "request_id": request_id,
+                "reason": str(e),
+            })
+            _emit_projects_updated()
+            save_state()
+
+    threading.Thread(target=_run_project_start, daemon=True).start()
+
+
+def _dispatch_project_tasks(config):
+    scheduled = False
+    with SCHEDULER_LOCK:
+        project_ids = list(PROJECTS.keys())
+    for project_id in project_ids:
+        while True:
+            with SCHEDULER_LOCK:
+                project = PROJECTS.get(str(project_id))
+                if not project or project.get("status") != "running":
+                    break
+                ready_task = None
+                for task_id in project.get("task_order") or list((project.get("tasks") or {}).keys()):
+                    task = (project.get("tasks") or {}).get(task_id)
+                    if task and _project_task_is_ready(project, task_id):
+                        ready_task = task
+                        break
+                if not ready_task:
+                    _refresh_project_status(project)
+                    break
+            swarm_id, node_id = _project_first_idle_target(project)
+            if swarm_id is None or node_id is None:
+                break
+            swarm = SWARMS.get(str(swarm_id))
+            provider = _provider_for_swarm(str(swarm_id))
+            if not swarm or not provider:
+                break
+            task_prompt = _build_project_task_prompt(project, ready_task)
+            request_id = f"project:{project_id}:{ready_task.get('task_id')}:{uuid.uuid4().hex[:8]}"
+            branch_name = f"codeswarm/{_sanitize_branch_token(project_id)}/{_sanitize_branch_token(ready_task.get('task_id'))}"
+            _mark_outstanding(str(swarm_id), node_id, +1)
+            success, injection_id, error = perform_injection(
+                config,
+                provider,
+                request_id,
+                str(swarm_id),
+                str(swarm.get("job_id")),
+                int(node_id),
+                task_prompt,
+                count_outstanding=False,
+            )
+            if not success:
+                _mark_outstanding(str(swarm_id), node_id, -1)
+                with SCHEDULER_LOCK:
+                    current_project = PROJECTS.get(str(project_id))
+                    if current_project:
+                        task = (current_project.get("tasks") or {}).get(str(ready_task.get("task_id")))
+                        if task:
+                            task["status"] = "failed"
+                            task["last_error"] = error or "project injection failed"
+                            task["updated_at"] = time.time()
+                            _refresh_project_status(current_project)
+                _emit_projects_updated()
+                save_state()
+                break
+            project_ref = None
+            task_ref = None
+            with SCHEDULER_LOCK:
+                current_project = PROJECTS.get(str(project_id))
+                if current_project:
+                    task = (current_project.get("tasks") or {}).get(str(ready_task.get("task_id")))
+                    if task:
+                        task["status"] = "assigned"
+                        task["attempts"] = int(task.get("attempts") or 0) + 1
+                        task["assigned_swarm_id"] = str(swarm_id)
+                        task["assigned_node_id"] = int(node_id)
+                        task["assignment_injection_id"] = injection_id
+                        task["branch"] = branch_name
+                        task["last_error"] = None
+                        task["updated_at"] = time.time()
+                        _refresh_project_status(current_project)
+                        project_ref = current_project
+                        task_ref = task
+            _sync_task_status_to_beads(project_ref, task_ref)
+            scheduled = True
+            _emit_projects_updated()
+            save_state()
+    return scheduled
+
+
 def _node_key(swarm_id, node_id):
     return (str(swarm_id), int(node_id))
 
@@ -1338,6 +2467,37 @@ def _first_idle_node_id(swarm_id):
     if fallback_node is not None:
         return fallback_node
     return None
+
+
+def _first_quiescent_node_id(swarm_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return None
+    node_count = int(swarm.get("node_count") or 0)
+    for node_id in range(node_count):
+        if _is_node_quiescent(swarm_id, node_id):
+            return node_id
+    return None
+
+
+def _first_available_node_id(swarm_id):
+    swarm = SWARMS.get(str(swarm_id))
+    if not swarm:
+        return None
+    node_count = int(swarm.get("node_count") or 0)
+    if node_count <= 0:
+        return None
+    best_node = None
+    best_score = None
+    for node_id in range(node_count):
+        key = _node_key(swarm_id, node_id)
+        outstanding = int(NODE_OUTSTANDING.get(key, 0))
+        active = 1 if bool(NODE_THREAD_ACTIVE.get(key, False)) else 0
+        score = (outstanding, active, node_id)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_node = node_id
+    return best_node
 
 
 def _is_node_quiescent(swarm_id, node_id):
@@ -3133,6 +4293,7 @@ def translate_event(event):
 import queue
 COMMAND_QUEUE = queue.Queue()
 TCP_CLIENTS = []
+TCP_CLIENTS_LOCK = threading.Lock()
 
 def run_daemon(config, providers):
     global ACTIVE_PROVIDER
@@ -3142,8 +4303,8 @@ def run_daemon(config, providers):
     import socket, sys
 
     def tcp_server():
-        host = "127.0.0.1"
-        port = 8765
+        host = str(os.environ.get("CODESWARM_ROUTER_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+        port = int(os.environ.get("CODESWARM_ROUTER_PORT") or 8765)
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -3154,16 +4315,23 @@ def run_daemon(config, providers):
 
         while True:
             conn, addr = server.accept()
+            conn.setblocking(False)
+            with TCP_CLIENTS_LOCK:
+                TCP_CLIENTS.append(conn)
             threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
 
     def handle_client(conn):
         print("CLIENT CONNECTED", file=sys.stderr, flush=True)
-        TCP_CLIENTS.append(conn)
         buffer = b""
         try:
             while True:
                 try:
                     chunk = conn.recv(4096)
+                except BlockingIOError:
+                    time.sleep(0.01)
+                    continue
+                except TimeoutError:
+                    continue
                 except ConnectionResetError:
                     break
 
@@ -3176,8 +4344,9 @@ def run_daemon(config, providers):
                     if decoded:
                         COMMAND_QUEUE.put(decoded)
         finally:
-            if conn in TCP_CLIENTS:
-                TCP_CLIENTS.remove(conn)
+            with TCP_CLIENTS_LOCK:
+                if conn in TCP_CLIENTS:
+                    TCP_CLIENTS.remove(conn)
             conn.close()
 
     threading.Thread(target=tcp_server, daemon=True).start()
@@ -3232,6 +4401,7 @@ def run_daemon(config, providers):
     debug_event("daemon_started")
     # Resume queued inter-swarm work after router restart.
     _dispatch_inter_swarm_queue(config)
+    _dispatch_project_tasks(config)
 
     while True:
         # Remove exited follower processes so EOF pipes do not cause a tight
@@ -3328,14 +4498,26 @@ def run_daemon(config, providers):
                                 NODE_OUTSTANDING[key] = 0
                         if status_type == "idle":
                             _dispatch_inter_swarm_queue(config)
+                            _dispatch_pending_project_plans(config)
+                            _dispatch_project_tasks(config)
                     if event_name == "turn_complete":
                         _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
                         _dispatch_inter_swarm_queue(config)
+                        _dispatch_pending_project_plans(config)
+                        _dispatch_project_tasks(config)
                     if event_name == "task_complete":
                         # Some traces emit task_complete without a matching turn_complete;
                         # reconcile outstanding count to avoid idle-queue starvation.
                         _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
+                        plan_id = _find_pending_project_plan_by_injection(data.get("injection_id"))
+                        if plan_id:
+                            _record_project_plan_result(plan_id, data)
+                        project_id, task_id = _find_project_and_task_by_injection(data.get("injection_id"))
+                        if project_id and task_id:
+                            _record_project_task_result(project_id, task_id, data)
                         _dispatch_inter_swarm_queue(config)
+                        _dispatch_pending_project_plans(config)
+                        _dispatch_project_tasks(config)
                     if event_name == "assistant" and bool(data.get("final_answer")):
                         final_key = (
                             str(data.get("swarm_id")),
@@ -3350,9 +4532,21 @@ def run_daemon(config, providers):
                                 node_id = data.get("node_id")
                                 if isinstance(node_id, int):
                                     NODE_THREAD_ACTIVE[_node_key(data.get("swarm_id"), node_id)] = False
+                        plan_id = _find_pending_project_plan_by_injection(data.get("injection_id"))
+                        if plan_id:
+                            _record_project_plan_result(plan_id, {
+                                "last_agent_message": data.get("content"),
+                            })
+                        project_id, task_id = _find_project_and_task_by_injection(data.get("injection_id"))
+                        if project_id and task_id:
+                            _record_project_task_result(project_id, task_id, {
+                                "last_agent_message": data.get("content"),
+                            })
                         if should_reconcile:
                             _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
                         _dispatch_inter_swarm_queue(config)
+                        _dispatch_pending_project_plans(config)
+                        _dispatch_project_tasks(config)
                     emit_event(event_name, data)
 
         for backend in dead_backends:
@@ -3480,7 +4674,13 @@ def run_daemon(config, providers):
                     "timestamp": time.time(),
                 })
 
-                def _launch_progress(stage, message):
+                def _launch_progress(
+                    stage,
+                    message,
+                    launch_request_id=launch_request_id,
+                    launch_provider_backend=launch_provider_backend,
+                    launch_provider_id=launch_provider_id,
+                ):
                     emit_event("swarm_launch_progress", {
                         "request_id": launch_request_id,
                         "provider": launch_provider_backend,
@@ -3490,7 +4690,19 @@ def run_daemon(config, providers):
                         "timestamp": time.time(),
                     })
 
-                def _run_launch():
+                def _run_launch(
+                    launch_provider_obj=launch_provider_obj,
+                    launch_nodes=launch_nodes,
+                    launch_agents_md_content=launch_agents_md_content,
+                    launch_agents_bundle=launch_agents_bundle,
+                    launch_effective_params=launch_effective_params,
+                    launch_request_id=launch_request_id,
+                    launch_system_prompt=launch_system_prompt,
+                    launch_provider_ref=launch_provider_ref,
+                    launch_provider_backend=launch_provider_backend,
+                    launch_provider_id=launch_provider_id,
+                    _launch_progress=_launch_progress,
+                ):
                     try:
                         job_id = launch_provider_obj.launch(
                             launch_nodes,
@@ -3659,6 +4871,136 @@ def run_daemon(config, providers):
                     "items": _queue_snapshot()
                 })
                 _emit_queue_updated()
+
+            elif command == "project_list":
+                emit_event("project_list", {
+                    "request_id": request_id,
+                    "projects": _project_snapshot(),
+                })
+                _emit_projects_updated()
+
+            elif command == "project_create":
+                title = str(payload.get("title") or "").strip()
+                repo_path = str(payload.get("repo_path") or "").strip()
+                worker_swarm_ids = payload.get("worker_swarm_ids")
+                raw_tasks = payload.get("tasks")
+                base_branch = str(payload.get("base_branch") or "main").strip() or "main"
+                workspace_subdir = str(payload.get("workspace_subdir") or "repo").strip() or "repo"
+                auto_start = bool(payload.get("auto_start"))
+                try:
+                    project = _create_project_record(
+                        title,
+                        repo_path,
+                        worker_swarm_ids,
+                        raw_tasks,
+                        base_branch=base_branch,
+                        workspace_subdir=workspace_subdir,
+                    )
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e),
+                    })
+                    continue
+                emit_event("project_created", {
+                    "request_id": request_id,
+                    "project_id": project.get("project_id"),
+                    "title": project.get("title"),
+                })
+                if auto_start:
+                    with SCHEDULER_LOCK:
+                        current = PROJECTS.get(str(project.get("project_id")))
+                        if current:
+                            current["status"] = "starting"
+                            current["updated_at"] = time.time()
+                    _emit_projects_updated()
+                    save_state()
+                    _start_project_async(project.get("project_id"), request_id)
+
+            elif command == "project_plan":
+                title = str(payload.get("title") or "").strip()
+                repo_path = str(payload.get("repo_path") or "").strip()
+                spec_text = str(payload.get("spec") or "").strip()
+                planner_swarm_id = str(payload.get("planner_swarm_id") or "").strip()
+                worker_swarm_ids = payload.get("worker_swarm_ids")
+                base_branch = str(payload.get("base_branch") or "main").strip() or "main"
+                workspace_subdir = str(payload.get("workspace_subdir") or "repo").strip() or "repo"
+                auto_start = bool(payload.get("auto_start"))
+
+                if not title or not repo_path or not spec_text or not planner_swarm_id:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "project_plan requires title, repo_path, spec, and planner_swarm_id",
+                    })
+                    continue
+                planner_swarm = SWARMS.get(planner_swarm_id)
+                if not planner_swarm:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown planner_swarm_id",
+                    })
+                    continue
+                planner_provider = _provider_for_swarm(planner_swarm_id)
+                if not planner_provider:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "provider unavailable for planner swarm",
+                    })
+                    continue
+                prompt = _build_project_plan_prompt(title, repo_path, spec_text, base_branch)
+                plan_id = str(uuid.uuid4())
+                with SCHEDULER_LOCK:
+                    PENDING_PROJECT_PLANS[plan_id] = {
+                        "plan_id": plan_id,
+                        "request_id": request_id,
+                        "title": title,
+                        "repo_path": repo_path,
+                        "spec": spec_text,
+                        "planner_swarm_id": planner_swarm_id,
+                        "planner_node_id": None,
+                        "worker_swarm_ids": worker_swarm_ids if isinstance(worker_swarm_ids, list) else [],
+                        "base_branch": base_branch,
+                        "workspace_subdir": workspace_subdir,
+                        "injection_id": None,
+                        "prompt": prompt,
+                        "auto_start": auto_start,
+                        "status": "queued",
+                        "created_at": time.time(),
+                        "updated_at": time.time(),
+                    }
+                save_state()
+                emit_event("project_plan_queued", {
+                    "request_id": request_id,
+                    "plan_id": plan_id,
+                    "planner_swarm_id": planner_swarm_id,
+                })
+                _dispatch_pending_project_plans(config)
+
+            elif command == "project_start":
+                project_id = str(payload.get("project_id") or "").strip()
+                project = PROJECTS.get(project_id)
+                if not project:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown project_id",
+                    })
+                    continue
+                if project.get("status") == "running":
+                    emit_event("project_started", {
+                        "request_id": request_id,
+                        "project_id": project_id,
+                        "status": "running",
+                    })
+                    _emit_projects_updated()
+                    _dispatch_project_tasks(config)
+                    continue
+
+                with SCHEDULER_LOCK:
+                    project["status"] = "starting"
+                    project["updated_at"] = time.time()
+                _emit_projects_updated()
+                save_state()
+                _start_project_async(project_id, request_id)
 
             elif command == "swarm_list":
                 emit_event("swarm_list", {

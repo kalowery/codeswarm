@@ -159,11 +159,59 @@ export interface PendingLaunchRecord {
   updated_at: number
 }
 
+export interface ProjectTaskRecord {
+  task_id: string
+  title: string
+  prompt: string
+  acceptance_criteria?: string[]
+  depends_on?: string[]
+  owned_paths?: string[]
+  expected_touch_paths?: string[]
+  status: string
+  attempts?: number
+  assigned_swarm_id?: string
+  assigned_node_id?: number
+  assignment_injection_id?: string
+  branch?: string
+  result_status?: string
+  result_raw?: string
+  last_error?: string
+  beads_id?: string
+  beads_sync_status?: string
+  beads_last_error?: string
+  created_at?: number
+  updated_at?: number
+}
+
+export interface ProjectRecord {
+  project_id: string
+  title: string
+  repo_path: string
+  base_branch?: string
+  worker_swarm_ids?: string[]
+  status: string
+  workspace_subdir?: string
+  task_order?: string[]
+  task_counts?: Record<string, number>
+  tasks: Record<string, ProjectTaskRecord>
+  created_at?: number
+  updated_at?: number
+  last_error?: string
+  beads_sync_status?: string
+  beads_last_error?: string
+  beads_repo_path?: string
+  beads_prefix?: string
+  beads_db_path?: string
+  beads_root_id?: string
+}
+
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
+  projects: Record<string, ProjectRecord>
   interSwarmQueue: InterSwarmQueueItem[]
   pendingLaunches: Record<string, PendingLaunchRecord>
   selectedSwarm?: string
+  selectedProject?: string
   pendingPrompt?: string
   launchError: string | null
   activeNodeBySwarm: Record<string, number>
@@ -175,10 +223,12 @@ interface SwarmStore {
   updatePendingLaunch: (request_id: string, update: Partial<PendingLaunchRecord>) => void
   removePendingLaunch: (request_id: string) => void
   setSwarms: (swarms: any[]) => void
+  setProjects: (projects: Record<string, ProjectRecord> | ProjectRecord[] | any) => void
   setInterSwarmQueue: (items: InterSwarmQueueItem[]) => void
   addOrUpdateSwarm: (swarm: SwarmRecord) => void
   removeSwarm: (swarm_id: string) => void
   selectSwarm: (swarm_id: string) => void
+  selectProject: (project_id?: string) => void
   handleMessage: (msg: any) => void
 }
 
@@ -561,9 +611,11 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
   return {
     swarms: {},
+    projects: {},
     interSwarmQueue: [],
     pendingLaunches: {},
     selectedSwarm: undefined,
+    selectedProject: undefined,
     pendingPrompt: undefined,
     launchError: null,
     activeNodeBySwarm: {},
@@ -675,6 +727,33 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       })
     },
 
+    setProjects: (projectsInput) => {
+      set((state) => {
+        const updated: Record<string, ProjectRecord> = {}
+        if (Array.isArray(projectsInput)) {
+          projectsInput.forEach((project) => {
+            if (project?.project_id) {
+              updated[project.project_id] = project
+            }
+          })
+        } else if (projectsInput && typeof projectsInput === 'object') {
+          Object.entries(projectsInput).forEach(([projectId, project]) => {
+            if (project && typeof project === 'object') {
+              updated[projectId] = project as ProjectRecord
+            }
+          })
+        }
+        const selectedProject =
+          state.selectedProject && updated[state.selectedProject]
+            ? state.selectedProject
+            : Object.keys(updated)[0]
+        return {
+          projects: updated,
+          selectedProject
+        }
+      })
+    },
+
     addOrUpdateSwarm: (swarm) => {
       set((state) => {
         const existing = state.swarms[swarm.swarm_id]
@@ -721,10 +800,17 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
 
     selectSwarm: (swarm_id) => set({ selectedSwarm: swarm_id }),
 
+    selectProject: (project_id) => set({ selectedProject: project_id }),
+
     handleMessage: (msg) => {
       const { type, payload } = msg
 
       if (shouldSuppressDuplicateEvent(type, payload)) {
+        return
+      }
+
+      if (type === 'project_list' || type === 'projects_updated') {
+        get().setProjects(payload?.projects ?? {})
         return
       }
 
@@ -1588,7 +1674,9 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
   name: 'codeswarm-ui-store-v1',
   partialize: (state) => ({
     swarms: state.swarms,
+    projects: state.projects,
     selectedSwarm: state.selectedSwarm,
+    selectedProject: state.selectedProject,
     activeNodeBySwarm: state.activeNodeBySwarm
   })
 }))

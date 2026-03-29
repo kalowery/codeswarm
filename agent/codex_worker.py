@@ -68,9 +68,15 @@ def main():
     outbox_path.parent.mkdir(parents=True, exist_ok=True)
 
     codex_bin = os.environ.get("CODESWARM_CODEX_BIN", "codex")
-    sandbox_mode = os.environ.get("CODESWARM_SANDBOX_MODE", "workspace-write")
-    approval_policy = os.environ.get("CODESWARM_ASK_FOR_APPROVAL", "never")
+    sandbox_mode = os.environ.get("CODESWARM_SANDBOX_MODE")
+    approval_policy = os.environ.get("CODESWARM_ASK_FOR_APPROVAL")
     capture_all_session = os.environ.get("CODESWARM_CAPTURE_ALL_SESSION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    native_auto_approve = os.environ.get("CODESWARM_NATIVE_AUTO_APPROVE", "").strip().lower() in (
         "1",
         "true",
         "yes",
@@ -79,19 +85,26 @@ def main():
 
     codex_home = str(Path.home() / ".codex")
     workspace_dir = os.getcwd()
+    workspace_root = Path(workspace_dir).resolve()
+    stderr_log_path = Path(workspace_dir) / "codex.stderr.log"
 
     def launch_codex_proc():
+        cmd = [
+            str(codex_bin),
+            "--cd", workspace_dir,
+        ]
+        if sandbox_mode and str(sandbox_mode).strip():
+            cmd.extend(["--sandbox", str(sandbox_mode).strip()])
+        if approval_policy and str(approval_policy).strip():
+            cmd.extend(["--ask-for-approval", str(approval_policy).strip()])
+        cmd.extend([
+            "--add-dir", codex_home,
+            "--add-dir", workspace_dir,
+            "app-server",
+            "--listen", "stdio://"
+        ])
         return subprocess.Popen(
-            [
-                str(codex_bin),
-                "--cd", workspace_dir,
-                "--sandbox", sandbox_mode,
-                "--ask-for-approval", approval_policy,
-                "--add-dir", codex_home,
-                "--add-dir", workspace_dir,
-                "app-server",
-                "--listen", "stdio://"
-            ],
+            cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -115,6 +128,7 @@ def main():
     pending_dynamic_tool_requests = {}
     pending_dynamic_tool_calls = {}
     pending_session_tool_calls = {}
+    native_items = {}
     session_response_history = []
     session_trace_lines_remaining = 0
     session_trace_reason = None
@@ -170,6 +184,11 @@ def main():
                 }
             ],
         })
+        request_to_injection[req_id] = injection_id
+        if current_active_turn_id:
+            # Rebind the active turn so streamed output from the steered turn
+            # is attributed to the latest injection instead of the bootstrap one.
+            turn_to_injection[current_active_turn_id] = injection_id
         pending_user_requests[req_id] = {
             "kind": "turn_steer",
             "injection_id": injection_id,
@@ -510,11 +529,103 @@ def main():
         )
         return native_call_id if isinstance(native_call_id, str) else None
 
+    def _path_within_workspace(raw_path):
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return False
+        try:
+            resolved = Path(raw_path).expanduser().resolve(strict=False)
+        except Exception:
+            return False
+        return resolved == workspace_root or workspace_root in resolved.parents
+
+    def _auto_native_approval_route(msg, injection_id):
+        if not native_auto_approve or not isinstance(msg, dict):
+            return False
+
+        method = msg.get("method")
+        if method not in (
+            "item/fileChange/requestApproval",
+            "item/commandExecution/requestApproval",
+            "applyPatchApproval",
+            "execCommandApproval",
+            "codex/event/apply_patch_approval_request",
+            "codex/event/exec_approval_request",
+        ):
+            return False
+
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        request_id = msg.get("id")
+        call_id = _extract_approval_call_id_from_rpc(msg)
+        approved = False
+        reason = None
+
+        if method in ("item/fileChange/requestApproval", "applyPatchApproval", "codex/event/apply_patch_approval_request"):
+            item = native_items.get(call_id) if isinstance(call_id, str) else None
+            changes = item.get("changes") if isinstance(item, dict) else None
+            changed_paths = []
+            if isinstance(changes, list):
+                for change in changes:
+                    if isinstance(change, dict):
+                        changed_paths.append(change.get("path"))
+            grant_root = params.get("grantRoot")
+            if changed_paths and all(_path_within_workspace(path) for path in changed_paths):
+                approved = grant_root is None or _path_within_workspace(grant_root)
+            else:
+                reason = "file_change_outside_workspace_or_missing_paths"
+            decision = "approved" if method in ("applyPatchApproval", "codex/event/apply_patch_approval_request") else "accept"
+            denied_decision = "denied" if decision == "approved" else "cancel"
+        else:
+            command_cwd = params.get("cwd")
+            grant_root = params.get("grantRoot")
+            proposed_execpolicy_amendment = params.get("proposedExecPolicyAmendment")
+            approved = _path_within_workspace(command_cwd) and not proposed_execpolicy_amendment
+            if approved and grant_root is not None:
+                approved = _path_within_workspace(grant_root)
+            if not approved:
+                reason = "command_request_outside_workspace_or_requires_execpolicy_amendment"
+            decision = "approved" if method == "execCommandApproval" else "accept"
+            denied_decision = "denied" if decision == "approved" else "cancel"
+
+        rpc_decision = decision if approved else denied_decision
+
+        if isinstance(request_id, int):
+            send_response(request_id, {
+                "decision": rpc_decision,
+            })
+        if isinstance(call_id, str) and call_id:
+            notify_params = {
+                "call_id": call_id,
+                "callId": call_id,
+                "approved": bool(approved),
+                "decision": rpc_decision,
+            }
+            turn_id = params.get("turnId") or params.get("turn_id") or params.get("id")
+            if isinstance(turn_id, str) and turn_id:
+                notify_params["id"] = turn_id
+                notify_params["turn_id"] = turn_id
+                notify_params["turnId"] = turn_id
+            send_notification("exec/approvalResponse", notify_params)
+
+        write_event(outbox, {
+            "type": "worker_trace",
+            "job_id": job_id,
+            "node_id": node_id,
+            "injection_id": injection_id,
+            "event": "native_approval_auto_responded",
+            "approval_method": method,
+            "call_id": call_id,
+            "request_id": request_id,
+            "approved": bool(approved),
+            "decision": rpc_decision,
+            "reason": reason,
+        })
+        return True
+
     def restart_codex(reason, outbox):
         nonlocal proc, rpc_id, thread_id, current_active_turn_id, session_path, session_offset
         nonlocal request_to_injection, turn_to_injection, pending_injections, pending_user_requests
         nonlocal pending_dynamic_tool_requests, pending_dynamic_tool_calls
-        nonlocal pending_session_tool_calls, initialized_sent
+        nonlocal pending_session_tool_calls, native_items, initialized_sent
         nonlocal restart_count, last_restart_ts, rehydrate_history_on_thread_start
         nonlocal session_trace_lines_remaining, session_trace_reason, session_trace_turn_id
 
@@ -570,6 +681,7 @@ def main():
         pending_dynamic_tool_requests = {}
         pending_dynamic_tool_calls = {}
         pending_session_tool_calls = {}
+        native_items = {}
         initialized_sent = False
         session_trace_lines_remaining = 0
         session_trace_reason = None
@@ -699,6 +811,7 @@ def main():
         })
 
     with open(outbox_path, "a", buffering=1) as outbox:
+        stderr_log_path.write_text("", encoding="utf-8")
 
         write_event(outbox, {
             "type": "start",
@@ -821,6 +934,16 @@ def main():
                                     "turn_id": session_trace_turn_id,
                                 })
 
+                        if msg.get("method") in ("item/started", "item/completed"):
+                            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                            item = params.get("item") if isinstance(params.get("item"), dict) else {}
+                            item_id = item.get("id")
+                            if isinstance(item_id, str) and item_id:
+                                native_items[item_id] = item
+
+                        if _auto_native_approval_route(msg, resolved_injection_id):
+                            continue
+
                         if msg.get("method") == "item/tool/call":
                             params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
                             request_id = msg.get("id")
@@ -906,6 +1029,11 @@ def main():
                 err_line = proc.stderr.readline()
                 if err_line:
                     stripped_err = err_line.strip()
+                    try:
+                        with stderr_log_path.open("a", encoding="utf-8") as stderr_log:
+                            stderr_log.write(stripped_err + "\n")
+                    except Exception:
+                        pass
                     write_event(outbox, {
                         "type": "codex_stderr",
                         "job_id": job_id,
@@ -913,9 +1041,7 @@ def main():
                         "line": stripped_err
                     })
                     if CODEX_ROLLOUT_CHANNEL_CLOSED_MARKER in stripped_err:
-                        if not restart_codex("rollout_channel_closed", outbox):
-                            running = False
-                            continue
+                        continue
 
             # ---- Inbox handling ----
             if inbox_path.exists() and thread_id:

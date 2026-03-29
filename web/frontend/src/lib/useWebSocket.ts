@@ -4,6 +4,7 @@ import { useSwarmStore } from './store'
 export function useWebSocket() {
   const handleMessage = useSwarmStore((s) => s.handleMessage)
   const setSwarms = useSwarmStore((s) => s.setSwarms)
+  const setProjects = useSwarmStore((s) => s.setProjects)
 
   const [status, setStatus] = useState<'connecting' | 'connected' | 'reconnecting' | 'disconnected'>('connecting')
   const retryCount = useRef(0)
@@ -38,6 +39,10 @@ export function useWebSocket() {
         fetch(`${apiBase}/approvals`)
           .then((res) => res.json())
           .then((data) => handleMessage({ type: 'approvals_snapshot', payload: data }))
+          .catch(() => {})
+        fetch(`${apiBase}/projects`)
+          .then((res) => res.json())
+          .then((data) => setProjects(data))
           .catch(() => {})
 
         if (approvalsPollTimer.current) clearInterval(approvalsPollTimer.current)
@@ -102,7 +107,7 @@ export function useWebSocket() {
       if (approvalsPollTimer.current) clearInterval(approvalsPollTimer.current)
       if (socketRef.current) socketRef.current.close()
     }
-  }, [handleMessage, setSwarms])
+  }, [handleMessage, setProjects, setSwarms])
 
   return { status }
 }

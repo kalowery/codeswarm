@@ -3,6 +3,7 @@ import uuid
 import shutil
 import json
 import os
+import re
 import signal
 import tarfile
 import sys
@@ -35,6 +36,17 @@ class LocalProvider(ClusterProvider):
 
     def _job_dir(self, job_id: str) -> Path:
         return self.workspace_root / str(job_id)
+
+    def _agent_dir(self, job_id: str, node_id: int) -> Path:
+        return self._job_dir(job_id) / f"agent_{int(node_id):02d}"
+
+    def _default_worker_sandbox_mode(self) -> str:
+        configured = str(self.config.get("default_sandbox_mode") or "").strip()
+        if configured:
+            return configured
+        if sys.platform == "darwin":
+            return "danger-full-access"
+        return "workspace-write"
 
     def _job_metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / ".codeswarm-job.json"
@@ -196,6 +208,112 @@ class LocalProvider(ClusterProvider):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content, encoding="utf-8")
 
+    def _write_worker_codex_config(self, agent_dir: Path, launch_params: dict | None = None) -> None:
+        launch_params = launch_params if isinstance(launch_params, dict) else {}
+        default_sandbox_mode = self._default_worker_sandbox_mode()
+        sandbox_mode = str(
+            launch_params.get("sandbox_mode") or default_sandbox_mode
+        ).strip() or default_sandbox_mode
+        approval_policy = str(launch_params.get("approval_policy") or "never").strip() or "never"
+        network_access = launch_params.get("network_access")
+        if network_access is None:
+            network_access = True
+        network_enabled = bool(network_access)
+
+        lines = [
+            "# Worker-local Codex overrides.",
+            "# model_providers and other shared settings are inherited from ~/.codex/config.toml.",
+            f'approval_policy = "{approval_policy}"',
+            f'sandbox_mode = "{sandbox_mode}"',
+            "",
+        ]
+        if sandbox_mode == "workspace-write":
+            lines.extend([
+                "[sandbox_workspace_write]",
+                f"network_access = {str(network_enabled).lower()}",
+                "",
+            ])
+
+        codex_dir = agent_dir / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        (codex_dir / "config.toml").write_text("\n".join(lines), encoding="utf-8")
+
+    @staticmethod
+    def _parse_github_repo_ref(repo_path: str) -> str | None:
+        text = str(repo_path or "").strip()
+        if not text:
+            return None
+        shorthand = re.fullmatch(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", text)
+        if shorthand:
+            return f"{shorthand.group(1)}/{shorthand.group(2)}"
+        https_match = re.fullmatch(
+            r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+            text,
+        )
+        if https_match:
+            return f"{https_match.group(1)}/{https_match.group(2)}"
+        ssh_match = re.fullmatch(
+            r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+            text,
+        )
+        if ssh_match:
+            return f"{ssh_match.group(1)}/{ssh_match.group(2)}"
+        return None
+
+    @staticmethod
+    def _origin_remote_url(repo_path: Path) -> str | None:
+        if not repo_path.exists() or not (repo_path / ".git").exists():
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        value = str(result.stdout or "").strip()
+        return value or None
+
+    def _clone_repository(self, source: str, target: Path) -> None:
+        github_repo = self._parse_github_repo_ref(source)
+        clone_source = str(source)
+        source_path = Path(str(source)).expanduser()
+        inherited_origin = self._origin_remote_url(source_path.resolve()) if source_path.exists() else None
+        if github_repo:
+            if shutil.which("gh"):
+                ssh_url = subprocess.run(
+                    ["gh", "repo", "view", github_repo, "--json", "sshUrl", "-q", ".sshUrl"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if ssh_url.returncode == 0 and (ssh_url.stdout or "").strip():
+                    clone_source = ssh_url.stdout.strip()
+                else:
+                    clone_source = f"git@github.com:{github_repo}.git"
+            else:
+                clone_source = f"git@github.com:{github_repo}.git"
+        result = subprocess.run(
+            ["git", "clone", clone_source, str(target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or result.stdout.strip() or f"clone failed for {clone_source}")
+        if inherited_origin:
+            subprocess.run(
+                ["git", "-C", str(target), "remote", "set-url", "origin", inherited_origin],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+
     def launch(
         self,
         nodes: int,
@@ -208,19 +326,20 @@ class LocalProvider(ClusterProvider):
             progress_cb("starting", f"Launching {nodes} local worker(s)")
         job_id = f"local_{uuid.uuid4().hex[:8]}"
         workers: List[dict] = []
+        launch_params = launch_params if isinstance(launch_params, dict) else {}
+        worker_mode = str(launch_params.get("worker_mode") or "codex").strip().lower()
 
         for i in range(nodes):
             agent_index = f"{i:02d}"
             agent_dir = self.workspace_root / job_id / f"agent_{agent_index}"
             agent_dir.mkdir(parents=True, exist_ok=True)
             self._apply_agents_payload(agent_dir, agents_md_content, agents_bundle)
+            if worker_mode == "codex":
+                self._write_worker_codex_config(agent_dir, launch_params)
 
             # Locate worker relative to repository root
-            worker_path = (
-                Path(__file__).resolve().parents[2]
-                / "agent"
-                / "codex_worker.py"
-            )
+            worker_name = "mock_worker.py" if worker_mode == "mock" else "codex_worker.py"
+            worker_path = Path(__file__).resolve().parents[2] / "agent" / worker_name
 
             env = os.environ.copy()
             env.update({
@@ -228,6 +347,10 @@ class LocalProvider(ClusterProvider):
                 "CODESWARM_NODE_ID": str(i),
                 "CODESWARM_BASE_DIR": str(self.workspace_root.resolve()),
             })
+            if "native_auto_approve" in launch_params:
+                env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1" if bool(launch_params.get("native_auto_approve")) else "0"
+            if worker_mode == "mock" and bool(launch_params.get("mock_push_branches")):
+                env["CODESWARM_MOCK_PUSH_BRANCHES"] = "1"
 
             p = subprocess.Popen(
                 ["python3", str(worker_path)],
@@ -253,6 +376,7 @@ class LocalProvider(ClusterProvider):
         self._write_job_metadata(job_id, {
             "job_id": job_id,
             "provider": "local",
+            "worker_mode": worker_mode,
             "workers": workers,
             "node_count": int(nodes),
         })
@@ -338,6 +462,83 @@ class LocalProvider(ClusterProvider):
             return None
 
         return str(archive_path.resolve())
+
+    def prepare_repository(
+        self,
+        job_id: str,
+        repo_path: str,
+        branch: str | None = None,
+        subdir: str = "repo",
+    ) -> dict:
+        source_text = str(repo_path or "").strip()
+        github_repo = self._parse_github_repo_ref(source_text)
+        source_path = Path(source_text).expanduser()
+        source_is_local = source_path.exists()
+        if source_is_local:
+            source = source_path.resolve()
+            if not (source / ".git").exists():
+                raise RuntimeError(f"Repository path is not a git repository: {source}")
+            clone_source = str(source)
+            source_kind = "local_path"
+        else:
+            if not source_text:
+                raise RuntimeError("Repository path is required")
+            clone_source = github_repo or source_text
+            source_kind = "github" if github_repo else "remote_url"
+
+        workers = self._active_workers_for_job(job_id)
+        if not workers:
+            raise RuntimeError(f"No active workers found for job {job_id}")
+
+        prepared_paths: list[str] = []
+        branch_name = str(branch).strip() if isinstance(branch, str) and str(branch).strip() else None
+
+        for worker in workers:
+            node_id = worker.get("node_id")
+            if not isinstance(node_id, int) or node_id < 0:
+                continue
+            agent_dir = self._agent_dir(job_id, node_id)
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            target = (agent_dir / subdir).resolve()
+
+            if not target.exists():
+                try:
+                    self._clone_repository(clone_source, target)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to clone repository for worker {node_id}: {e}")
+
+            if branch_name:
+                result = subprocess.run(
+                    ["git", "-C", str(target), "checkout", branch_name],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        f"Failed to checkout branch '{branch_name}' for worker {node_id}: {result.stderr.strip() or result.stdout.strip()}"
+                    )
+
+            prepared_paths.append(str(target))
+
+        self._write_job_metadata(job_id, {
+            "prepared_repo": {
+                "source": clone_source,
+                "source_kind": source_kind,
+                "branch": branch_name,
+                "subdir": subdir,
+                "worker_paths": prepared_paths,
+            }
+        })
+        return {
+            "mode": "per_agent_clone",
+            "source": clone_source,
+            "source_kind": source_kind,
+            "branch": branch_name,
+            "subdir": subdir,
+            "worker_paths": prepared_paths,
+        }
 
     def get_job_state(self, job_id: str) -> Optional[str]:
         return "RUNNING" if self._active_workers_for_job(job_id) else None

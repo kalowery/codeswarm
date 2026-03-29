@@ -60,6 +60,20 @@ class ClusterProvider(ABC):
         """
         return None
 
+    def prepare_repository(
+        self,
+        job_id: str,
+        repo_path: str,
+        branch: str | None = None,
+        subdir: str = "repo",
+    ) -> dict:
+        """
+        Optional hook used by orchestrated-project mode.
+        Providers may prepare an isolated per-worker repo checkout and return
+        metadata describing the prepared workspace layout.
+        """
+        raise NotImplementedError("provider does not support repository preparation")
+
     def bind_swarm(self, job_id: str, swarm_id: str, swarm_record: dict) -> None:
         """
         Optional hook invoked after the router assigns a swarm_id to a launched job.

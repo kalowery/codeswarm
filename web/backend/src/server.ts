@@ -53,6 +53,7 @@ const requestSwarmMap: Record<string, string> = {};
 let interSwarmQueueItems: any[] = [];
 const requestPromptMap = new Map<string, string>();
 const injectionPromptMap = new Map<string, string>();
+let projectsCache: Record<string, any> = {};
 const processedAutoRoutes = new Set<string>();
 const pendingReplyRoutesByRequestId = new Map<
   string,
@@ -1604,6 +1605,10 @@ router.on('event', (msg: any) => {
     // Continue with generic passthrough below.
   }
 
+  if (event === 'project_list' || event === 'projects_updated') {
+    projectsCache = data?.projects && typeof data.projects === 'object' ? data.projects : {};
+  }
+
   // --- Generic passthrough for all other router events ---
   // This keeps backend decoupled from router protocol evolution.
   hub.broadcast({ type: event, payload: data });
@@ -1690,6 +1695,7 @@ setInterval(() => {
   try {
     sendRouterCommand('swarm_list', {});
     sendRouterCommand('queue_list', {});
+    sendRouterCommand('project_list', {});
   } catch {
     // Best-effort reconciliation only.
   }
@@ -1897,6 +1903,10 @@ app.get('/queue', (req, res) => {
   res.json(interSwarmQueueItems);
 });
 
+app.get('/projects', (req, res) => {
+  res.json(projectsCache);
+});
+
 app.get('/approvals', (req, res) => {
   // Serve the backend cache; a background router sync loop keeps this current.
   return res.json(buildApprovalsSnapshotPayload());
@@ -2094,6 +2104,80 @@ app.post('/approval', async (req, res) => {
   });
 });
 
+app.post('/projects', (req, res) => {
+  if (!router.isConnected()) {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  const { title, repo_path, base_branch, worker_swarm_ids, tasks, workspace_subdir, auto_start } = req.body || {};
+  if (!title || !repo_path || !Array.isArray(worker_swarm_ids) || !Array.isArray(tasks)) {
+    return res.status(400).json({ error: 'title, repo_path, worker_swarm_ids, and tasks are required' });
+  }
+  try {
+    const request_id = sendRouterCommand('project_create', {
+      title,
+      repo_path,
+      base_branch,
+      worker_swarm_ids,
+      tasks,
+      workspace_subdir,
+      auto_start
+    });
+    return res.json({ request_id, status: 'submitted' });
+  } catch {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+});
+
+app.post('/projects/plan', (req, res) => {
+  if (!router.isConnected()) {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  const {
+    title,
+    repo_path,
+    spec,
+    planner_swarm_id,
+    worker_swarm_ids,
+    base_branch,
+    workspace_subdir,
+    auto_start
+  } = req.body || {};
+  if (!title || !repo_path || !spec || !planner_swarm_id || !Array.isArray(worker_swarm_ids)) {
+    return res.status(400).json({
+      error: 'title, repo_path, spec, planner_swarm_id, and worker_swarm_ids are required'
+    });
+  }
+  try {
+    const request_id = sendRouterCommand('project_plan', {
+      title,
+      repo_path,
+      spec,
+      planner_swarm_id,
+      worker_swarm_ids,
+      base_branch,
+      workspace_subdir,
+      auto_start
+    });
+    return res.json({ request_id, status: 'submitted' });
+  } catch {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+});
+
+app.post('/projects/:projectId/start', (req, res) => {
+  if (!router.isConnected()) {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  try {
+    const request_id = sendRouterCommand('project_start', {
+      project_id: req.params.projectId
+    });
+    return res.json({ request_id, status: 'submitted' });
+  } catch {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+});
+
 async function connectWithRetry() {
   if (routerReconnectInProgress) return;
   routerReconnectInProgress = true;
@@ -2105,6 +2189,7 @@ async function connectWithRetry() {
       // Initial reconciliation
       sendRouterCommand('swarm_list', {});
       sendRouterCommand('queue_list', {});
+      sendRouterCommand('project_list', {});
       sendRouterCommand('approvals_list', {});
       startApprovalsSyncLoop();
 

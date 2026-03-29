@@ -158,7 +158,7 @@ def _tail_session_for_call(session_path: Path, timeout_s: float) -> tuple[str | 
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--codex-bin", default=os.environ.get("CODESWARM_CODEX_BIN", "codex"))
-    p.add_argument("--sandbox", default="workspace-write")
+    p.add_argument("--sandbox", default="danger-full-access" if sys.platform == "darwin" else "workspace-write")
     p.add_argument("--ask-for-approval", default="never")
     p.add_argument("--prompt", default=PROMPT)
     args = p.parse_args()

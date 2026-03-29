@@ -32,6 +32,8 @@ APPROVAL_METHODS = {
     "applyPatchApproval",
 }
 
+DEFAULT_SANDBOX = "danger-full-access" if sys.platform == "darwin" else "workspace-write"
+
 
 DEFAULT_PROMPT = (
     "Randomly select a 1980s video game and implement a version that can run in a web browser. "
@@ -327,6 +329,7 @@ def run_variant(
     scenario: str,
     ask_for_approval: str,
     sandbox_mode: str,
+    native_auto_approve: bool,
 ) -> ProbeResult:
     probe_root = worker_py.parent.parent / ".tmp" / "approval-probes"
     probe_root.mkdir(parents=True, exist_ok=True)
@@ -344,6 +347,8 @@ def run_variant(
         env["CODESWARM_CODEX_BIN"] = codex_bin
         env["CODESWARM_ASK_FOR_APPROVAL"] = ask_for_approval
         env["CODESWARM_SANDBOX_MODE"] = sandbox_mode
+        if native_auto_approve:
+            env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1"
 
         proc = subprocess.Popen(
             [sys.executable, str(worker_py)],
@@ -563,11 +568,17 @@ def run_variant(
                         item = params.get("item") if isinstance(params.get("item"), dict) else {}
                         item_type = str(item.get("type") or "").lower()
                         item_id = item.get("id")
-                        if item_type == "filechange" and (call_id is None or item_id == call_id):
-                            if method == "item/started":
-                                filechange_started = True
-                            else:
-                                filechange_completed = True
+                        if call_id is None or item_id == call_id:
+                            if item_type == "filechange":
+                                if method == "item/started":
+                                    filechange_started = True
+                                else:
+                                    filechange_completed = True
+                            elif item_type == "commandexecution":
+                                if method == "item/started":
+                                    command_started = True
+                                else:
+                                    command_completed = True
                     elif method in ("codex/event/task_complete", "task/complete"):
                         task_complete = True
                 for row in rows:
@@ -681,8 +692,13 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--sandbox",
-        default="workspace-write",
+        default=DEFAULT_SANDBOX,
         help="Sandbox mode passed to codex_worker.",
+    )
+    p.add_argument(
+        "--native-auto-approve",
+        action="store_true",
+        help="Enable worker-side automatic responses for native file-change and command approval requests.",
     )
     p.add_argument(
         "--variants",
@@ -744,6 +760,7 @@ def main() -> int:
                 scenario=scenario,
                 ask_for_approval=args.ask_for_approval,
                 sandbox_mode=args.sandbox,
+                native_auto_approve=args.native_auto_approve,
             )
             result_dict = dict(result.__dict__)
             result_dict["scenario"] = scenario
