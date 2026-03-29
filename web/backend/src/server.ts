@@ -1634,10 +1634,20 @@ router.on('event', (msg: any) => {
           alias,
           swarm.job_id,
           swarm.node_count,
-          { provider: swarm.provider, provider_id: swarm.provider_id }
+          {
+            provider: swarm.provider,
+            provider_id: swarm.provider_id,
+            status: typeof swarm.status === 'string' ? swarm.status : 'unknown',
+            slurm_state: typeof swarm.slurm_state === 'string' ? swarm.slurm_state : undefined
+          }
         );
       } else {
         state.updateProviderMeta(swarm_id, swarm.provider, swarm.provider_id);
+        state.updateStatus(
+          swarm_id,
+          typeof swarm.status === 'string' ? swarm.status : undefined,
+          typeof swarm.slurm_state === 'string' ? swarm.slurm_state : undefined
+        );
       }
     }
 

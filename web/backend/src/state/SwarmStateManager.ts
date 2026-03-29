@@ -28,7 +28,16 @@ export class SwarmStateManager {
       const raw = fs.readFileSync(this.stateFile, 'utf-8')
       const data: SwarmRecord[] = JSON.parse(raw)
       data.forEach((record) => {
-        this.swarms.set(record.swarm_id, record)
+        const normalized: SwarmRecord = {
+          ...record,
+          // Backend cache is not authoritative across restarts. Avoid surfacing
+          // persisted "running" state until router reconciliation arrives.
+          status:
+            typeof record.status === 'string' && record.status.toLowerCase() === 'running'
+              ? 'unknown'
+              : record.status
+        }
+        this.swarms.set(record.swarm_id, normalized)
         this.aliasIndex.set(record.alias.toLowerCase(), record.swarm_id)
       })
     } catch (err) {
@@ -52,7 +61,7 @@ export class SwarmStateManager {
     alias: string,
     job_id: string,
     node_count: number,
-    options?: { provider?: string; provider_id?: string }
+    options?: { provider?: string; provider_id?: string; status?: string; slurm_state?: string }
   ) {
     const normalized = alias.toLowerCase();
     if (this.aliasIndex.has(normalized)) {
@@ -64,7 +73,8 @@ export class SwarmStateManager {
       alias,
       job_id,
       node_count,
-      status: 'running',
+      status: options?.status ?? 'unknown',
+      slurm_state: options?.slurm_state,
       provider: options?.provider,
       provider_id: options?.provider_id,
       created_at: Date.now()

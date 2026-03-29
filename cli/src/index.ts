@@ -531,15 +531,59 @@ function resolveRouterAddress(opts: any): { host: string; port: number } {
 }
 
 async function stopRouterProcess(opts: any): Promise<boolean> {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const waitForExit = async (pid: number, timeoutMs: number): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        process.kill(pid, 0);
+      } catch (error: any) {
+        if (error?.code === "ESRCH") {
+          return true;
+        }
+      }
+      await sleep(100);
+    }
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error: any) {
+      return error?.code === "ESRCH";
+    }
+  };
+  const terminatePid = async (pid: number): Promise<boolean> => {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch (error: any) {
+      if (error?.code === "ESRCH") {
+        return false;
+      }
+      throw error;
+    }
+    if (await waitForExit(pid, 2000)) {
+      return true;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch (error: any) {
+      if (error?.code === "ESRCH") {
+        return true;
+      }
+      throw error;
+    }
+    return await waitForExit(pid, 1000);
+  };
+
   const pidFile = getRouterPidFilePath();
   try {
     const raw = await fs.readFile(pidFile, "utf8");
     const pid = parseInt(raw.trim(), 10);
-    if (!Number.isFinite(pid) || pid <= 0) {
-      return false;
+    if (Number.isFinite(pid) && pid > 0) {
+      const stopped = await terminatePid(pid);
+      if (stopped) {
+        return true;
+      }
     }
-    process.kill(pid, "SIGTERM");
-    return true;
   } catch {}
 
   const configPath = opts.config ? path.resolve(process.cwd(), String(opts.config)) : null;
@@ -564,8 +608,9 @@ async function stopRouterProcess(opts: any): Promise<boolean> {
   let stopped = false;
   for (const pid of pids) {
     try {
-      process.kill(pid, "SIGTERM");
-      stopped = true;
+      if (await terminatePid(pid)) {
+        stopped = true;
+      }
     } catch {}
   }
   return stopped;
@@ -988,6 +1033,7 @@ program
 
 async function createTransport(opts: any, transportOpts?: { autoStartRouter?: boolean }) {
   const pythonCmd = resolvePythonCommand();
+  let routerStartedByWeb = false;
   const { host, port } = resolveRouterAddress(opts);
   const autoStartRouter = transportOpts?.autoStartRouter !== false;
 
@@ -1213,8 +1259,11 @@ async function runWebStack(opts: any) {
   console.log("[web] Starting Codeswarm web stack...\n");
 
   const children: any[] = [];
+  let routerStartedByWeb = false;
 
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const frontendUrl = "http://localhost:3000";
+  const backendUrl = "http://localhost:4000/swarms";
 
   async function isTcpPortListening(host: string, port: number, timeoutMs = 700): Promise<boolean> {
     return await new Promise<boolean>((resolve) => {
@@ -1323,8 +1372,6 @@ async function runWebStack(opts: any) {
 
   async function waitForWebReady(timeoutMs: number): Promise<boolean> {
     const start = Date.now();
-    const frontendUrl = "http://localhost:3000";
-    const backendUrl = "http://localhost:4000/swarms";
 
     while (Date.now() - start < timeoutMs) {
       const [frontendReady, backendReady] = await Promise.all([
@@ -1395,6 +1442,7 @@ async function runWebStack(opts: any) {
         ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
         repoRoot
       );
+      routerStartedByWeb = true;
     }
   } else {
     spawnWithPrefix(
@@ -1403,6 +1451,7 @@ async function runWebStack(opts: any) {
       ["-u", "-m", "router.router", "--config", configPath, "--daemon", "--debug"],
       repoRoot
     );
+    routerStartedByWeb = true;
   }
 
   const routerHealthy = await waitForRouterHealthy(routerHost, routerPort, 15000);
@@ -1412,12 +1461,38 @@ async function runWebStack(opts: any) {
     );
   }
 
-  // Backend (dev mode)
-  // Use non-watch mode in web stack to avoid restart flapping.
-  spawnWithPrefix("backend", "npm", ["run", "web"], backendPath);
+  // Backend
+  const backendPort = 4000;
+  const backendAlreadyListening = await isTcpPortListening("127.0.0.1", backendPort);
+  if (backendAlreadyListening) {
+    const healthy = await checkHttpReady(backendUrl, 1500);
+    if (healthy) {
+      console.log(`[web] Backend already listening on :${backendPort}; reusing existing process.`);
+    } else {
+      throw new Error(
+        `Backend port ${backendPort} is already in use by an unhealthy process.`
+      );
+    }
+  } else {
+    // Use non-watch mode in web stack to avoid restart flapping.
+    spawnWithPrefix("backend", "npm", ["run", "web"], backendPath);
+  }
 
-  // Frontend (dev mode)
-  spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
+  // Frontend
+  const frontendPort = 3000;
+  const frontendAlreadyListening = await isTcpPortListening("127.0.0.1", frontendPort);
+  if (frontendAlreadyListening) {
+    const healthy = await checkHttpReady(frontendUrl, 1500);
+    if (healthy) {
+      console.log(`[web] Frontend already listening on :${frontendPort}; reusing existing process.`);
+    } else {
+      throw new Error(
+        `Frontend port ${frontendPort} is already in use by an unhealthy process.`
+      );
+    }
+  } else {
+    spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
+  }
 
   // Attempt to open browser (best-effort) once services are actually reachable.
   if (!opts.noOpen) {
@@ -1429,7 +1504,7 @@ async function runWebStack(opts: any) {
       );
     } else {
       try {
-        const url = "http://localhost:3000";
+        const url = frontendUrl;
         const opener = process.platform === "darwin" ? "open" : "xdg-open";
 
         const browser = spawn(opener, [url], {
@@ -1448,18 +1523,37 @@ async function runWebStack(opts: any) {
     }
   }
 
-  function shutdown() {
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) {
+      return;
+    }
+    shuttingDown = true;
     console.log("\n[web] Shutting down...");
     for (const child of children) {
       try {
         child.kill("SIGTERM");
       } catch {}
     }
+    if (routerStartedByWeb) {
+      try {
+        const stopped = await stopRouterProcess({ config: configPath });
+        if (!stopped) {
+          console.warn("[web] Warning: router stop was requested but no live router pid was found.");
+        }
+      } catch {
+        console.warn("[web] Warning: failed to stop router cleanly.");
+      }
+    }
     process.exit(0);
   }
 
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", () => {
+    void shutdown();
+  });
+  process.on("SIGTERM", () => {
+    void shutdown();
+  });
 }
 
 program

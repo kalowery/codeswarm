@@ -1671,12 +1671,9 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     }
   }
 }, {
-  name: 'codeswarm-ui-store-v1',
+  name: 'codeswarm-ui-store-v2',
   partialize: (state) => ({
-    swarms: state.swarms,
-    projects: state.projects,
     selectedSwarm: state.selectedSwarm,
-    selectedProject: state.selectedProject,
-    activeNodeBySwarm: state.activeNodeBySwarm
+    selectedProject: state.selectedProject
   })
 }))

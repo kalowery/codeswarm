@@ -43,6 +43,64 @@ def _resolve_backend_profile(cluster_cfg: dict, backend: str, profile: str | Non
 
 
 def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
+    if backend == "local":
+        local_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}
+        default_sandbox = local_cfg.get("default_sandbox_mode")
+        if not isinstance(default_sandbox, str) or not default_sandbox.strip():
+            default_sandbox = "danger-full-access"
+        return [
+            {
+                "key": "worker_mode",
+                "label": "Worker Mode",
+                "type": "select",
+                "default": "codex",
+                "required": True,
+                "options": [
+                    {"label": "Codex", "value": "codex"},
+                    {"label": "Mock", "value": "mock"},
+                ],
+            },
+            {
+                "key": "approval_policy",
+                "label": "Approval Policy",
+                "type": "select",
+                "default": "never",
+                "required": True,
+                "options": [
+                    {"label": "Never", "value": "never"},
+                    {"label": "On Failure", "value": "on-failure"},
+                    {"label": "On Request", "value": "on-request"},
+                    {"label": "Untrusted", "value": "untrusted"},
+                ],
+            },
+            {
+                "key": "sandbox_mode",
+                "label": "Sandbox Mode",
+                "type": "select",
+                "default": default_sandbox,
+                "required": True,
+                "options": [
+                    {"label": "Danger Full Access", "value": "danger-full-access"},
+                    {"label": "Workspace Write", "value": "workspace-write"},
+                    {"label": "Read Only", "value": "read-only"},
+                ],
+            },
+            {
+                "key": "native_auto_approve",
+                "label": "Native Auto Approve",
+                "type": "boolean",
+                "default": False,
+                "required": False,
+            },
+            {
+                "key": "fresh_thread_per_injection",
+                "label": "Fresh Thread Per Injection",
+                "type": "boolean",
+                "default": False,
+                "required": False,
+            },
+        ]
+
     if backend == "slurm":
         slurm_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}
         return [

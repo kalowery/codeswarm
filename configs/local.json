@@ -3,5 +3,55 @@
     "backend": "local",
     "workspace_root": "runs",
     "archive_root": "/tmp/archives"
-  }
+  },
+  "launch_providers": [
+    {
+      "id": "local-dev",
+      "label": "Local Dev",
+      "backend": "local",
+      "defaults": {
+        "worker_mode": "codex",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "native_auto_approve": false,
+        "fresh_thread_per_injection": false
+      }
+    },
+    {
+      "id": "local-orchestrated-planner",
+      "label": "Local Orchestrated Planner",
+      "backend": "local",
+      "defaults": {
+        "worker_mode": "codex",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "native_auto_approve": true,
+        "fresh_thread_per_injection": true
+      }
+    },
+    {
+      "id": "local-orchestrated-worker",
+      "label": "Local Orchestrated Worker",
+      "backend": "local",
+      "defaults": {
+        "worker_mode": "codex",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "native_auto_approve": true,
+        "fresh_thread_per_injection": true
+      }
+    },
+    {
+      "id": "local-mock-worker",
+      "label": "Local Mock Worker",
+      "backend": "local",
+      "defaults": {
+        "worker_mode": "mock",
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access",
+        "native_auto_approve": false,
+        "fresh_thread_per_injection": false
+      }
+    }
+  ]
 }

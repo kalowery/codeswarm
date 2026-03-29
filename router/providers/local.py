@@ -314,6 +314,50 @@ class LocalProvider(ClusterProvider):
                 check=False,
             )
 
+    @staticmethod
+    def _has_git_commits(repo_path: Path) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def _checkout_prepared_branch(self, repo_path: Path, branch_name: str, worker_id: int) -> None:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "checkout", branch_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+
+        # Empty repositories have an unborn HEAD, so there is no branch ref to
+        # check out yet. In that case create the requested branch locally.
+        if not self._has_git_commits(repo_path):
+            create_result = subprocess.run(
+                ["git", "-C", str(repo_path), "checkout", "-B", branch_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if create_result.returncode == 0:
+                return
+            detail = create_result.stderr.strip() or create_result.stdout.strip()
+            raise RuntimeError(
+                f"Failed to create branch '{branch_name}' for worker {worker_id}: {detail}"
+            )
+
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            f"Failed to checkout branch '{branch_name}' for worker {worker_id}: {detail}"
+        )
+
     def launch(
         self,
         nodes: int,
@@ -512,17 +556,7 @@ class LocalProvider(ClusterProvider):
                     raise RuntimeError(f"Failed to clone repository for worker {node_id}: {e}")
 
             if branch_name:
-                result = subprocess.run(
-                    ["git", "-C", str(target), "checkout", branch_name],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    raise RuntimeError(
-                        f"Failed to checkout branch '{branch_name}' for worker {node_id}: {result.stderr.strip() or result.stdout.strip()}"
-                    )
+                self._checkout_prepared_branch(target, branch_name, node_id)
 
             prepared_paths.append(str(target))
 
