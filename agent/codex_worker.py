@@ -82,6 +82,12 @@ def main():
         "yes",
         "on",
     )
+    fresh_thread_per_injection = os.environ.get("CODESWARM_FRESH_THREAD_PER_INJECTION", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
     codex_home = str(Path.home() / ".codex")
     workspace_dir = os.getcwd()
@@ -133,6 +139,9 @@ def main():
     session_trace_lines_remaining = 0
     session_trace_reason = None
     session_trace_turn_id = None
+    persistent_preamble = None
+    pending_fresh_turn = None
+    pending_fresh_thread_request_id = None
     SESSION_TOOL_NATIVE_GRACE_SECONDS = 1.0
     restart_count = 0
     last_restart_ts = 0.0
@@ -196,6 +205,15 @@ def main():
             "expected_turn_id": current_active_turn_id,
         }
         return req_id
+
+    def _start_fresh_turn(injection_id, content):
+        nonlocal pending_fresh_turn, pending_fresh_thread_request_id
+        pending_fresh_turn = {
+            "injection_id": injection_id,
+            "content": content,
+        }
+        pending_fresh_thread_request_id = send_request("thread/start", {})
+        return pending_fresh_thread_request_id
 
     def send_notification(method, params=None):
         nonlocal proc
@@ -628,6 +646,7 @@ def main():
         nonlocal pending_session_tool_calls, native_items, initialized_sent
         nonlocal restart_count, last_restart_ts, rehydrate_history_on_thread_start
         nonlocal session_trace_lines_remaining, session_trace_reason, session_trace_turn_id
+        nonlocal pending_fresh_turn, pending_fresh_thread_request_id
 
         if shutdown_requested:
             return False
@@ -646,7 +665,7 @@ def main():
 
         restart_count += 1
         last_restart_ts = time.time()
-        rehydrate_history_on_thread_start = list(session_response_history)
+        rehydrate_history_on_thread_start = None if fresh_thread_per_injection else list(session_response_history)
         write_event(outbox, {
             "type": "worker_trace",
             "job_id": job_id,
@@ -686,6 +705,8 @@ def main():
         session_trace_lines_remaining = 0
         session_trace_reason = None
         session_trace_turn_id = None
+        pending_fresh_turn = None
+        pending_fresh_thread_request_id = None
 
         write_event(outbox, {
             "type": "worker_trace",
@@ -882,6 +903,41 @@ def main():
                         if msg.get("method") == "turn/completed" and turn_id and turn_id == current_active_turn_id:
                             current_active_turn_id = None
 
+                        if (
+                            fresh_thread_per_injection
+                            and isinstance(msg_id, int)
+                            and msg_id == pending_fresh_thread_request_id
+                        ):
+                            if msg.get("error"):
+                                write_event(outbox, {
+                                    "type": "worker_error",
+                                    "job_id": job_id,
+                                    "node_id": node_id,
+                                    "injection_id": (pending_fresh_turn or {}).get("injection_id"),
+                                    "error": f"fresh_thread_start_failed: {msg.get('error')}",
+                                })
+                                pending_fresh_turn = None
+                                pending_fresh_thread_request_id = None
+                            elif pending_fresh_turn and isinstance(msg.get("result"), dict):
+                                result_thread = msg["result"].get("thread")
+                                if isinstance(result_thread, dict) and isinstance(result_thread.get("id"), str):
+                                    thread_id = result_thread["id"]
+                                if thread_id:
+                                    _send_user_turn_start(
+                                        pending_fresh_turn.get("injection_id"),
+                                        pending_fresh_turn.get("content", ""),
+                                    )
+                                    write_event(outbox, {
+                                        "type": "worker_trace",
+                                        "job_id": job_id,
+                                        "node_id": node_id,
+                                        "injection_id": pending_fresh_turn.get("injection_id"),
+                                        "event": "fresh_thread_started",
+                                        "thread_id": thread_id,
+                                    })
+                                    pending_fresh_turn = None
+                                    pending_fresh_thread_request_id = None
+
                         if isinstance(msg_id, int) and msg_id in pending_user_requests:
                             pending_request = pending_user_requests.pop(msg_id, None)
                             if msg.get("error") and pending_request and pending_request.get("kind") == "turn_steer":
@@ -977,7 +1033,8 @@ def main():
                         if msg.get("id") == 0 and not initialized_sent:
                             send_notification("initialized", {})
                             initialized_sent = True
-                            send_request("thread/start", {})
+                            if not fresh_thread_per_injection:
+                                send_request("thread/start", {})
                             continue
 
                         # Capture thread id/session path from thread/start response
@@ -1034,17 +1091,17 @@ def main():
                             stderr_log.write(stripped_err + "\n")
                     except Exception:
                         pass
+                    if CODEX_ROLLOUT_CHANNEL_CLOSED_MARKER in stripped_err:
+                        continue
                     write_event(outbox, {
                         "type": "codex_stderr",
                         "job_id": job_id,
                         "node_id": node_id,
                         "line": stripped_err
                     })
-                    if CODEX_ROLLOUT_CHANNEL_CLOSED_MARKER in stripped_err:
-                        continue
 
             # ---- Inbox handling ----
-            if inbox_path.exists() and thread_id:
+            if inbox_path.exists() and (thread_id or fresh_thread_per_injection):
                 try:
                     inbox_size = inbox_path.stat().st_size
                     if inbox_offset_bytes > inbox_size:
@@ -1082,7 +1139,35 @@ def main():
                                 injection_id = event.get("injection_id")
                                 last_injection_id = injection_id
                                 content = event.get("content", "")
-                                if current_active_turn_id:
+                                if fresh_thread_per_injection:
+                                    if persistent_preamble is None:
+                                        persistent_preamble = content
+                                        write_event(outbox, {
+                                            "type": "worker_trace",
+                                            "job_id": job_id,
+                                            "node_id": node_id,
+                                            "injection_id": injection_id,
+                                            "event": "persistent_preamble_captured",
+                                        })
+                                        write_event(outbox, {
+                                            "type": "complete",
+                                            "job_id": job_id,
+                                            "node_id": node_id,
+                                            "injection_id": injection_id,
+                                        })
+                                    else:
+                                        effective_content = content
+                                        if isinstance(persistent_preamble, str) and persistent_preamble.strip():
+                                            effective_content = f"{persistent_preamble.rstrip()}\n\n{content}"
+                                        _start_fresh_turn(injection_id, effective_content)
+                                        write_event(outbox, {
+                                            "type": "worker_trace",
+                                            "job_id": job_id,
+                                            "node_id": node_id,
+                                            "injection_id": injection_id,
+                                            "event": "fresh_thread_requested",
+                                        })
+                                elif current_active_turn_id:
                                     _send_user_turn_steer(injection_id, content)
                                     write_event(outbox, {
                                         "type": "worker_trace",

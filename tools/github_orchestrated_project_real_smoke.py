@@ -303,6 +303,7 @@ def main():
         "worker_mode": "codex",
         "native_auto_approve": True,
         "approval_policy": "never",
+        "fresh_thread_per_injection": True,
     }
 
     planner_request = client.send("swarm_launch", {

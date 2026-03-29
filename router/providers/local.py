@@ -347,6 +347,10 @@ class LocalProvider(ClusterProvider):
                 "CODESWARM_NODE_ID": str(i),
                 "CODESWARM_BASE_DIR": str(self.workspace_root.resolve()),
             })
+            if "fresh_thread_per_injection" in launch_params:
+                env["CODESWARM_FRESH_THREAD_PER_INJECTION"] = (
+                    "1" if bool(launch_params.get("fresh_thread_per_injection")) else "0"
+                )
             if "native_auto_approve" in launch_params:
                 env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1" if bool(launch_params.get("native_auto_approve")) else "0"
             if worker_mode == "mock" and bool(launch_params.get("mock_push_branches")):
