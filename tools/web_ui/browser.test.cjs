@@ -458,13 +458,16 @@ async function waitForPromptResponse(page, promptText, timeoutMs = 30_000) {
 }
 
 async function createDirectProject(page, options) {
-  const { title, repoPath, workerAlias, tasksJson } = options
+  const { title, repoPath, workerAlias, tasksJson, autoStart = true } = options
   await clickTestId(page, 'open-project-modal-button')
   await waitForTestId(page, 'project-modal')
   await clickTestId(page, 'project-mode-tasks')
   await setValueByTestId(page, 'project-title-input', title)
   await setValueByTestId(page, 'project-repo-path-input', repoPath)
   await setWorkerSwarmByAlias(page, workerAlias, true)
+  if (!autoStart) {
+    await setCheckboxByTestId(page, 'project-auto-start-checkbox', false)
+  }
   await setValueByTestId(page, 'project-tasks-json-input', tasksJson)
   await clickTestId(page, 'project-submit-button')
   await waitForCardByText(page, 'project-card-', title, 30_000)
@@ -635,6 +638,65 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         await waitForTestIdText(page, 'project-detail-title', new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
         await waitForTestIdText(page, 'project-task-prompt', /Create a file `ui-direct\/alpha\.txt` containing exactly `alpha direct`\./)
         await waitForTestId(page, 'project-task-row-T-001')
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('resumes a draft project from the project UI', async () => {
+      const repo = await createRepoWithOrigin('resume-ui')
+      tempRepoRoots.push(repo.baseDir)
+      const { context, page } = await newPage(browser, stack)
+      const workerAlias = `ui-resume-worker-${Date.now()}`
+      const title = `UI Resume Project ${Date.now()}`
+      const tasks = JSON.stringify(
+        [
+          {
+            task_id: 'T-001',
+            title: 'Create resume alpha file',
+            prompt: 'Create a file `ui-resume/alpha.txt` containing exactly `alpha resume ui`.',
+            acceptance_criteria: ['`ui-resume/alpha.txt` exists with exact content `alpha resume ui`.'],
+            depends_on: [],
+            owned_paths: ['ui-resume/alpha.txt']
+          },
+          {
+            task_id: 'T-002',
+            title: 'Create resume bravo file',
+            prompt: 'Create a file `ui-resume/bravo.txt` containing exactly `bravo resume ui`.',
+            acceptance_criteria: ['`ui-resume/bravo.txt` exists with exact content `bravo resume ui`.'],
+            depends_on: ['T-001'],
+            owned_paths: ['ui-resume/bravo.txt']
+          }
+        ],
+        null,
+        2
+      )
+      try {
+        await launchMockSwarm(page, {
+          alias: workerAlias,
+          prompt: '',
+          delayMs: 500,
+          pushBranches: true
+        })
+        await waitForSwarmReady(stack, workerAlias, 60_000)
+        await createDirectProject(page, {
+          title,
+          repoPath: repo.repoDir,
+          workerAlias,
+          tasksJson: tasks,
+          autoStart: false
+        })
+        const draftProject = await waitForProject(stack, title, (item) => item.status === 'draft', 60_000)
+        assert.equal(draftProject.status, 'draft')
+        await clickCardByText(page, 'project-card-', title)
+        await waitForTestIdText(page, 'project-detail-title', new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+        await clickTestId(page, 'project-open-resume-button')
+        await waitForTestId(page, 'project-resume-modal')
+        await clickTestId(page, 'project-resume-submit-button')
+        const completedProject = await waitForProject(stack, title, (item) => item.status === 'completed', 120_000)
+        assert.equal(completedProject.status, 'completed')
+        assert.ok((completedProject.resume_count || 0) >= 1, 'Expected resume_count after UI resume')
+        await waitForTestId(page, 'project-resume-summary')
       } finally {
         await context.close()
       }

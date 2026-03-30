@@ -132,6 +132,39 @@ This should be a hybrid model:
 
 Prompt routing alone is too weak because it lacks durable task claims and completion semantics.
 
+## Project Resume
+
+Projects should be resumable after router restarts, host failures, or proactive worker-swarm termination.
+
+The resume source of truth should be:
+
+- router project/task state for scheduling metadata
+- the canonical project repository for durable branch verification
+
+Resume should not depend on old worker workspaces. Those are disposable.
+
+### Resume Rules
+
+- If a task has a durable task branch and the branch still exists, the router may keep it completed.
+- If a task was `assigned` when the system stopped, resume should either:
+  - recover it as completed from the task branch when durable branch evidence exists, or
+  - reset it to `pending` when no durable branch evidence exists.
+- If a task previously failed, resume may optionally retry it by moving it back to `pending`.
+- If a completed task branch is missing, the task must be downgraded to `pending`.
+- If a completed dependency is downgraded, downstream completed tasks, including the integration task, must also be reset.
+
+### Initial Resume Scope
+
+The first implementation slice should:
+
+- add a router `project_resume` command
+- allow replacing the worker swarm set during resume
+- reverify completed tasks against the canonical repo
+- reset stale assignments from dead swarms
+- reuse the existing deterministic project dispatcher after reconciliation
+
+This keeps resume deterministic without changing the existing ad hoc swarm workflow.
+
 ## Phase Plan
 
 ### Phase 1
@@ -172,6 +205,15 @@ Add advanced orchestration:
 - cost/latency aware assignment
 - replanning after repeated failures
 - richer project controls
+
+### Phase 5
+
+Add richer resume UX:
+
+- resume preview in the UI
+- per-task resume reasons
+- explicit retry policies for failed tasks
+- CLI support for project resume
 
 ## Phase 1 Scope Being Implemented
 

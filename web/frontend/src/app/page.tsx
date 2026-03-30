@@ -5,6 +5,7 @@ import { useSwarmStore } from '@/lib/store'
 import { useWebSocket } from '@/lib/useWebSocket'
 import LaunchModal from '@/components/LaunchModal'
 import ProjectModal from '@/components/ProjectModal'
+import ProjectResumeModal from '@/components/ProjectResumeModal'
 import Image from 'next/image'
 import ReactMarkdown from 'react-markdown'
 import { getBackendHttpOrigin } from '@/lib/runtime'
@@ -293,6 +294,30 @@ export default function Home() {
     return Number(project.task_counts?.completed ?? 0)
   }
 
+  function formatTimestamp(value: number | undefined) {
+    if (!Number.isFinite(value)) return 'n/a'
+    return new Date(Number(value) * 1000).toLocaleString()
+  }
+
+  function resumeDecisionLabel(value: string | undefined) {
+    switch ((value || '').toLowerCase()) {
+      case 'kept_completed':
+        return 'Verified branch'
+      case 'recovered_from_branch':
+        return 'Recovered branch'
+      case 'reset_assigned':
+        return 'Reset assignment'
+      case 'retried_failed':
+        return 'Retry failed'
+      case 'dependency_reset':
+        return 'Dependency reset'
+      case 'downgraded_to_pending':
+        return 'Branch missing'
+      default:
+        return value || 'n/a'
+    }
+  }
+
   function selectedProjectTask(project: ProjectRecord | undefined): ProjectTaskRecord | undefined {
     if (!project) return undefined
     const taskId =
@@ -304,6 +329,7 @@ export default function Home() {
 
   const [showLaunch, setShowLaunch] = useState(false)
   const [showProjectModal, setShowProjectModal] = useState(false)
+  const [resumeProjectId, setResumeProjectId] = useState<string | null>(null)
   const [startingProjectId, setStartingProjectId] = useState<string | null>(null)
   const [selectedTaskByProject, setSelectedTaskByProject] = useState<Record<string, string>>({})
   const [viewModeBySwarm, setViewModeBySwarm] = useState<Record<string, SwarmViewMode>>({})
@@ -1415,46 +1441,88 @@ export default function Home() {
                     {activeProject.last_error && (
                       <div className="mt-2 text-xs text-rose-300">{activeProject.last_error}</div>
                     )}
+                    {activeProject.resume_summary && (
+                      <div data-testid="project-resume-summary" className="mt-3 rounded border border-slate-800 bg-slate-950/50 p-3 text-xs text-slate-300">
+                        <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-2">Latest Resume</div>
+                        <div className="flex flex-wrap gap-x-4 gap-y-1">
+                          <span>count {activeProject.resume_count ?? 0}</span>
+                          <span>kept {activeProject.resume_summary.kept_completed ?? 0}</span>
+                          <span>recovered {activeProject.resume_summary.recovered_from_branch ?? 0}</span>
+                          <span>reset {activeProject.resume_summary.reset_assigned ?? 0}</span>
+                          <span>downgraded {activeProject.resume_summary.downgraded_to_pending ?? 0}</span>
+                          <span>retried {activeProject.resume_summary.retried_failed ?? 0}</span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-2">
+                          Last resumed: {formatTimestamp(activeProject.last_resume_at)}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                  <button
-                    data-testid="project-start-button"
-                    disabled={
-                      startingProjectId === activeProject.project_id ||
-                      activeProject.status === 'running' ||
-                      activeProject.status === 'starting' ||
-                      activeProject.status === 'completed'
-                    }
-                    onClick={async () => {
-                      try {
-                        setStartingProjectId(activeProject.project_id)
-                        const apiBase = getBackendHttpOrigin()
-                        await fetch(`${apiBase}/projects/${activeProject.project_id}/start`, {
-                          method: 'POST',
-                          headers: { 'Content-Type': 'application/json' }
-                        })
-                      } finally {
-                        setTimeout(() => setStartingProjectId(null), 300)
+                  <div className="flex items-center gap-2">
+                    <button
+                      data-testid="project-start-button"
+                      disabled={
+                        startingProjectId === activeProject.project_id ||
+                        activeProject.status === 'running' ||
+                        activeProject.status === 'starting' ||
+                        activeProject.status === 'completed' ||
+                        activeProject.status === 'resuming'
                       }
-                    }}
-                    className={`px-3 py-1 rounded text-sm ${
-                      startingProjectId === activeProject.project_id ||
-                      activeProject.status === 'running' ||
-                      activeProject.status === 'starting' ||
-                      activeProject.status === 'completed'
-                        ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
-                        : 'bg-cyan-600 hover:bg-cyan-500'
-                    }`}
-                  >
-                    {activeProject.status === 'running'
-                      ? 'Running'
-                      : activeProject.status === 'starting'
-                      ? 'Starting...'
-                      : activeProject.status === 'completed'
-                      ? 'Completed'
-                      : startingProjectId === activeProject.project_id
-                      ? 'Starting...'
-                      : 'Start Project'}
-                  </button>
+                      onClick={async () => {
+                        try {
+                          setStartingProjectId(activeProject.project_id)
+                          const apiBase = getBackendHttpOrigin()
+                          await fetch(`${apiBase}/projects/${activeProject.project_id}/start`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                          })
+                        } finally {
+                          setTimeout(() => setStartingProjectId(null), 300)
+                        }
+                      }}
+                      className={`px-3 py-1 rounded text-sm ${
+                        startingProjectId === activeProject.project_id ||
+                        activeProject.status === 'running' ||
+                        activeProject.status === 'starting' ||
+                        activeProject.status === 'completed' ||
+                        activeProject.status === 'resuming'
+                          ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                          : 'bg-cyan-600 hover:bg-cyan-500'
+                      }`}
+                    >
+                      {activeProject.status === 'running'
+                        ? 'Running'
+                        : activeProject.status === 'starting'
+                        ? 'Starting...'
+                        : activeProject.status === 'completed'
+                        ? 'Completed'
+                        : activeProject.status === 'resuming'
+                        ? 'Resuming...'
+                        : startingProjectId === activeProject.project_id
+                        ? 'Starting...'
+                        : 'Start Project'}
+                    </button>
+                    <button
+                      data-testid="project-open-resume-button"
+                      disabled={
+                        activeProject.status === 'running' ||
+                        activeProject.status === 'starting' ||
+                        activeProject.status === 'completed' ||
+                        activeProject.status === 'resuming'
+                      }
+                      onClick={() => setResumeProjectId(activeProject.project_id)}
+                      className={`px-3 py-1 rounded text-sm ${
+                        activeProject.status === 'running' ||
+                        activeProject.status === 'starting' ||
+                        activeProject.status === 'completed' ||
+                        activeProject.status === 'resuming'
+                          ? 'bg-slate-700 text-slate-400 cursor-not-allowed'
+                          : 'bg-slate-800 border border-slate-700 hover:bg-slate-700'
+                      }`}
+                    >
+                      {activeProject.status === 'resuming' ? 'Resuming...' : 'Resume'}
+                    </button>
+                  </div>
                 </div>
 
                 <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
@@ -1540,6 +1608,7 @@ export default function Home() {
                               <div>Attempts: {selectedTask.attempts ?? 0}</div>
                               <div>Result: {selectedTask.result_status ?? 'n/a'}</div>
                               <div>Beads issue: {selectedTask.beads_id ?? 'n/a'}</div>
+                              <div>Resume: {resumeDecisionLabel(selectedTask.resume_decision)}</div>
                             </div>
                             <div>
                               <div>Assigned swarm: {selectedTask.assigned_swarm_id ? (swarms[selectedTask.assigned_swarm_id]?.alias ?? selectedTask.assigned_swarm_id) : 'unassigned'}</div>
@@ -1548,6 +1617,11 @@ export default function Home() {
                               <div>Beads sync: {selectedTask.beads_sync_status ?? 'pending'}</div>
                             </div>
                           </div>
+                          {selectedTask.last_resume_reason && (
+                            <div data-testid="project-task-resume-reason" className="mt-3 text-xs text-amber-300">
+                              {selectedTask.last_resume_reason}
+                            </div>
+                          )}
                           {selectedTask.beads_last_error && (
                             <div className="mt-3 text-xs text-amber-300">{selectedTask.beads_last_error}</div>
                           )}
@@ -2083,6 +2157,12 @@ export default function Home() {
 
       {showProjectModal && <ProjectModal onClose={() => setShowProjectModal(false)} />}
       {showLaunch && <LaunchModal onClose={() => setShowLaunch(false)} />}
+      {resumeProjectId && projects[resumeProjectId] && (
+        <ProjectResumeModal
+          project={projects[resumeProjectId]}
+          onClose={() => setResumeProjectId(null)}
+        />
+      )}
     </div>
   )
 }

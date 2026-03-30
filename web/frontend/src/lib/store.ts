@@ -175,6 +175,12 @@ export interface ProjectTaskRecord {
   assigned_node_id?: number
   assignment_injection_id?: string
   branch?: string
+  base_commit?: string
+  head_commit?: string
+  verified_branch_commit?: string
+  verified_at?: number
+  resume_decision?: string
+  last_resume_reason?: string
   result_status?: string
   result_raw?: string
   last_error?: string
@@ -216,6 +222,10 @@ export interface ProjectRecord {
   integration_head_commit?: string
   final_result_branch?: string
   final_result_head_commit?: string
+  resume_count?: number
+  last_resume_at?: number
+  last_resumed_by_worker_swarm_ids?: string[]
+  resume_summary?: Record<string, number>
 }
 
 export type FocusTarget = 'swarm' | 'project'

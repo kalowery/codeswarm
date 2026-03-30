@@ -2226,6 +2226,24 @@ app.post('/projects/:projectId/start', (req, res) => {
   }
 });
 
+app.post('/projects/:projectId/resume', (req, res) => {
+  if (!router.isConnected()) {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  const { worker_swarm_ids, retry_failed, reverify_completed } = req.body || {};
+  try {
+    const request_id = sendRouterCommand('project_resume', {
+      project_id: req.params.projectId,
+      worker_swarm_ids,
+      retry_failed: Boolean(retry_failed),
+      reverify_completed: reverify_completed === undefined ? true : Boolean(reverify_completed)
+    });
+    return res.json({ request_id, status: 'submitted' });
+  } catch {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+});
+
 async function connectWithRetry() {
   if (routerReconnectInProgress) return;
   routerReconnectInProgress = true;

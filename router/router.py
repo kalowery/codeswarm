@@ -1532,6 +1532,64 @@ def _sync_project_control_clone(clone_source, target: Path):
         raise RuntimeError(f"Failed to update cached repository clone: {detail}")
 
 
+def _run_git(repo_path: Path, args):
+    return subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+
+def _project_repo_dir(project):
+    repo_path = str((project or {}).get("repo_path") or "").strip()
+    if not repo_path:
+        raise RuntimeError("Project repo_path is missing")
+    repo_dir = Path(repo_path).expanduser().resolve()
+    if not repo_dir.exists() or not (repo_dir / ".git").exists():
+        raise RuntimeError(f"Project repository is unavailable: {repo_dir}")
+    return repo_dir
+
+
+def _refresh_project_repo_for_resume(project):
+    repo_dir = _project_repo_dir(project)
+    remote_url = str((project or {}).get("repo_remote_url") or "").strip()
+    repo_mode = str((project or {}).get("repo_mode") or "").strip().lower()
+    if repo_mode == "github" and remote_url:
+        _sync_project_control_clone(remote_url, repo_dir)
+        return repo_dir
+    origin_url = _git_origin_remote_url(repo_dir)
+    if origin_url:
+        fetch = _run_git(repo_dir, ["fetch", "origin", "--prune"])
+        if fetch.returncode != 0:
+            detail = fetch.stderr.strip() or fetch.stdout.strip() or "git fetch failed"
+            raise RuntimeError(f"Failed to refresh project repository: {detail}")
+    return repo_dir
+
+
+def _git_resolve_revision(repo_dir: Path, revisions):
+    for revision in revisions:
+        rev = str(revision or "").strip()
+        if not rev:
+            continue
+        completed = _run_git(repo_dir, ["rev-parse", rev])
+        if completed.returncode == 0:
+            value = str(completed.stdout or "").strip()
+            if value:
+                return value
+    return None
+
+
+def _git_is_ancestor(repo_dir: Path, ancestor_rev, descendant_rev):
+    ancestor = str(ancestor_rev or "").strip()
+    descendant = str(descendant_rev or "").strip()
+    if not ancestor or not descendant:
+        return False
+    completed = _run_git(repo_dir, ["merge-base", "--is-ancestor", ancestor, descendant])
+    return completed.returncode == 0
+
+
 def _resolve_project_repo_spec(
     repo_path="",
     repo_mode=None,
@@ -1724,7 +1782,7 @@ def _refresh_project_status(project):
     project["task_counts"] = counts
     project["updated_at"] = time.time()
     current = str(project.get("status") or "draft")
-    if current in ("draft", "starting", "error"):
+    if current in ("draft", "starting", "resuming", "error"):
         return
     total = len(project.get("tasks") or {})
     if total > 0 and counts["completed"] == total:
@@ -2188,6 +2246,10 @@ def _create_project_record(
         "integration_head_commit": None,
         "final_result_branch": None,
         "final_result_head_commit": None,
+        "resume_count": 0,
+        "last_resume_at": None,
+        "last_resumed_by_worker_swarm_ids": [],
+        "resume_summary": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -2465,6 +2527,12 @@ def _normalize_task_payload(raw_task, index):
         "assigned_node_id": None,
         "assignment_injection_id": None,
         "branch": None,
+        "base_commit": None,
+        "head_commit": None,
+        "verified_branch_commit": None,
+        "verified_at": None,
+        "resume_decision": None,
+        "last_resume_reason": None,
         "result_status": None,
         "result_raw": None,
         "last_error": None,
@@ -2627,6 +2695,8 @@ def _record_project_task_result(project_id, task_id, data):
         task["assigned_node_id"] = None
         task["assignment_injection_id"] = None
         task["branch"] = parsed.get("branch") if isinstance(parsed, dict) else task.get("branch")
+        task["base_commit"] = parsed.get("base_commit") if isinstance(parsed, dict) else task.get("base_commit")
+        task["head_commit"] = parsed.get("head_commit") if isinstance(parsed, dict) else task.get("head_commit")
         if not parsed:
             task["status"] = "failed"
             task["result_status"] = "invalid_result"
@@ -2649,6 +2719,8 @@ def _record_project_task_result(project_id, task_id, data):
             ):
                 integration_branch = str(parsed.get("branch") or task.get("branch") or "").strip() or None
                 integration_head_commit = str(parsed.get("head_commit") or "").strip() or None
+                task["verified_branch_commit"] = integration_head_commit
+                task["verified_at"] = time.time()
                 project["integration_branch"] = integration_branch
                 project["integration_head_commit"] = integration_head_commit
                 project["final_result_branch"] = integration_branch
@@ -2659,6 +2731,360 @@ def _record_project_task_result(project_id, task_id, data):
     _sync_task_status_to_beads(project_ref, task_ref)
     _emit_projects_updated()
     save_state()
+
+
+def _task_recorded_head_commit(task):
+    head_commit = str((task or {}).get("head_commit") or "").strip()
+    if head_commit:
+        return head_commit
+    parsed = _parse_task_result_block(str((task or {}).get("result_raw") or ""))
+    if not isinstance(parsed, dict):
+        return None
+    value = str(parsed.get("head_commit") or "").strip()
+    return value or None
+
+
+def _task_is_integration(task):
+    return str((task or {}).get("task_kind") or "").strip().lower() == "integration"
+
+
+def _reset_project_integration_result(project):
+    if not isinstance(project, dict):
+        return
+    project["integration_branch"] = None
+    project["integration_head_commit"] = None
+    project["final_result_branch"] = None
+    project["final_result_head_commit"] = None
+
+
+def _verify_task_branch_state(project, task, repo_dir: Path):
+    branch = str((task or {}).get("branch") or "").strip()
+    if not branch:
+        return {
+            "branch": None,
+            "branch_tip": None,
+            "recoverable": False,
+            "reason": "No task branch recorded",
+        }
+    branch_tip = _git_resolve_revision(
+        repo_dir,
+        [
+            branch,
+            f"refs/heads/{branch}",
+            f"origin/{branch}",
+            f"refs/remotes/origin/{branch}",
+        ],
+    )
+    if not branch_tip:
+        return {
+            "branch": branch,
+            "branch_tip": None,
+            "recoverable": False,
+            "reason": f"Task branch {branch} was not found",
+        }
+    recorded_head = _task_recorded_head_commit(task)
+    if recorded_head and _git_is_ancestor(repo_dir, recorded_head, branch_tip):
+        return {
+            "branch": branch,
+            "branch_tip": branch_tip,
+            "recoverable": True,
+            "reason": f"Recorded head commit is reachable from {branch}",
+        }
+    base_branch = str((project or {}).get("base_branch") or "main").strip() or "main"
+    base_tip = _git_resolve_revision(
+        repo_dir,
+        [
+            base_branch,
+            f"refs/heads/{base_branch}",
+            f"origin/{base_branch}",
+            f"refs/remotes/origin/{base_branch}",
+            "HEAD",
+        ],
+    )
+    if base_tip and base_tip != branch_tip:
+        return {
+            "branch": branch,
+            "branch_tip": branch_tip,
+            "recoverable": True,
+            "reason": f"Task branch {branch} diverges from base branch {base_branch}",
+        }
+    return {
+        "branch": branch,
+        "branch_tip": branch_tip,
+        "recoverable": False,
+        "reason": f"Task branch {branch} does not contain durable progress beyond {base_branch}",
+    }
+
+
+def _normalize_resume_worker_swarm_ids(worker_swarm_ids):
+    if worker_swarm_ids is None:
+        return None
+    if not isinstance(worker_swarm_ids, list) or not worker_swarm_ids:
+        raise RuntimeError("project_resume requires at least one worker_swarm_id when overriding workers")
+    normalized = []
+    missing = []
+    for item in worker_swarm_ids:
+        swarm_id = str(item or "").strip()
+        if not swarm_id:
+            continue
+        if swarm_id not in SWARMS:
+            missing.append(swarm_id)
+            continue
+        if swarm_id not in normalized:
+            normalized.append(swarm_id)
+    if missing:
+        raise RuntimeError(f"unknown worker_swarm_ids: {', '.join(missing)}")
+    if not normalized:
+        raise RuntimeError("project_resume requires at least one valid worker_swarm_id")
+    return normalized
+
+
+def _project_has_live_assignments(project):
+    tasks = (project or {}).get("tasks") or {}
+    for task in tasks.values():
+        if not isinstance(task, dict) or task.get("status") != "assigned":
+            continue
+        swarm_id = str(task.get("assigned_swarm_id") or "").strip()
+        if not swarm_id:
+            continue
+        swarm = SWARMS.get(swarm_id)
+        if swarm and swarm.get("status") not in ("terminating", "terminated"):
+            return True
+    return False
+
+
+def _reconcile_project_for_resume(project, retry_failed=False, reverify_completed=True):
+    if not isinstance(project, dict):
+        raise RuntimeError("project not found")
+    tasks = project.get("tasks") or {}
+    repo_dir = None
+    if reverify_completed:
+        repo_dir = _refresh_project_repo_for_resume(project)
+
+    summary = {
+        "kept_completed": 0,
+        "recovered_from_branch": 0,
+        "downgraded_to_pending": 0,
+        "reset_assigned": 0,
+        "retried_failed": 0,
+    }
+    changed_task_ids = set()
+    now = time.time()
+
+    for task_id in project.get("task_order") or list(tasks.keys()):
+        task = tasks.get(task_id)
+        if not isinstance(task, dict):
+            continue
+        status = str(task.get("status") or "").strip().lower()
+        task["resume_decision"] = None
+        task["last_resume_reason"] = None
+        if status == "completed" and reverify_completed:
+            verification = _verify_task_branch_state(project, task, repo_dir)
+            if verification.get("recoverable"):
+                task["verified_branch_commit"] = verification.get("branch_tip")
+                task["verified_at"] = now
+                task["resume_decision"] = "kept_completed"
+                task["last_resume_reason"] = verification.get("reason")
+                summary["kept_completed"] += 1
+            else:
+                task["status"] = "pending"
+                task["assigned_swarm_id"] = None
+                task["assigned_node_id"] = None
+                task["assignment_injection_id"] = None
+                task["verified_branch_commit"] = None
+                task["verified_at"] = None
+                task["resume_decision"] = "downgraded_to_pending"
+                task["last_resume_reason"] = verification.get("reason")
+                task["updated_at"] = now
+                changed_task_ids.add(str(task_id))
+                summary["downgraded_to_pending"] += 1
+                if _task_is_integration(task):
+                    _reset_project_integration_result(project)
+        elif status == "assigned":
+            verification = _verify_task_branch_state(project, task, repo_dir) if reverify_completed else {
+                "recoverable": False,
+                "reason": "Assigned task reset for resume",
+                "branch_tip": None,
+            }
+            task["assigned_swarm_id"] = None
+            task["assigned_node_id"] = None
+            task["assignment_injection_id"] = None
+            if verification.get("recoverable"):
+                task["status"] = "completed"
+                task["result_status"] = str(task.get("result_status") or "recovered_from_branch")
+                task["verified_branch_commit"] = verification.get("branch_tip")
+                task["head_commit"] = task.get("head_commit") or verification.get("branch_tip")
+                task["verified_at"] = now
+                task["resume_decision"] = "recovered_from_branch"
+                task["last_resume_reason"] = verification.get("reason")
+                summary["recovered_from_branch"] += 1
+            else:
+                task["status"] = "pending"
+                task["resume_decision"] = "reset_assigned"
+                task["last_resume_reason"] = verification.get("reason")
+                summary["reset_assigned"] += 1
+            task["updated_at"] = now
+            changed_task_ids.add(str(task_id))
+            if _task_is_integration(task) and task.get("status") != "completed":
+                _reset_project_integration_result(project)
+        elif status == "failed" and retry_failed:
+            task["status"] = "pending"
+            task["assigned_swarm_id"] = None
+            task["assigned_node_id"] = None
+            task["assignment_injection_id"] = None
+            task["last_error"] = None
+            task["resume_decision"] = "retried_failed"
+            task["last_resume_reason"] = "Failed task reset to pending during resume"
+            task["updated_at"] = now
+            changed_task_ids.add(str(task_id))
+            summary["retried_failed"] += 1
+            if _task_is_integration(task):
+                _reset_project_integration_result(project)
+
+    changed = True
+    while changed:
+        changed = False
+        for task_id in reversed(project.get("task_order") or list(tasks.keys())):
+            task = tasks.get(task_id)
+            if not isinstance(task, dict) or task.get("status") != "completed":
+                continue
+            missing_dep = next(
+                (
+                    dep_id
+                    for dep_id in task.get("depends_on") or []
+                    if str((tasks.get(dep_id) or {}).get("status") or "").strip().lower() != "completed"
+                ),
+                None,
+            )
+            if not missing_dep:
+                continue
+            task["status"] = "pending"
+            task["assigned_swarm_id"] = None
+            task["assigned_node_id"] = None
+            task["assignment_injection_id"] = None
+            task["verified_branch_commit"] = None
+            task["verified_at"] = None
+            task["resume_decision"] = "dependency_reset"
+            task["last_resume_reason"] = f"Dependency {missing_dep} is no longer completed"
+            task["updated_at"] = now
+            changed_task_ids.add(str(task_id))
+            summary["downgraded_to_pending"] += 1
+            changed = True
+            if _task_is_integration(task):
+                _reset_project_integration_result(project)
+
+    integration_completed = any(_task_is_integration(task) and task.get("status") == "completed" for task in tasks.values())
+    if not integration_completed:
+        _reset_project_integration_result(project)
+
+    _refresh_project_status(project)
+    return sorted(changed_task_ids), summary
+
+
+def _resume_project_async(
+    project_id,
+    request_id,
+    worker_swarm_ids=None,
+    retry_failed=False,
+    reverify_completed=True,
+):
+    def _run_project_resume():
+        try:
+            with SCHEDULER_LOCK:
+                project = copy.deepcopy(PROJECTS.get(str(project_id)))
+            if not project:
+                raise RuntimeError("unknown project_id")
+            if str(project.get("status") or "").strip().lower() == "completed":
+                raise RuntimeError("project is already completed")
+            if _project_has_live_assignments(project):
+                raise RuntimeError("project has tasks still assigned to active swarms; terminate or wait for them before resuming")
+
+            normalized_workers = _normalize_resume_worker_swarm_ids(worker_swarm_ids)
+            if normalized_workers is not None:
+                project["worker_swarm_ids"] = normalized_workers
+            if not isinstance(project.get("worker_swarm_ids"), list) or not project.get("worker_swarm_ids"):
+                raise RuntimeError("project has no worker swarms configured")
+
+            changed_task_ids, summary = _reconcile_project_for_resume(
+                project,
+                retry_failed=bool(retry_failed),
+                reverify_completed=bool(reverify_completed),
+            )
+            project["resume_count"] = int(project.get("resume_count") or 0) + 1
+            project["last_resume_at"] = time.time()
+            project["last_resumed_by_worker_swarm_ids"] = list(project.get("worker_swarm_ids") or [])
+            project["resume_summary"] = summary
+            project["last_error"] = None
+
+            total_tasks = len(project.get("tasks") or {})
+            completed_tasks = int((project.get("task_counts") or {}).get("completed", 0))
+            if total_tasks > 0 and completed_tasks == total_tasks:
+                project["status"] = "completed"
+                with SCHEDULER_LOCK:
+                    PROJECTS[str(project_id)] = project
+                for task_id in changed_task_ids:
+                    task = (project.get("tasks") or {}).get(str(task_id))
+                    if task:
+                        _sync_task_status_to_beads(project, task)
+                _sync_project_to_beads(project)
+                emit_event("project_resumed", {
+                    "request_id": request_id,
+                    "project_id": project_id,
+                    "status": "completed",
+                    "resume_summary": summary,
+                })
+                _emit_projects_updated()
+                save_state()
+                return
+
+            preparation = {}
+            for swarm_id in project.get("worker_swarm_ids") or []:
+                swarm = SWARMS.get(str(swarm_id))
+                provider = _provider_for_swarm(str(swarm_id))
+                if not swarm or not provider:
+                    raise RuntimeError(f"worker swarm unavailable: {swarm_id}")
+                prepared = provider.prepare_repository(
+                    str(swarm.get("job_id")),
+                    str(project.get("repo_path")),
+                    branch=project.get("base_branch"),
+                    subdir=project.get("workspace_subdir") or "repo",
+                )
+                preparation[str(swarm_id)] = prepared
+            project["repo_preparation"] = preparation
+            project["status"] = "running"
+            _refresh_project_status(project)
+
+            with SCHEDULER_LOCK:
+                PROJECTS[str(project_id)] = project
+            for task_id in changed_task_ids:
+                task = (project.get("tasks") or {}).get(str(task_id))
+                if task:
+                    _sync_task_status_to_beads(project, task)
+            _sync_project_to_beads(project)
+            emit_event("project_resumed", {
+                "request_id": request_id,
+                "project_id": project_id,
+                "status": project.get("status"),
+                "resume_summary": summary,
+            })
+            _emit_projects_updated()
+            save_state()
+            _dispatch_project_tasks(config=None)
+        except Exception as e:
+            with SCHEDULER_LOCK:
+                current = PROJECTS.get(str(project_id))
+                if current:
+                    current["status"] = "error"
+                    current["last_error"] = str(e)
+                    current["updated_at"] = time.time()
+            emit_event("command_rejected", {
+                "request_id": request_id,
+                "reason": str(e),
+            })
+            _emit_projects_updated()
+            save_state()
+
+    threading.Thread(target=_run_project_resume, daemon=True).start()
 
 
 def _start_project_async(project_id, request_id):
@@ -5424,6 +5850,35 @@ def run_daemon(config, providers):
                 _emit_projects_updated()
                 save_state()
                 _start_project_async(project_id, request_id)
+
+            elif command == "project_resume":
+                project_id = str(payload.get("project_id") or "").strip()
+                project = PROJECTS.get(project_id)
+                if not project:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown project_id",
+                    })
+                    continue
+                if str(project.get("status") or "").strip().lower() == "completed":
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "project is already completed",
+                    })
+                    continue
+
+                with SCHEDULER_LOCK:
+                    project["status"] = "resuming"
+                    project["updated_at"] = time.time()
+                _emit_projects_updated()
+                save_state()
+                _resume_project_async(
+                    project_id,
+                    request_id,
+                    worker_swarm_ids=payload.get("worker_swarm_ids"),
+                    retry_failed=bool(payload.get("retry_failed")),
+                    reverify_completed=bool(payload.get("reverify_completed", True)),
+                )
 
             elif command == "swarm_list":
                 emit_event("swarm_list", {
