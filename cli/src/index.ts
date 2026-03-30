@@ -85,6 +85,132 @@ function formatMultilinePreview(label: string, value: unknown): string | null {
   return `${label}:\n${trimmed}`;
 }
 
+function formatCountsLine(counts: Record<string, unknown> | null | undefined): string {
+  const order = ["pending", "assigned", "completed", "failed"];
+  const source = counts && typeof counts === "object" ? counts : {};
+  const entries: string[] = [];
+
+  for (const key of order) {
+    const raw = (source as Record<string, unknown>)[key];
+    const value = typeof raw === "number" ? raw : Number(raw ?? 0);
+    entries.push(`${key}=${Number.isFinite(value) ? value : 0}`);
+  }
+
+  for (const [key, raw] of Object.entries(source)) {
+    if (order.includes(key)) continue;
+    const value = typeof raw === "number" ? raw : Number(raw ?? 0);
+    entries.push(`${key}=${Number.isFinite(value) ? value : 0}`);
+  }
+
+  return entries.join(", ");
+}
+
+function printResumeSummary(summary: Record<string, unknown> | null | undefined) {
+  const source = summary && typeof summary === "object" ? summary : {};
+  const entries = Object.entries(source);
+  if (entries.length === 0) {
+    console.log("Resume summary: none");
+    return;
+  }
+
+  console.log("Resume summary:");
+  for (const [key, raw] of entries) {
+    const value = typeof raw === "number" ? raw : Number(raw ?? 0);
+    console.log(`  ${key}: ${Number.isFinite(value) ? value : raw}`);
+  }
+}
+
+function printResumePreview(preview: Record<string, any>) {
+  const title = typeof preview.title === "string" && preview.title.trim()
+    ? preview.title
+    : String(preview.project_id ?? "unknown");
+  console.log(`Project resume preview: ${title}`);
+  console.log(`Project ID: ${String(preview.project_id ?? "")}`);
+  console.log(`Status: ${String(preview.status ?? "unknown")}`);
+
+  const workers = Array.isArray(preview.worker_swarm_ids)
+    ? preview.worker_swarm_ids.filter((value: unknown) =>
+      typeof value === "string" && value.trim()
+    )
+    : [];
+  console.log(`Workers: ${workers.length > 0 ? workers.join(", ") : "(configured project workers)"}`);
+  console.log(`Options: retry_failed=${Boolean(preview.retry_failed)}, reverify_completed=${Boolean(preview.reverify_completed)}`);
+  console.log(`Counts before: ${formatCountsLine(preview.counts_before)}`);
+  console.log(`Counts after:  ${formatCountsLine(preview.counts_after)}`);
+  console.log(`Blocked: ${Boolean(preview.blocked) ? "yes" : "no"}`);
+  if (typeof preview.blocked_reason === "string" && preview.blocked_reason.trim()) {
+    console.log(`Blocked reason: ${preview.blocked_reason}`);
+  }
+
+  const blockingAssignments = Array.isArray(preview.blocking_assignments)
+    ? preview.blocking_assignments
+    : [];
+  if (blockingAssignments.length > 0) {
+    console.log("Blocking assignments:");
+    for (const item of blockingAssignments) {
+      const swarmId = String(item?.swarm_id ?? "");
+      const swarmAlias = String(item?.swarm_alias ?? swarmId);
+      const taskId = String(item?.task_id ?? "");
+      const nodeId =
+        typeof item?.node_id === "number" ? ` node=${item.node_id}` : "";
+      const branch =
+        typeof item?.branch === "string" && item.branch.trim()
+          ? ` branch=${item.branch}`
+          : "";
+      console.log(`  ${swarmAlias} (${swarmId}) task=${taskId}${nodeId}${branch}`);
+    }
+  }
+
+  printResumeSummary(preview.summary);
+
+  const taskChanges = Array.isArray(preview.task_changes) ? preview.task_changes : [];
+  console.log(`Task changes: ${taskChanges.length}`);
+  for (const change of taskChanges) {
+    const taskId = String(change?.task_id ?? "");
+    const titleText = String(change?.title ?? taskId);
+    const beforeStatus = String(change?.before_status ?? "unknown");
+    const afterStatus = String(change?.after_status ?? "unknown");
+    const decision =
+      typeof change?.resume_decision === "string" && change.resume_decision.trim()
+        ? ` ${change.resume_decision}`
+        : "";
+    console.log(`  - ${taskId}: ${titleText} [${beforeStatus} -> ${afterStatus}]${decision}`);
+    if (typeof change?.reason === "string" && change.reason.trim()) {
+      console.log(`    reason: ${change.reason}`);
+    }
+  }
+}
+
+function normalizeWorkerSwarmIds(cmd: any): string[] | undefined {
+  const values = Array.isArray(cmd.workerSwarmId) ? cmd.workerSwarmId : [];
+  const normalized = values
+    .map((value: unknown) => String(value ?? "").trim())
+    .filter(Boolean);
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function resolveProjectResumeOptions(cmd: any): {
+  workerSwarmIds?: string[];
+  retryFailed: boolean;
+  reverifyCompleted: boolean;
+} {
+  const resolved: {
+    workerSwarmIds?: string[];
+    retryFailed: boolean;
+    reverifyCompleted: boolean;
+  } = {
+    retryFailed: Boolean(cmd.retryFailed),
+    reverifyCompleted: cmd.reverifyCompleted === undefined
+      ? true
+      : Boolean(cmd.reverifyCompleted),
+  };
+  const workerSwarmIds = normalizeWorkerSwarmIds(cmd);
+  if (workerSwarmIds) {
+    resolved.workerSwarmIds = workerSwarmIds;
+  }
+  return resolved;
+}
+
 class SwarmInfoLogger {
   private activeAssistantNodes = new Set<number>();
 
@@ -642,6 +768,54 @@ async function terminateSwarmAndWait(
       if (e?.data?.request_id !== requestId) return;
       if (e.event === "swarm_terminated") {
         resolve();
+        return;
+      }
+      if (e.event === "command_rejected") {
+        reject(new Error(e.data?.reason || "Command rejected"));
+      }
+    });
+  });
+}
+
+async function requestProjectResumePreview(
+  client: RouterClient,
+  projectId: string,
+  opts: {
+    workerSwarmIds?: string[];
+    retryFailed?: boolean;
+    reverifyCompleted?: boolean;
+  }
+): Promise<Record<string, any>> {
+  return await new Promise<Record<string, any>>((resolve, reject) => {
+    const requestId = client.projectResumePreview(projectId, opts);
+    client.onEvent((e) => {
+      if (e?.data?.request_id !== requestId) return;
+      if (e.event === "project_resume_preview") {
+        resolve((e.data as Record<string, any>) || {});
+        return;
+      }
+      if (e.event === "command_rejected") {
+        reject(new Error(e.data?.reason || "Command rejected"));
+      }
+    });
+  });
+}
+
+async function resumeProjectAndWait(
+  client: RouterClient,
+  projectId: string,
+  opts: {
+    workerSwarmIds?: string[];
+    retryFailed?: boolean;
+    reverifyCompleted?: boolean;
+  }
+): Promise<Record<string, any>> {
+  return await new Promise<Record<string, any>>((resolve, reject) => {
+    const requestId = client.projectResume(projectId, opts);
+    client.onEvent((e) => {
+      if (e?.data?.request_id !== requestId) return;
+      if (e.event === "project_resumed") {
+        resolve((e.data as Record<string, any>) || {});
         return;
       }
       if (e.event === "command_rejected") {
@@ -1237,6 +1411,94 @@ program
     });
 
     await new Promise<void>(() => {});
+  });
+
+const projectProgram = program
+  .command("project")
+  .description("Manage orchestrated projects");
+
+projectProgram
+  .command("resume-preview <projectId>")
+  .description("Show how project resume would reconcile task state")
+  .option(
+    "--worker-swarm-id <swarmId>",
+    "Override worker swarm id; repeat for multiple workers",
+    collectRepeatedOption,
+    []
+  )
+  .option("--retry-failed", "Reset failed tasks to pending before resume", false)
+  .option(
+    "--no-reverify-completed",
+    "Skip branch verification for completed and assigned tasks"
+  )
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .option("--json", "Print preview as JSON", false)
+  .action(async (projectId: string, cmd: any) => {
+    const opts = cmd;
+    const transport = await createTransport(opts);
+    const client = new RouterClient(transport);
+
+    try {
+      const preview = await requestProjectResumePreview(
+        client,
+        projectId,
+        resolveProjectResumeOptions(cmd)
+      );
+      if (cmd.json) {
+        console.log(JSON.stringify(preview, null, 2));
+      } else {
+        printResumePreview(preview);
+      }
+      process.exit(Boolean(preview.blocked) ? 2 : 0);
+    } catch (error: any) {
+      console.error("Resume preview failed:", error?.message || String(error));
+      process.exit(1);
+    }
+  });
+
+projectProgram
+  .command("resume <projectId>")
+  .description("Resume an incomplete orchestrated project")
+  .option(
+    "--worker-swarm-id <swarmId>",
+    "Override worker swarm id; repeat for multiple workers",
+    collectRepeatedOption,
+    []
+  )
+  .option("--retry-failed", "Reset failed tasks to pending before resume", false)
+  .option(
+    "--no-reverify-completed",
+    "Skip branch verification for completed and assigned tasks"
+  )
+  .option("--config <path>", "Path to router config")
+  .option("--router <address>", "Router address override (host:port)")
+  .option("--debug", "Print raw JSON messages from router", false)
+  .option("--json", "Print resume result as JSON", false)
+  .action(async (projectId: string, cmd: any) => {
+    const opts = cmd;
+    const transport = await createTransport(opts);
+    const client = new RouterClient(transport);
+
+    try {
+      const result = await resumeProjectAndWait(
+        client,
+        projectId,
+        resolveProjectResumeOptions(cmd)
+      );
+      if (cmd.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(`Project resumed: ${String(result.project_id ?? projectId)}`);
+        console.log(`Status: ${String(result.status ?? "unknown")}`);
+        printResumeSummary(result.resume_summary);
+      }
+      process.exit(0);
+    } catch (error: any) {
+      console.error("Project resume failed:", error?.message || String(error));
+      process.exit(1);
+    }
   });
 
 // --- Web Stack Supervisor ---

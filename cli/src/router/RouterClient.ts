@@ -88,6 +88,56 @@ export class RouterClient {
     });
   }
 
+  projectResume(
+    projectId: string,
+    opts?: {
+      workerSwarmIds?: string[];
+      retryFailed?: boolean;
+      reverifyCompleted?: boolean;
+    }
+  ) {
+    const payload: any = {
+      project_id: projectId,
+    };
+
+    if (Array.isArray(opts?.workerSwarmIds)) {
+      payload.worker_swarm_ids = opts.workerSwarmIds;
+    }
+    if (typeof opts?.retryFailed === "boolean") {
+      payload.retry_failed = opts.retryFailed;
+    }
+    if (typeof opts?.reverifyCompleted === "boolean") {
+      payload.reverify_completed = opts.reverifyCompleted;
+    }
+
+    return this.sendCommand("project_resume", payload);
+  }
+
+  projectResumePreview(
+    projectId: string,
+    opts?: {
+      workerSwarmIds?: string[];
+      retryFailed?: boolean;
+      reverifyCompleted?: boolean;
+    }
+  ) {
+    const payload: any = {
+      project_id: projectId,
+    };
+
+    if (Array.isArray(opts?.workerSwarmIds)) {
+      payload.worker_swarm_ids = opts.workerSwarmIds;
+    }
+    if (typeof opts?.retryFailed === "boolean") {
+      payload.retry_failed = opts.retryFailed;
+    }
+    if (typeof opts?.reverifyCompleted === "boolean") {
+      payload.reverify_completed = opts.reverifyCompleted;
+    }
+
+    return this.sendCommand("project_resume_preview", payload);
+  }
+
   onEvent(cb: (msg: any) => void) {
     this.transport.onMessage(cb);
   }
