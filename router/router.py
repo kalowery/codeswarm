@@ -1369,6 +1369,70 @@ def _sanitize_branch_token(value):
     return text or "task"
 
 
+def _project_task_branch_name(project, task):
+    project_token = _sanitize_branch_token(project.get("project_id"))
+    task_kind = str(task.get("task_kind") or "implementation").strip().lower()
+    if task_kind == "integration":
+        return f"codeswarm/{project_token}/integration"
+    task_token = _sanitize_branch_token(task.get("task_id"))
+    return f"codeswarm/{project_token}/{task_token}"
+
+
+def _next_project_task_id(existing_ids):
+    numeric_ids = []
+    for task_id in existing_ids:
+        match = re.fullmatch(r"T-(\d{3})", str(task_id or "").strip())
+        if match:
+            numeric_ids.append(int(match.group(1)))
+    candidate = max(numeric_ids, default=0) + 1
+    while True:
+        task_id = f"T-{candidate:03d}"
+        if task_id not in existing_ids:
+            return task_id
+        candidate += 1
+
+
+def _build_integration_task(project_id, base_branch, task_order, tasks):
+    dependency_ids = [task_id for task_id in task_order if task_id in tasks]
+    project_stub = {
+        "project_id": project_id,
+        "base_branch": base_branch,
+    }
+    integration_task_id = _next_project_task_id(set(tasks.keys()))
+    integration_task = {
+        "task_id": integration_task_id,
+        "title": "Integrate completed task branches",
+        "prompt": "",
+        "acceptance_criteria": [
+            "Create or update the project integration branch from the base branch.",
+            "Merge every completed task branch into the integration branch in dependency order.",
+            "Run the strongest repo-level verification you can find and report what ran.",
+            "Push the integration branch when an origin remote exists.",
+        ],
+        "depends_on": dependency_ids,
+        "owned_paths": [],
+        "expected_touch_paths": [],
+        "task_kind": "integration",
+        "system_generated": True,
+    }
+    branch_lines = "\n".join(
+        f"- {task_id}: {_project_task_branch_name(project_stub, tasks[task_id])}"
+        for task_id in dependency_ids
+    ) or "- none"
+    integration_branch = _project_task_branch_name(project_stub, integration_task)
+    integration_task["prompt"] = (
+        "This is the final integration task for the project.\n"
+        f"Create or reset the integration branch `{integration_branch}` from the base branch `{base_branch}`.\n"
+        "Merge the completed task branches listed below in the listed order. Fetch any source branch from `origin` first if it is not already available locally. Resolve merge conflicts carefully without rewriting the source task branches.\n"
+        "After merging, run the strongest repository-level verification you can find. Prefer an existing `verify` or smoke target, otherwise run the most appropriate test/build commands available in the repo.\n"
+        "If verification fails, either fix the integrated branch and rerun verification or return status `blocked` with a concise explanation.\n"
+        "Do not create a pull request; the required output is the integrated branch and merge commit.\n\n"
+        "Integration source branches:\n"
+        f"{branch_lines}\n"
+    )
+    return integration_task
+
+
 def _project_task_is_ready(project, task_id):
     task = (project.get("tasks") or {}).get(task_id) or {}
     if task.get("status") not in ("pending", "ready"):
@@ -1827,6 +1891,7 @@ def _create_project_record(
     if missing_swarms:
         raise RuntimeError(f"unknown worker_swarm_ids: {', '.join(missing_swarms)}")
 
+    project_id = str(uuid.uuid4())
     tasks = {}
     task_order = []
     for idx, raw_task in enumerate(raw_tasks):
@@ -1836,12 +1901,22 @@ def _create_project_record(
             raise RuntimeError(f"Duplicate task_id: {task_id}")
         tasks[task_id] = task
         task_order.append(task_id)
+    has_integration_task = any(
+        str(task.get("task_kind") or "").strip().lower() == "integration"
+        for task in tasks.values()
+    )
+    if not has_integration_task:
+        integration_task = _normalize_task_payload(
+            _build_integration_task(project_id, str(base_branch or "main"), task_order, tasks),
+            len(task_order),
+        )
+        tasks[integration_task["task_id"]] = integration_task
+        task_order.append(integration_task["task_id"])
     for task_id, task in tasks.items():
         missing = [dep_id for dep_id in task.get("depends_on") or [] if dep_id not in tasks]
         if missing:
             raise RuntimeError(f"Task {task_id} references unknown dependencies: {', '.join(missing)}")
 
-    project_id = str(uuid.uuid4())
     now = time.time()
     project = {
         "project_id": project_id,
@@ -1860,6 +1935,10 @@ def _create_project_record(
         "beads_prefix": None,
         "beads_db_path": None,
         "beads_root_id": None,
+        "integration_branch": None,
+        "integration_head_commit": None,
+        "final_result_branch": None,
+        "final_result_head_commit": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -1876,6 +1955,7 @@ def _build_project_plan_prompt(title, repo_path, spec_text, base_branch):
     return (
         "You are the planning swarm for an orchestrated project.\n"
         "Decompose the specification into implementation-ready tasks for the referenced repository.\n"
+        "Do not include the final merge/integration task yourself; Codeswarm appends that automatically after planning.\n"
         "Each task must include task_id, title, prompt, acceptance_criteria, depends_on, and optional owned_paths.\n"
         "Do not return an empty task list.\n"
         "If the specification requires an exact task count, produce exactly that many tasks.\n"
@@ -2095,6 +2175,8 @@ def _normalize_task_payload(raw_task, index):
         "depends_on": [str(item) for item in (depends_on if isinstance(depends_on, list) else [])],
         "owned_paths": [str(item) for item in (owned_paths if isinstance(owned_paths, list) else [])],
         "expected_touch_paths": [str(item) for item in (expected_touch_paths if isinstance(expected_touch_paths, list) else [])],
+        "task_kind": str(raw_task.get("task_kind") or raw_task.get("kind") or "implementation"),
+        "system_generated": bool(raw_task.get("system_generated", False)),
         "status": "pending",
         "attempts": 0,
         "assigned_swarm_id": None,
@@ -2173,9 +2255,7 @@ def _parse_task_result_block(text):
 
 
 def _build_project_task_prompt(project, task):
-    project_token = _sanitize_branch_token(project.get("project_id"))
-    task_token = _sanitize_branch_token(task.get("task_id"))
-    branch_name = f"codeswarm/{project_token}/{task_token}"
+    branch_name = _project_task_branch_name(project, task)
     acceptance_lines = "\n".join(
         f"- {item}" for item in (task.get("acceptance_criteria") or []) if str(item).strip()
     ) or "- Satisfy the task prompt and describe any verification you ran."
@@ -2281,6 +2361,16 @@ def _record_project_task_result(project_id, task_id, data):
             else:
                 task["status"] = "failed"
                 task["last_error"] = "Unrecognized TASK_RESULT status"
+            if (
+                task["status"] == "completed"
+                and str(task.get("task_kind") or "").strip().lower() == "integration"
+            ):
+                integration_branch = str(parsed.get("branch") or task.get("branch") or "").strip() or None
+                integration_head_commit = str(parsed.get("head_commit") or "").strip() or None
+                project["integration_branch"] = integration_branch
+                project["integration_head_commit"] = integration_head_commit
+                project["final_result_branch"] = integration_branch
+                project["final_result_head_commit"] = integration_head_commit
         _refresh_project_status(project)
         project_ref = project
         task_ref = task
@@ -2376,7 +2466,7 @@ def _dispatch_project_tasks(config):
                 break
             task_prompt = _build_project_task_prompt(project, ready_task)
             request_id = f"project:{project_id}:{ready_task.get('task_id')}:{uuid.uuid4().hex[:8]}"
-            branch_name = f"codeswarm/{_sanitize_branch_token(project_id)}/{_sanitize_branch_token(ready_task.get('task_id'))}"
+            branch_name = _project_task_branch_name(project, ready_task)
             _mark_outstanding(str(swarm_id), node_id, +1)
             success, injection_id, error = perform_injection(
                 config,

@@ -13,7 +13,8 @@ import type {
   TokenUsage,
   NodeSystemEvent,
   ProjectRecord,
-  ProjectTaskRecord
+  ProjectTaskRecord,
+  FocusTarget
 } from '@/lib/store'
 import remarkGfm from 'remark-gfm'
 
@@ -117,6 +118,7 @@ export default function Home() {
   const selectProject = useSwarmStore((s) => s.selectProject)
   const selected = useSwarmStore((s) => s.selectedSwarm)
   const selectedProject = useSwarmStore((s) => s.selectedProject)
+  const focusTarget = useSwarmStore((s) => s.focusTarget)
   const setPendingPrompt = useSwarmStore((s) => s.setPendingPrompt)
   const activeNodeBySwarm = useSwarmStore((s) => s.activeNodeBySwarm)
   const setActiveNode = useSwarmStore((s) => s.setActiveNode)
@@ -160,8 +162,16 @@ export default function Home() {
   const pendingLaunches = useSwarmStore((s) => s.pendingLaunches)
   const projectList = Object.values(projects)
   const swarmList = Object.values(swarms)
-  const activeProject = selectedProject ? projects[selectedProject] : undefined
-  const active = selected ? swarms[selected] : undefined
+  const selectedProjectRecord = selectedProject ? projects[selectedProject] : undefined
+  const selectedSwarmRecord = selected ? swarms[selected] : undefined
+  const effectiveFocusTarget: FocusTarget | undefined =
+    focusTarget === 'project'
+      ? (selectedProjectRecord ? 'project' : selectedSwarmRecord ? 'swarm' : undefined)
+      : focusTarget === 'swarm'
+      ? (selectedSwarmRecord ? 'swarm' : selectedProjectRecord ? 'project' : undefined)
+      : (selectedProjectRecord ? 'project' : selectedSwarmRecord ? 'swarm' : undefined)
+  const activeProject = effectiveFocusTarget === 'project' ? selectedProjectRecord : undefined
+  const active = effectiveFocusTarget === 'swarm' ? selectedSwarmRecord : undefined
   const activeIsTerminating = (active?.status ?? '').toLowerCase() === 'terminating'
   const activePendingApprovals = active
     ? (() => {

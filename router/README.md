@@ -102,6 +102,18 @@ Behavior:
 7. Emits `swarm_launched`.
 8. Injects `system_prompt` into all nodes asynchronously.
 
+### Orchestrated Projects
+
+Project planning produces implementation tasks only. Codeswarm appends a final
+system-generated integration task automatically. That task:
+
+- waits for all implementation tasks to complete
+- creates `codeswarm/<project-id>/integration`
+- merges the task branches in dependency order
+- runs repo-level verification when available
+
+A project is not considered fully complete until that integration task succeeds.
+
 ---
 
 ### `providers_list`

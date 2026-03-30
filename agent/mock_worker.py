@@ -34,6 +34,28 @@ def extract_between(text: str, prefix: str) -> str:
     return ""
 
 
+def extract_section_bullets(text: str, header: str) -> list[str]:
+    lines = text.splitlines()
+    capture = False
+    results: list[str] = []
+    header_text = header.strip()
+    header_variants = {header_text, header_text.rstrip(":")}
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if line.strip() in header_variants:
+            capture = True
+            continue
+        if not capture:
+            continue
+        if not line.strip():
+            break
+        if line.lstrip().startswith("- "):
+            results.append(line.lstrip()[2:].strip())
+            continue
+        break
+    return results
+
+
 def extract_task_graph_override(spec_text: str):
     marker = "MOCK_TASK_GRAPH_JSON:"
     idx = spec_text.find(marker)
@@ -90,6 +112,109 @@ def run_git(cmd: list[str], cwd: Path) -> subprocess.CompletedProcess:
 def ensure_git_identity(repo_dir: Path) -> None:
     run_git(["git", "config", "user.email", "codeswarm-mock@example.test"], repo_dir)
     run_git(["git", "config", "user.name", "Codeswarm Mock Worker"], repo_dir)
+
+
+def current_head(repo_dir: Path, rev: str = "HEAD") -> str:
+    completed = run_git(["git", "rev-parse", rev], repo_dir)
+    return (completed.stdout or "").strip() or "unknown"
+
+
+def gather_changed_files(repo_dir: Path, base_rev: str, head_rev: str) -> list[str]:
+    completed = run_git(["git", "diff", "--name-only", base_rev, head_rev], repo_dir)
+    if completed.returncode != 0:
+        return []
+    return [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+
+
+def build_mock_integration_result(content: str, repo_dir: Path) -> str:
+    task_id = extract_between(content, "You are executing orchestrated project task ").split(".")[0].strip() or "T-UNKNOWN"
+    branch = extract_between(content, "Working branch to create/use: ") or "codeswarm/mock/integration"
+    base_branch = extract_between(content, "Base branch: ") or "main"
+    branch_specs = extract_section_bullets(content, "Integration source branches:")
+    source_branches = []
+    for item in branch_specs:
+        if ":" in item:
+            _, branch_name = item.split(":", 1)
+            branch_name = branch_name.strip()
+        else:
+            branch_name = item.strip()
+        if branch_name:
+            source_branches.append(branch_name)
+
+    push_enabled = str(os.environ.get("CODESWARM_MOCK_PUSH_BRANCHES") or "").strip().lower() in ("1", "true", "yes", "on")
+    ensure_git_identity(repo_dir)
+
+    branch_existed = run_git(["git", "rev-parse", "--verify", branch], repo_dir).returncode == 0
+    checkout = run_git(["git", "checkout", "-B", branch, base_branch], repo_dir)
+    if checkout.returncode != 0:
+        notes = f"git checkout failed: {(checkout.stderr or checkout.stdout).strip()}"
+        base_rev = current_head(repo_dir)
+        return (
+            "TASK_RESULT\n"
+            f"task_id: {task_id}\n"
+            "status: failed\n"
+            f"branch: {branch}\n"
+            f"base_commit: {base_rev}\n"
+            f"head_commit: {base_rev}\n"
+            "files_changed:\n"
+            "- none\n"
+            "verification:\n"
+            "- integration branch checkout attempted\n"
+            f"notes: {notes}\n"
+        )
+
+    base_rev = current_head(repo_dir, "HEAD")
+    verification = []
+    status = "done"
+    notes = "Mock worker merged task branches into the integration branch."
+
+    if branch_existed:
+        verification.append("integration branch reset from base branch")
+    else:
+        verification.append("integration branch created from base branch")
+
+    for source_branch in source_branches:
+        has_branch = run_git(["git", "rev-parse", "--verify", source_branch], repo_dir).returncode == 0
+        if not has_branch:
+            fetch = run_git(["git", "fetch", "origin", f"{source_branch}:{source_branch}"], repo_dir)
+            verification.append(f"fetched {source_branch} from origin")
+            if fetch.returncode != 0:
+                status = "blocked"
+                notes = f"git fetch failed for {source_branch}: {(fetch.stderr or fetch.stdout).strip()}"
+                break
+        merge = run_git(["git", "merge", "--no-ff", "--no-edit", source_branch], repo_dir)
+        verification.append(f"merged {source_branch}")
+        if merge.returncode != 0:
+            status = "blocked"
+            notes = f"git merge failed for {source_branch}: {(merge.stderr or merge.stdout).strip()}"
+            run_git(["git", "merge", "--abort"], repo_dir)
+            break
+
+    if status == "done" and push_enabled:
+        push = run_git(["git", "push", "--set-upstream", "origin", branch], repo_dir)
+        if push.returncode != 0:
+            status = "failed"
+            notes = f"git push failed: {(push.stderr or push.stdout).strip()}"
+        else:
+            verification.append("pushed integration branch")
+
+    head_rev = current_head(repo_dir, "HEAD")
+    changed_files = gather_changed_files(repo_dir, base_rev, head_rev)
+    file_lines = changed_files or ["none"]
+    verification_lines = verification or ["integration branch prepared"]
+    return (
+        "TASK_RESULT\n"
+        f"task_id: {task_id}\n"
+        f"status: {status}\n"
+        f"branch: {branch}\n"
+        f"base_commit: {base_rev}\n"
+        f"head_commit: {head_rev}\n"
+        "files_changed:\n"
+        + "".join(f"- {item}\n" for item in file_lines)
+        + "verification:\n"
+        + "".join(f"- {item}\n" for item in verification_lines)
+        + f"notes: {notes}\n"
+    )
 
 
 def build_task_result(content: str, repo_dir: Path) -> str:
@@ -189,7 +314,10 @@ def main():
                     response_text = build_task_graph_response(content)
                 elif "You are executing orchestrated project task" in content:
                     repo_dir = agent_dir / "repo"
-                    response_text = build_task_result(content, repo_dir)
+                    if "This is the final integration task for the project." in content:
+                        response_text = build_mock_integration_result(content, repo_dir)
+                    else:
+                        response_text = build_task_result(content, repo_dir)
                 else:
                     response_text = "TASK_RESULT\ntask_id: UNKNOWN\nstatus: failed\nnotes: Unsupported mock prompt\n"
 

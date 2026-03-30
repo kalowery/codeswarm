@@ -144,7 +144,7 @@ def main():
     atexit.register(client.close)
 
     launch_payload = {
-        "provider_params": {"worker_mode": "mock"},
+        "provider_params": {"worker_mode": "mock", "mock_push_branches": True},
         "agents_md_content": "# Mock worker\n",
     }
     planner_request = client.send("swarm_launch", {
@@ -218,8 +218,8 @@ def main():
     if not completed_snapshot:
         raise RuntimeError("Project completion snapshot missing")
     counts = completed_snapshot.get("task_counts") or {}
-    if int(counts.get("completed", 0)) != 2:
-        raise RuntimeError(f"Expected 2 completed tasks, got counts={counts}")
+    if int(counts.get("completed", 0)) != 3:
+        raise RuntimeError(f"Expected 3 completed tasks including integration, got counts={counts}")
 
     worker_paths = []
     for prepared in (completed_snapshot.get("repo_preparation") or {}).values():
@@ -228,17 +228,37 @@ def main():
     if not worker_paths:
         raise RuntimeError("No prepared worker repo paths found")
 
-    first_repo = Path(worker_paths[0])
+    worker_repos = [Path(item) for item in worker_paths]
     for rel in ("mock_tasks/T-001.txt", "mock_tasks/T-002.txt"):
-        if not (first_repo / rel).exists():
-            raise RuntimeError(f"Expected marker file missing: {first_repo / rel}")
+        if not any((repo / rel).exists() for repo in worker_repos):
+            raise RuntimeError(f"Expected marker file missing from all worker repos: {rel}")
+    integration_branch = str(completed_snapshot.get("integration_branch") or "").strip()
+    if not integration_branch:
+        raise RuntimeError("Expected integration_branch to be populated")
+    for rel in ("mock_tasks/T-001.txt", "mock_tasks/T-002.txt"):
+        branch_found = False
+        for repo in worker_repos:
+            show = subprocess.run(
+                ["git", "show", f"{integration_branch}:{rel}"],
+                cwd=repo,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if show.returncode == 0:
+                branch_found = True
+                break
+        if not branch_found:
+            raise RuntimeError(f"Expected {rel} to exist on integration branch {integration_branch}")
 
     print(json.dumps({
         "status": "ok",
         "project_id": completed_snapshot.get("project_id"),
         "planner_swarm_id": planner_swarm.get("swarm_id"),
         "worker_swarm_id": worker_swarm.get("swarm_id"),
-        "worker_repo": str(first_repo),
+        "worker_repos": [str(repo) for repo in worker_repos],
+        "integration_branch": integration_branch,
+        "final_result_head_commit": completed_snapshot.get("final_result_head_commit"),
         "task_counts": counts,
     }, indent=2))
 

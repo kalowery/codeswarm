@@ -203,6 +203,15 @@ def remote_branch_head(repo_name: str, branch: str) -> str:
     return str(((payload.get("object") or {}).get("sha")) or "")
 
 
+def checkout_branch_and_read(repo_dir: Path, branch: str, rel_path: str) -> str:
+    run(["git", "fetch", "origin", branch], cwd=repo_dir)
+    run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo_dir)
+    target = repo_dir / rel_path
+    if not target.exists():
+        raise RuntimeError(f"Expected file missing on branch {branch}: {rel_path}")
+    return target.read_text(encoding="utf-8")
+
+
 def parse_task_result_block(text: str) -> dict:
     parsed: dict[str, object] = {}
     for line in str(text or "").splitlines():
@@ -305,11 +314,16 @@ def main():
         raise RuntimeError(f"Project did not complete: status={completed_snapshot.get('status')} error={completed_snapshot.get('last_error')}")
 
     counts = completed_snapshot.get("task_counts") or {}
-    if int(counts.get("completed", 0)) != 2:
-        raise RuntimeError(f"Expected 2 completed tasks, got counts={counts}")
+    if int(counts.get("completed", 0)) != 3:
+        raise RuntimeError(f"Expected 3 completed tasks including integration, got counts={counts}")
 
     created_branches: list[str] = []
     verified_heads: dict[str, str] = {}
+    integration_branch = str(completed_snapshot.get("integration_branch") or "").strip()
+    if not integration_branch:
+        raise RuntimeError("Expected integration_branch to be populated")
+    remote_verify_repo = clone_repo(clone_source)
+    atexit.register(lambda: shutil.rmtree(remote_verify_repo.parent, ignore_errors=True))
     for task in (completed_snapshot.get("tasks") or {}).values():
         if not isinstance(task, dict):
             continue
@@ -325,6 +339,10 @@ def main():
         if head_commit and remote_head != head_commit:
             raise RuntimeError(f"Remote branch {branch} head {remote_head} did not match task result {head_commit}")
         verified_heads[branch] = remote_head
+    for rel in ("mock_tasks/T-001.txt", "mock_tasks/T-002.txt"):
+        content = checkout_branch_and_read(remote_verify_repo, integration_branch, rel).strip()
+        if not content:
+            raise RuntimeError(f"Expected {rel} to exist on integration branch {integration_branch}")
 
     deleted_after = cleanup_codeswarm_branches(clone_source, created_branches)
 
@@ -338,6 +356,7 @@ def main():
         "project_id": completed_snapshot.get("project_id"),
         "planner_swarm_id": planner_swarm.get("swarm_id"),
         "worker_swarm_id": worker_swarm.get("swarm_id"),
+        "integration_branch": integration_branch,
         "deleted_stale_branches_before": deleted_before,
         "verified_remote_branches": verified_heads,
         "deleted_branches_after": deleted_after,

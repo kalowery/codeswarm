@@ -167,6 +167,8 @@ export interface ProjectTaskRecord {
   depends_on?: string[]
   owned_paths?: string[]
   expected_touch_paths?: string[]
+  task_kind?: string
+  system_generated?: boolean
   status: string
   attempts?: number
   assigned_swarm_id?: string
@@ -203,7 +205,13 @@ export interface ProjectRecord {
   beads_prefix?: string
   beads_db_path?: string
   beads_root_id?: string
+  integration_branch?: string
+  integration_head_commit?: string
+  final_result_branch?: string
+  final_result_head_commit?: string
 }
+
+export type FocusTarget = 'swarm' | 'project'
 
 interface SwarmStore {
   swarms: Record<string, SwarmRecord>
@@ -212,6 +220,7 @@ interface SwarmStore {
   pendingLaunches: Record<string, PendingLaunchRecord>
   selectedSwarm?: string
   selectedProject?: string
+  focusTarget?: FocusTarget
   pendingPrompt?: string
   launchError: string | null
   activeNodeBySwarm: Record<string, number>
@@ -616,6 +625,7 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
     pendingLaunches: {},
     selectedSwarm: undefined,
     selectedProject: undefined,
+    focusTarget: undefined,
     pendingPrompt: undefined,
     launchError: null,
     activeNodeBySwarm: {},
@@ -746,7 +756,9 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         const selectedProject =
           state.selectedProject && updated[state.selectedProject]
             ? state.selectedProject
-            : Object.keys(updated)[0]
+            : state.focusTarget === 'project'
+            ? Object.keys(updated)[0]
+            : undefined
         return {
           projects: updated,
           selectedProject
@@ -798,9 +810,9 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
       })
     },
 
-    selectSwarm: (swarm_id) => set({ selectedSwarm: swarm_id }),
+    selectSwarm: (swarm_id) => set({ selectedSwarm: swarm_id, focusTarget: swarm_id ? 'swarm' : undefined }),
 
-    selectProject: (project_id) => set({ selectedProject: project_id }),
+    selectProject: (project_id) => set({ selectedProject: project_id, focusTarget: project_id ? 'project' : undefined }),
 
     handleMessage: (msg) => {
       const { type, payload } = msg
@@ -933,6 +945,54 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         return
       }
 
+      if (type === 'inject_ack') {
+        const swarm = get().swarms[payload.swarm_id]
+        if (!swarm) return
+
+        const nodeId = Number(payload.node_id)
+        const node = swarm.nodes[nodeId]
+        if (!node) return
+
+        const cleanedTurns: NodeTurn[] = node.turns.map((t) =>
+          t.phase !== 'completed' && t.phase !== 'error'
+            ? ({ ...t, phase: 'completed' } as NodeTurn)
+            : t
+        )
+
+        const turns = [...cleanedTurns]
+        const existingIndex = turns.findIndex((t) => t.injection_id === payload.injection_id)
+        const prompt = typeof payload.prompt === 'string' ? payload.prompt : ''
+
+        if (existingIndex >= 0) {
+          const existing = turns[existingIndex]
+          turns[existingIndex] = {
+            ...existing,
+            prompt: existing.prompt || prompt
+          }
+        } else {
+          turns.push({
+            injection_id: payload.injection_id,
+            prompt,
+            deltas: [],
+            reasoning: '',
+            phase: 'streaming',
+            has_final_answer: false
+          })
+        }
+
+        get().addOrUpdateSwarm({
+          ...swarm,
+          nodes: {
+            ...swarm.nodes,
+            [nodeId]: {
+              ...node,
+              turns: capTurns(turns)
+            }
+          }
+        })
+        return
+      }
+
       if (type === 'turn_started') {
         const swarm = get().swarms[payload.swarm_id]
         if (!swarm) return
@@ -940,13 +1000,10 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
         const nodeId = Number(payload.node_id)
         const node = swarm.nodes[nodeId]
         if (!node) return
-        if (node.turns.some((t) => t.injection_id === payload.injection_id)) {
-          return
-        }
 
         // Force-close any non-terminal turns to avoid multiple active bubbles
         const cleanedTurns: NodeTurn[] = node.turns.map((t) =>
-          t.phase !== 'completed' && t.phase !== 'error'
+          t.injection_id !== payload.injection_id && t.phase !== 'completed' && t.phase !== 'error'
             ? ({ ...t, phase: 'completed' } as NodeTurn)
             : t
         )
@@ -986,7 +1043,23 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           delete pendingTaskComplete[payload.injection_id]
         }
 
-        if (
+        const existingIndex = turns.findIndex((t) => t.injection_id === payload.injection_id)
+
+        if (existingIndex >= 0) {
+          const existing = turns[existingIndex]
+          turns[existingIndex] = {
+            ...existing,
+            ...newTurn,
+            prompt: existing.prompt || newTurn.prompt,
+            deltas: existing.deltas.length > 0 ? existing.deltas : newTurn.deltas,
+            reasoning: existing.reasoning || newTurn.reasoning,
+            phase:
+              existing.has_final_answer || newTurn.has_final_answer
+                ? 'completed'
+                : newTurn.phase,
+            has_final_answer: existing.has_final_answer || newTurn.has_final_answer
+          } as NodeTurn
+        } else if (
           turns.length > 0 &&
           turns[turns.length - 1].injection_id.startsWith('temp-')
         ) {
@@ -1674,6 +1747,7 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
   name: 'codeswarm-ui-store-v2',
   partialize: (state) => ({
     selectedSwarm: state.selectedSwarm,
-    selectedProject: state.selectedProject
+    selectedProject: state.selectedProject,
+    focusTarget: state.focusTarget
   })
 }))

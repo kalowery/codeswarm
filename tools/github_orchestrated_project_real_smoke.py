@@ -392,8 +392,8 @@ def main():
         )
 
     counts = completed_snapshot.get("task_counts") or {}
-    if int(counts.get("completed", 0)) != 2:
-        raise RuntimeError(f"Expected 2 completed tasks, got counts={counts}")
+    if int(counts.get("completed", 0)) != 3:
+        raise RuntimeError(f"Expected 3 completed tasks including integration, got counts={counts}")
     if str(completed_snapshot.get("beads_sync_status") or "") not in ("synced", "partial"):
         raise RuntimeError(
             f"Unexpected beads sync status: {completed_snapshot.get('beads_sync_status')} / {completed_snapshot.get('beads_last_error')}"
@@ -402,8 +402,8 @@ def main():
         raise RuntimeError("Expected beads_root_id to be populated")
 
     tasks = completed_snapshot.get("tasks") or {}
-    if len(tasks) != 2:
-        raise RuntimeError(f"Expected 2 tasks in project snapshot, got {len(tasks)}")
+    if len(tasks) != 3:
+        raise RuntimeError(f"Expected 3 tasks in project snapshot including integration, got {len(tasks)}")
 
     expected_contents = {
         "smoke/alpha.txt": "alpha smoke",
@@ -413,12 +413,25 @@ def main():
     verified_heads: dict[str, str] = {}
     remote_verify_repo = clone_repo(clone_source)
     atexit.register(lambda: shutil.rmtree(remote_verify_repo.parent, ignore_errors=True))
+    implementation_tasks = []
+    integration_task = None
 
     for task in tasks.values():
         if not isinstance(task, dict):
             continue
         if not task.get("beads_id"):
             raise RuntimeError(f"Task missing beads_id: {task.get('task_id')}")
+        if str(task.get("task_kind") or "").strip().lower() == "integration":
+            integration_task = task
+            continue
+        implementation_tasks.append(task)
+
+    if len(implementation_tasks) != 2:
+        raise RuntimeError(f"Expected 2 implementation tasks, got {len(implementation_tasks)}")
+    if not isinstance(integration_task, dict):
+        raise RuntimeError("Expected a system-generated integration task in project snapshot")
+
+    for task in implementation_tasks:
         parsed_result = parse_task_result_block(str(task.get("result_raw") or ""))
         branch = str(parsed_result.get("branch") or task.get("branch") or "").strip()
         if not branch:
@@ -448,6 +461,27 @@ def main():
             )
         verified_heads[branch] = remote_head
 
+    integration_result = parse_task_result_block(str(integration_task.get("result_raw") or ""))
+    integration_branch = str(
+        integration_result.get("branch")
+        or integration_task.get("branch")
+        or completed_snapshot.get("integration_branch")
+        or ""
+    ).strip()
+    if not integration_branch:
+        raise RuntimeError("Integration task did not report an integration branch")
+    integration_head = remote_branch_head(repo_name, integration_branch)
+    if not integration_head:
+        raise RuntimeError(f"Remote integration branch missing: {integration_branch}")
+    for rel_path, expected_content in expected_contents.items():
+        content = checkout_branch_and_read(remote_verify_repo, integration_branch, rel_path).strip()
+        if content != expected_content:
+            raise RuntimeError(
+                f"Unexpected integrated content on {integration_branch} for {rel_path}: {content!r}"
+            )
+    created_branches.append(integration_branch)
+    verified_heads[integration_branch] = integration_head
+
     deleted_after = cleanup_codeswarm_branches(clone_source, created_branches)
 
     print(json.dumps({
@@ -460,6 +494,7 @@ def main():
         "project_id": completed_snapshot.get("project_id"),
         "planner_swarm_id": planner_swarm.get("swarm_id"),
         "worker_swarm_id": worker_swarm.get("swarm_id"),
+        "integration_branch": integration_branch,
         "task_counts": counts,
         "beads_sync_status": completed_snapshot.get("beads_sync_status"),
         "beads_root_id": completed_snapshot.get("beads_root_id"),
