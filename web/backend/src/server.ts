@@ -2258,7 +2258,7 @@ router.on('disconnected', () => {
 
 (async () => {
   await connectWithRetry();
-  const PORT = 4000;
+  const PORT = Number(process.env.CODESWARM_WEB_BACKEND_PORT || process.env.PORT || 4000);
   server.listen(PORT, () => {
     console.log(`Backend running on http://localhost:${PORT}`);
   });

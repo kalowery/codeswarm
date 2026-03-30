@@ -153,7 +153,7 @@ class LocalProvider(ClusterProvider):
 
         cmdline = self._read_proc_cmdline(pid)
         if cmdline:
-            return "codex_worker.py" in cmdline
+            return ("codex_worker.py" in cmdline) or ("mock_worker.py" in cmdline)
         # Fallback if command line is unavailable on this platform.
         return True
 
@@ -439,6 +439,14 @@ class LocalProvider(ClusterProvider):
                 env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1" if bool(launch_params.get("native_auto_approve")) else "0"
             if worker_mode == "mock" and bool(launch_params.get("mock_push_branches")):
                 env["CODESWARM_MOCK_PUSH_BRANCHES"] = "1"
+            if worker_mode == "mock":
+                mock_delay_ms = launch_params.get("mock_delay_ms")
+                if mock_delay_ms is not None:
+                    try:
+                        parsed_mock_delay_ms = max(0, int(mock_delay_ms))
+                    except Exception:
+                        parsed_mock_delay_ms = 0
+                    env["CODESWARM_MOCK_DELAY_MS"] = str(parsed_mock_delay_ms)
 
             p = subprocess.Popen(
                 ["python3", str(worker_path)],

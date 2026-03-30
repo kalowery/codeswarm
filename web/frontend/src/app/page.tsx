@@ -7,6 +7,7 @@ import LaunchModal from '@/components/LaunchModal'
 import ProjectModal from '@/components/ProjectModal'
 import Image from 'next/image'
 import ReactMarkdown from 'react-markdown'
+import { getBackendHttpOrigin } from '@/lib/runtime'
 import type {
   NodeTurn,
   PendingApproval,
@@ -131,7 +132,7 @@ export default function Home() {
   const { status: wsStatus } = useWebSocket()
 
   useEffect(() => {
-    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+    const apiBase = getBackendHttpOrigin()
 
     const fetchJson = async (url: string) => {
       const res = await fetch(url)
@@ -570,7 +571,7 @@ export default function Home() {
     node_id?: number,
     injection_id?: string
   ) {
-    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+    const apiBase = getBackendHttpOrigin()
     const res = await fetch(`${apiBase}/approval`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1020,7 +1021,7 @@ export default function Home() {
           <div key={turnKey} className="space-y-2">
             {turn.prompt && (
               <div className="flex justify-end">
-                <div className="max-w-[75%] bg-indigo-600 text-white px-3 py-2 rounded-lg rounded-br-sm break-words overflow-hidden">
+                <div data-testid="turn-prompt-bubble" className="max-w-[75%] bg-indigo-600 text-white px-3 py-2 rounded-lg rounded-br-sm break-words overflow-hidden">
                   {turn.prompt}
                 </div>
               </div>
@@ -1111,7 +1112,7 @@ export default function Home() {
                   const showRaw = raw !== formatted
 
                   return (
-                    <div className="markdown-content break-words overflow-x-auto text-sm leading-relaxed space-y-2" style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}>
+                    <div data-testid="turn-response-bubble" className="markdown-content break-words overflow-x-auto text-sm leading-relaxed space-y-2" style={{ overflowWrap: 'break-word', wordBreak: 'normal' }}>
                       {showRaw && (
                         <details className="text-xs text-slate-300">
                           <summary className="cursor-pointer select-none text-slate-400">
@@ -1167,7 +1168,7 @@ export default function Home() {
           </div>
 
           <div className="flex items-center justify-between">
-            <span className={`text-xs px-2 py-0.5 rounded border ${
+            <span data-testid="ws-status" className={`text-xs px-2 py-0.5 rounded border ${
               wsStatus === 'connected'
                 ? 'bg-emerald-900 border-emerald-500 text-emerald-400'
                 : wsStatus === 'reconnecting' || wsStatus === 'connecting'
@@ -1178,8 +1179,8 @@ export default function Home() {
             </span>
 
             <div className="flex items-center gap-2">
-              <button onClick={() => setShowProjectModal(true)} className="px-2 py-1 bg-cyan-600 rounded text-sm">+ Project</button>
-              <button onClick={() => setShowLaunch(true)} className="px-2 py-1 bg-indigo-600 rounded text-sm">+ Launch</button>
+              <button data-testid="open-project-modal-button" onClick={() => setShowProjectModal(true)} className="px-2 py-1 bg-cyan-600 rounded text-sm">+ Project</button>
+              <button data-testid="open-launch-modal-button" onClick={() => setShowLaunch(true)} className="px-2 py-1 bg-indigo-600 rounded text-sm">+ Launch</button>
             </div>
           </div>
         </div>
@@ -1217,7 +1218,7 @@ export default function Home() {
             </div>
           ))}
 
-          <div className="pt-3 mt-3 border-t border-slate-800">
+          <div data-testid="projects-panel" className="pt-3 mt-3 border-t border-slate-800">
             <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
               Projects ({projectList.length})
             </div>
@@ -1228,6 +1229,7 @@ export default function Home() {
                 {projectList.map((project) => (
                   <div
                     key={project.project_id}
+                    data-testid={`project-card-${project.project_id}`}
                     onClick={() => selectProject(project.project_id)}
                     className={`p-3 rounded cursor-pointer border transition ${
                       selectedProject === project.project_id
@@ -1261,7 +1263,7 @@ export default function Home() {
             )}
           </div>
 
-          <div className="pt-3 mt-3 border-t border-slate-800">
+          <div data-testid="swarms-panel" className="pt-3 mt-3 border-t border-slate-800">
             <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
               Swarms ({swarmList.length})
             </div>
@@ -1275,6 +1277,7 @@ export default function Home() {
                 return (
                   <div
                     key={swarm.swarm_id}
+                    data-testid={`swarm-card-${swarm.swarm_id}`}
                     onClick={() => {
                       selectSwarm(swarm.swarm_id)
                       selectProject(undefined)
@@ -1325,7 +1328,7 @@ export default function Home() {
             )}
           </div>
 
-          <div className="pt-3 mt-3 border-t border-slate-800">
+          <div data-testid="queue-panel" className="pt-3 mt-3 border-t border-slate-800">
             <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">
               Queued Cross-Swarm Work ({interSwarmQueue.length})
             </div>
@@ -1382,7 +1385,7 @@ export default function Home() {
                 <div className="flex items-start justify-between gap-4 mb-4">
                   <div>
                     <div className="text-xs uppercase tracking-wide text-cyan-400 mb-1">Orchestrated Project</div>
-                    <h1 className="text-xl font-semibold">{activeProject.title}</h1>
+                    <h1 data-testid="project-detail-title" className="text-xl font-semibold">{activeProject.title}</h1>
                     <div className="text-sm text-slate-400">
                       Status: {activeProject.status} · Base branch: {activeProject.base_branch || 'main'}
                     </div>
@@ -1414,6 +1417,7 @@ export default function Home() {
                     )}
                   </div>
                   <button
+                    data-testid="project-start-button"
                     disabled={
                       startingProjectId === activeProject.project_id ||
                       activeProject.status === 'running' ||
@@ -1423,7 +1427,7 @@ export default function Home() {
                     onClick={async () => {
                       try {
                         setStartingProjectId(activeProject.project_id)
-                        const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                        const apiBase = getBackendHttpOrigin()
                         await fetch(`${apiBase}/projects/${activeProject.project_id}/start`, {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' }
@@ -1466,6 +1470,7 @@ export default function Home() {
                         return (
                           <button
                             key={task.task_id}
+                            data-testid={`project-task-row-${task.task_id}`}
                             onClick={() => setSelectedTaskByProject((prev) => ({ ...prev, [activeProject.project_id]: task.task_id }))}
                             className={`w-full text-left rounded border p-3 transition ${
                               isSelected
@@ -1518,7 +1523,7 @@ export default function Home() {
                               {selectedTask.status}
                             </span>
                           </div>
-                          <div className="mt-3 text-sm text-slate-300 whitespace-pre-wrap">{selectedTask.prompt}</div>
+                          <div data-testid="project-task-prompt" className="mt-3 text-sm text-slate-300 whitespace-pre-wrap">{selectedTask.prompt}</div>
                           {selectedTask.acceptance_criteria && selectedTask.acceptance_criteria.length > 0 && (
                             <div className="mt-4">
                               <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Acceptance Criteria</div>
@@ -1564,7 +1569,7 @@ export default function Home() {
                             )}
                           </div>
                           {assignedSwarm && assignedNode && typeof assignedNodeId === 'number' ? (
-                            <div className="max-h-[420px] overflow-y-auto pr-1">
+                            <div data-testid="project-live-worker-view" className="max-h-[420px] overflow-y-auto pr-1">
                               {renderTurns(
                                 assignedNode.turns,
                                 assignedSwarm.pending_approvals?.[assignedNodeId],
@@ -1603,7 +1608,7 @@ export default function Home() {
             })()}
             <div className="flex items-center justify-between mb-4">
               <div>
-                <h1 className="text-xl font-semibold">{active.alias}</h1>
+                <h1 data-testid="swarm-detail-title" className="text-xl font-semibold">{active.alias}</h1>
                 <div className="text-sm text-slate-400">
                   Status: {active.status ?? 'unknown'}
                   {active.slurm_state
@@ -1624,7 +1629,7 @@ export default function Home() {
                   if (!confirm(`Terminate ${active.alias}? This cannot be undone.`)) return
                   try {
                     setIsTerminating(true)
-                    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                    const apiBase = getBackendHttpOrigin()
                     await fetch(`${apiBase}/terminate/${active.alias}`, {
                       method: 'POST',
                       headers: { 'Content-Type': 'application/json' },
@@ -1738,6 +1743,7 @@ export default function Home() {
                           return (
                             <button
                               key={id}
+                              data-testid={`swarm-node-tab-${id}`}
                               onClick={() => setActiveNode(active.swarm_id, id)}
                               onFocus={() => setActiveNode(active.swarm_id, id)}
                               className={`relative min-w-[72px] shrink-0 px-3 py-2 text-xs rounded-t-md transition border-b-2 ${
@@ -1890,6 +1896,7 @@ export default function Home() {
 
             <div className="mt-4">
               <textarea
+                data-testid="swarm-prompt-input"
                 placeholder="Enter prompt..."
                 disabled={isSending}
                 className={`w-full border rounded px-3 py-2 h-20 ${
@@ -2034,7 +2041,7 @@ export default function Home() {
                         })
                       }
 
-                      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+                      const apiBase = getBackendHttpOrigin()
                       const localNodeIds =
                         targetNodes === 'all'
                           ? Object.keys(swarm.nodes).map((id) => Number(id))

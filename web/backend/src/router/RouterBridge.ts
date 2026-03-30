@@ -12,7 +12,10 @@ export class RouterBridge extends EventEmitter {
   private buffer = '';
   private connected = false;
 
-  constructor(private host = '127.0.0.1', private port = 8765) {
+  constructor(
+    private host = process.env.CODESWARM_ROUTER_HOST || '127.0.0.1',
+    private port = Number(process.env.CODESWARM_ROUTER_PORT || 8765)
+  ) {
     super();
   }
 

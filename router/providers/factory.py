@@ -99,6 +99,20 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                 "default": False,
                 "required": False,
             },
+            {
+                "key": "mock_delay_ms",
+                "label": "Mock Delay (ms)",
+                "type": "number",
+                "default": 0,
+                "required": False,
+            },
+            {
+                "key": "mock_push_branches",
+                "label": "Mock Push Branches",
+                "type": "boolean",
+                "default": False,
+                "required": False,
+            },
         ]
 
     if backend == "slurm":

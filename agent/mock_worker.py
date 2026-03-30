@@ -314,6 +314,13 @@ def build_task_result(content: str, repo_dir: Path) -> str:
     )
 
 
+def build_generic_response(content: str) -> str:
+    text = " ".join(str(content or "").split())
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return f"Mock worker received prompt: {text}"
+
+
 def main():
     job_id = os.environ["CODESWARM_JOB_ID"]
     node_id = int(os.environ["CODESWARM_NODE_ID"])
@@ -329,6 +336,10 @@ def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mock_worker": True,
     })
+    try:
+        response_delay_ms = max(0, int(os.environ.get("CODESWARM_MOCK_DELAY_MS") or "0"))
+    except Exception:
+        response_delay_ms = 0
 
     offset = 0
     while True:
@@ -360,6 +371,9 @@ def main():
                 }))
                 write_jsonl(outbox_path, rpc_event(job_id, node_id, injection_id, "turn/started", {}))
 
+                if response_delay_ms > 0:
+                    time.sleep(response_delay_ms / 1000.0)
+
                 if "Return the task graph as JSON" in content or "TASK_GRAPH_JSON" in content:
                     response_text = build_task_graph_response(content)
                 elif "You are executing orchestrated project task" in content:
@@ -369,7 +383,7 @@ def main():
                     else:
                         response_text = build_task_result(content, repo_dir)
                 else:
-                    response_text = "TASK_RESULT\ntask_id: UNKNOWN\nstatus: failed\nnotes: Unsupported mock prompt\n"
+                    response_text = build_generic_response(content)
 
                 write_jsonl(outbox_path, rpc_event(job_id, node_id, injection_id, "codex/event/agent_message", {
                     "msg": {

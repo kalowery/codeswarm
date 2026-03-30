@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { getBackendHttpOrigin } from '@/lib/runtime'
 
 interface Props {
   onClose: () => void
@@ -65,6 +66,30 @@ export default function LaunchModal({ onClose }: Props) {
   const [providersError, setProvidersError] = useState<string | null>(null)
   const agentsFileInputRef = useRef<HTMLInputElement | null>(null)
   const agentsDirInputRef = useRef<HTMLInputElement | null>(null)
+
+  const buildProviderDefaults = (provider: LaunchProvider | undefined) => {
+    if (!provider) return {}
+    const defaults: Record<string, string> = {}
+    const panelFields = (provider.launch_panels ?? [])
+      .flatMap((panel) => (Array.isArray(panel.fields) ? panel.fields : []))
+    const fields = [
+      ...(Array.isArray(provider.launch_fields) ? provider.launch_fields : []),
+      ...panelFields
+    ]
+    for (const field of fields) {
+      const providerDefault = provider.defaults?.[field.key]
+      const fieldDefault = typeof field.default !== 'undefined' ? field.default : providerDefault
+      if (typeof fieldDefault === 'undefined' || fieldDefault === null) continue
+      defaults[field.key] = String(fieldDefault)
+    }
+    return defaults
+  }
+
+  const applyProviderSelection = (providerId: string) => {
+    setSelectedProvider(providerId)
+    const provider = providers.find((item) => item.id === providerId)
+    setProviderValues(buildProviderDefaults(provider))
+  }
 
   const applyPersonaSelection = (
     rootName: string,
@@ -143,7 +168,7 @@ export default function LaunchModal({ onClose }: Props) {
   }
 
   useEffect(() => {
-    const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+    const apiBase = getBackendHttpOrigin()
     setLoadingProviders(true)
     setProvidersError(null)
     let cancelled = false
@@ -169,9 +194,12 @@ export default function LaunchModal({ onClose }: Props) {
           }
           setProviders(list)
           setProvidersError(null)
-          setSelectedProvider((current) =>
-            current && list.some((p) => p.id === current) ? current : list[0].id
-          )
+          const nextProviderId =
+            selectedProvider && list.some((p) => p.id === selectedProvider)
+              ? selectedProvider
+              : list[0].id
+          setSelectedProvider(nextProviderId)
+          setProviderValues(buildProviderDefaults(list.find((p) => p.id === nextProviderId)))
           return
         } catch {
           if (i === delays.length - 1) {
@@ -197,22 +225,7 @@ export default function LaunchModal({ onClose }: Props) {
   useEffect(() => {
     if (!activeProvider) {
       setProviderValues({})
-      return
     }
-    const defaults: Record<string, string> = {}
-    const panelFields = (activeProvider.launch_panels ?? [])
-      .flatMap((panel) => (Array.isArray(panel.fields) ? panel.fields : []))
-    const fields = [
-      ...(Array.isArray(activeProvider.launch_fields) ? activeProvider.launch_fields : []),
-      ...panelFields
-    ]
-    for (const field of fields) {
-      const providerDefault = activeProvider.defaults?.[field.key]
-      const fieldDefault = typeof field.default !== 'undefined' ? field.default : providerDefault
-      if (typeof fieldDefault === 'undefined' || fieldDefault === null) continue
-      defaults[field.key] = String(fieldDefault)
-    }
-    setProviderValues(defaults)
   }, [activeProvider])
 
   async function handleLaunch() {
@@ -225,7 +238,7 @@ export default function LaunchModal({ onClose }: Props) {
 
     try {
       setLoading(true)
-      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+      const apiBase = getBackendHttpOrigin()
       const provider_params: Record<string, string | number | boolean> = {}
       const allProviderFields = activeProvider
         ? [
@@ -291,10 +304,12 @@ export default function LaunchModal({ onClose }: Props) {
     const type = field.type ?? 'text'
     const label = field.label ?? field.key
     const value = providerValues[field.key] ?? ''
+    const fieldTestId = `launch-provider-field-${field.key}`
     if (type === 'boolean') {
       return (
         <label key={field.key} className="flex items-center gap-2 text-sm text-slate-300">
           <input
+            data-testid={fieldTestId}
             type="checkbox"
             checked={value === 'true'}
             onChange={(e) =>
@@ -310,6 +325,7 @@ export default function LaunchModal({ onClose }: Props) {
         <div key={field.key}>
           <label className="block text-sm text-slate-400 mb-1">{label}</label>
           <select
+            data-testid={fieldTestId}
             value={value}
             onChange={(e) => setProviderValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
             className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -330,6 +346,7 @@ export default function LaunchModal({ onClose }: Props) {
           {label}{field.required ? ' *' : ''}
         </label>
         <input
+          data-testid={fieldTestId}
           type={type === 'number' ? 'number' : 'text'}
           value={value}
           onChange={(e) => setProviderValues((prev) => ({ ...prev, [field.key]: e.target.value }))}
@@ -477,7 +494,7 @@ export default function LaunchModal({ onClose }: Props) {
   }, [showProviderTab, activeTab])
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center">
+    <div data-testid="launch-modal" className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center">
       <div className="bg-slate-900 border border-slate-800 rounded-lg w-[560px] h-[680px] max-h-[82vh] p-6 flex flex-col shadow-2xl">
         <h2 className="text-lg font-semibold mb-4">Launch Swarm</h2>
 
@@ -489,8 +506,9 @@ export default function LaunchModal({ onClose }: Props) {
             <div className="text-sm text-rose-400">{providersError}</div>
           ) : (
             <select
+              data-testid="launch-provider-select"
               value={selectedProvider}
-              onChange={(e) => setSelectedProvider(e.target.value)}
+              onChange={(e) => applyProviderSelection(e.target.value)}
               className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
             >
               {providers.map((provider) => (
@@ -505,12 +523,14 @@ export default function LaunchModal({ onClose }: Props) {
         {showProviderTab && (
           <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs mb-4 self-start">
             <button
+              data-testid="launch-general-tab"
               onClick={() => setActiveTab('general')}
               className={`px-3 py-1 ${activeTab === 'general' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
             >
               General
             </button>
             <button
+              data-testid="launch-provider-tab"
               onClick={() => setActiveTab('provider')}
               className={`px-3 py-1 ${activeTab === 'provider' ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
             >
@@ -525,6 +545,7 @@ export default function LaunchModal({ onClose }: Props) {
               <div>
                 <label className="block text-sm text-slate-400 mb-1">Alias</label>
                 <input
+                  data-testid="launch-alias-input"
                   value={alias}
                   onChange={(e) => setAlias(e.target.value)}
                   className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -535,6 +556,7 @@ export default function LaunchModal({ onClose }: Props) {
               <div>
                 <label className="block text-sm text-slate-400 mb-1">Agents</label>
                 <input
+                  data-testid="launch-nodes-input"
                   type="number"
                   min={1}
                   value={nodes}
@@ -546,6 +568,7 @@ export default function LaunchModal({ onClose }: Props) {
               <div>
                 <label className="block text-sm text-slate-400 mb-1">System Prompt</label>
                 <textarea
+                  data-testid="launch-system-prompt-input"
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
                   className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-24"
@@ -619,12 +642,14 @@ export default function LaunchModal({ onClose }: Props) {
 
         <div className="flex justify-end mt-6 space-x-3 shrink-0">
           <button
+            data-testid="launch-cancel-button"
             onClick={onClose}
             className="px-4 py-2 bg-slate-700 rounded"
           >
             Cancel
           </button>
           <button
+            data-testid="launch-submit-button"
             onClick={handleLaunch}
             disabled={loading}
             className="px-4 py-2 bg-indigo-600 rounded disabled:opacity-50"

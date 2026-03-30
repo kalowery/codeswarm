@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import { useSwarmStore } from '@/lib/store'
+import { getBackendHttpOrigin } from '@/lib/runtime'
 
 interface Props {
   onClose: () => void
@@ -101,7 +102,7 @@ export default function ProjectModal({ onClose }: Props) {
 
     try {
       setSubmitting(true)
-      const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+      const apiBase = getBackendHttpOrigin()
       if (mode === 'plan') {
         const res = await fetch(`${apiBase}/projects/plan`, {
           method: 'POST',
@@ -173,18 +174,20 @@ export default function ProjectModal({ onClose }: Props) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center">
+    <div data-testid="project-modal" className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center">
       <div className="bg-slate-900 border border-slate-800 rounded-lg w-[720px] h-[760px] max-h-[86vh] p-6 flex flex-col shadow-2xl">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">Create Project</h2>
           <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs">
             <button
+              data-testid="project-mode-plan"
               onClick={() => setMode('plan')}
               className={`px-3 py-1 ${mode === 'plan' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
             >
               Plan From Spec
             </button>
             <button
+              data-testid="project-mode-tasks"
               onClick={() => setMode('tasks')}
               className={`px-3 py-1 ${mode === 'tasks' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
             >
@@ -198,6 +201,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Project Title</label>
               <input
+                data-testid="project-title-input"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -207,6 +211,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Base Branch</label>
               <input
+                data-testid="project-base-branch-input"
                 value={baseBranch}
                 onChange={(e) => setBaseBranch(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -220,12 +225,14 @@ export default function ProjectModal({ onClose }: Props) {
               <label className="block text-sm text-slate-400 mb-1">Repository Source</label>
               <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs w-full">
                 <button
+                  data-testid="project-repo-mode-local"
                   onClick={() => setRepoMode('local')}
                   className={`flex-1 px-3 py-2 ${repoMode === 'local' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
                 >
                   Local Path
                 </button>
                 <button
+                  data-testid="project-repo-mode-github"
                   onClick={() => setRepoMode('github')}
                   className={`flex-1 px-3 py-2 ${repoMode === 'github' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
                 >
@@ -236,6 +243,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Workspace Subdir</label>
               <input
+                data-testid="project-workspace-subdir-input"
                 value={workspaceSubdir}
                 onChange={(e) => setWorkspaceSubdir(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -248,6 +256,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Repository Path</label>
               <input
+                data-testid="project-repo-path-input"
                 value={repoPath}
                 onChange={(e) => setRepoPath(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -260,6 +269,7 @@ export default function ProjectModal({ onClose }: Props) {
                 <div>
                   <label className="block text-sm text-slate-400 mb-1">GitHub Org / Owner</label>
                   <input
+                    data-testid="project-github-owner-input"
                     value={githubOwner}
                     onChange={(e) => setGithubOwner(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -269,6 +279,7 @@ export default function ProjectModal({ onClose }: Props) {
                 <div>
                   <label className="block text-sm text-slate-400 mb-1">Repository Name</label>
                   <input
+                    data-testid="project-github-repo-input"
                     value={githubRepo}
                     onChange={(e) => setGithubRepo(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -279,6 +290,7 @@ export default function ProjectModal({ onClose }: Props) {
               <div className="grid grid-cols-2 gap-4">
                 <label className="inline-flex items-center gap-2 text-sm text-slate-300">
                   <input
+                    data-testid="project-github-create-if-missing"
                     type="checkbox"
                     checked={githubCreateIfMissing}
                     onChange={(e) => setGithubCreateIfMissing(e.target.checked)}
@@ -288,6 +300,7 @@ export default function ProjectModal({ onClose }: Props) {
                 <div>
                   <label className="block text-sm text-slate-400 mb-1">Visibility</label>
                   <select
+                    data-testid="project-github-visibility-select"
                     value={githubVisibility}
                     onChange={(e) => setGithubVisibility(e.target.value as 'private' | 'public' | 'internal')}
                     className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -308,6 +321,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Planner Swarm</label>
               <select
+                data-testid="project-planner-swarm-select"
                 value={plannerSwarmId}
                 onChange={(e) => setPlannerSwarmId(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
@@ -331,6 +345,7 @@ export default function ProjectModal({ onClose }: Props) {
                 {swarmOptions.map((swarm) => (
                   <label key={swarm.swarm_id} className="flex items-center gap-2 text-sm text-slate-300">
                     <input
+                      data-testid={`project-worker-swarm-${swarm.swarm_id}`}
                       type="checkbox"
                       checked={workerSwarmIds.includes(swarm.swarm_id)}
                       onChange={() => toggleWorker(swarm.swarm_id)}
@@ -347,6 +362,7 @@ export default function ProjectModal({ onClose }: Props) {
 
           <label className="inline-flex items-center gap-2 text-sm text-slate-300">
             <input
+              data-testid="project-auto-start-checkbox"
               type="checkbox"
               checked={autoStart}
               onChange={(e) => setAutoStart(e.target.checked)}
@@ -358,6 +374,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Specification</label>
               <textarea
+                data-testid="project-spec-input"
                 value={spec}
                 onChange={(e) => setSpec(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-72"
@@ -371,6 +388,7 @@ export default function ProjectModal({ onClose }: Props) {
             <div>
               <label className="block text-sm text-slate-400 mb-1">Tasks JSON</label>
               <textarea
+                data-testid="project-tasks-json-input"
                 value={tasksJson}
                 onChange={(e) => setTasksJson(e.target.value)}
                 className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2 h-72 font-mono text-sm"
@@ -383,10 +401,11 @@ export default function ProjectModal({ onClose }: Props) {
         </div>
 
         <div className="flex justify-end mt-6 space-x-3 shrink-0">
-          <button onClick={onClose} className="px-4 py-2 bg-slate-700 rounded">
+          <button data-testid="project-cancel-button" onClick={onClose} className="px-4 py-2 bg-slate-700 rounded">
             Cancel
           </button>
           <button
+            data-testid="project-submit-button"
             onClick={handleSubmit}
             disabled={submitting || swarmOptions.length === 0}
             className="px-4 py-2 bg-cyan-600 rounded disabled:opacity-50"

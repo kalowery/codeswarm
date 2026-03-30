@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useSwarmStore } from './store'
+import { getBackendHttpOrigin, getBackendWsOrigin } from './runtime'
 
 export function useWebSocket() {
   const handleMessage = useSwarmStore((s) => s.handleMessage)
@@ -16,8 +17,7 @@ export function useWebSocket() {
     let isMounted = true
 
     const connect = () => {
-      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${wsProtocol}//${window.location.hostname}:4000`
+      const wsUrl = getBackendWsOrigin()
 
       setStatus(retryCount.current === 0 ? 'connecting' : 'reconnecting')
 
@@ -31,7 +31,7 @@ export function useWebSocket() {
         setStatus('connected')
 
         // Reconcile control plane after reconnect
-        const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+        const apiBase = getBackendHttpOrigin()
         fetch(`${apiBase}/swarms`)
           .then((res) => res.json())
           .then((data) => setSwarms(data))
@@ -58,7 +58,7 @@ export function useWebSocket() {
         try {
           const msg = JSON.parse(event.data)
           if (msg?.type === 'workspace_archive_ready' && typeof msg?.payload?.download_url === 'string') {
-            const apiBase = `${window.location.protocol}//${window.location.hostname}:4000`
+            const apiBase = getBackendHttpOrigin()
             const href = `${apiBase}${msg.payload.download_url}`
             const a = document.createElement('a')
             a.href = href
