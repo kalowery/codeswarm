@@ -2840,8 +2840,13 @@ def _normalize_resume_worker_swarm_ids(worker_swarm_ids):
 
 
 def _project_has_live_assignments(project):
+    return len(_project_live_assignment_details(project)) > 0
+
+
+def _project_live_assignment_details(project):
+    results = []
     tasks = (project or {}).get("tasks") or {}
-    for task in tasks.values():
+    for task_id, task in tasks.items():
         if not isinstance(task, dict) or task.get("status") != "assigned":
             continue
         swarm_id = str(task.get("assigned_swarm_id") or "").strip()
@@ -2849,8 +2854,16 @@ def _project_has_live_assignments(project):
             continue
         swarm = SWARMS.get(swarm_id)
         if swarm and swarm.get("status") not in ("terminating", "terminated"):
-            return True
-    return False
+            results.append({
+                "task_id": str(task_id),
+                "title": str(task.get("title") or task_id),
+                "swarm_id": swarm_id,
+                "swarm_alias": str(swarm.get("alias") or swarm_id),
+                "swarm_status": str(swarm.get("status") or "running"),
+                "node_id": task.get("assigned_node_id"),
+                "branch": task.get("branch"),
+            })
+    return results
 
 
 def _reconcile_project_for_resume(project, retry_failed=False, reverify_completed=True):
@@ -2979,6 +2992,97 @@ def _reconcile_project_for_resume(project, retry_failed=False, reverify_complete
 
     _refresh_project_status(project)
     return sorted(changed_task_ids), summary
+
+
+def _project_resume_preview(project, worker_swarm_ids=None, retry_failed=False, reverify_completed=True):
+    if not isinstance(project, dict):
+        raise RuntimeError("project not found")
+
+    preview_project = copy.deepcopy(project)
+    original_counts = _project_task_counts(preview_project)
+    blocked_reason = None
+    blocking_assignments = _project_live_assignment_details(preview_project)
+
+    if str(preview_project.get("status") or "").strip().lower() == "completed":
+        blocked_reason = "project is already completed"
+
+    live_assignments = len(blocking_assignments) > 0
+    if live_assignments:
+        blocked_reason = (
+            blocked_reason
+            or "project has tasks still assigned to active swarms; terminate or wait for them before resuming"
+        )
+
+    normalized_workers = _normalize_resume_worker_swarm_ids(worker_swarm_ids)
+    if normalized_workers is not None:
+        preview_project["worker_swarm_ids"] = normalized_workers
+    if not isinstance(preview_project.get("worker_swarm_ids"), list) or not preview_project.get("worker_swarm_ids"):
+        blocked_reason = blocked_reason or "project has no worker swarms configured"
+
+    changed_task_ids, summary = _reconcile_project_for_resume(
+        preview_project,
+        retry_failed=bool(retry_failed),
+        reverify_completed=bool(reverify_completed),
+    )
+    resulting_counts = preview_project.get("task_counts") or _project_task_counts(preview_project)
+
+    task_changes = []
+    original_tasks = project.get("tasks") or {}
+    preview_tasks = preview_project.get("tasks") or {}
+    for task_id in preview_project.get("task_order") or list(preview_tasks.keys()):
+        before = original_tasks.get(task_id) or {}
+        after = preview_tasks.get(task_id) or {}
+        before_status = str(before.get("status") or "pending")
+        after_status = str(after.get("status") or "pending")
+        resume_decision = after.get("resume_decision")
+        changed = (
+            task_id in changed_task_ids
+            or before_status != after_status
+            or bool(resume_decision)
+        )
+        if not changed:
+            continue
+        task_changes.append({
+            "task_id": str(task_id),
+            "title": str(after.get("title") or before.get("title") or task_id),
+            "before_status": before_status,
+            "after_status": after_status,
+            "resume_decision": resume_decision,
+            "reason": after.get("last_resume_reason"),
+            "branch": after.get("branch") or before.get("branch"),
+            "assigned_swarm_id": before.get("assigned_swarm_id"),
+            "assigned_node_id": before.get("assigned_node_id"),
+        })
+
+    return {
+        "project_id": preview_project.get("project_id"),
+        "title": preview_project.get("title"),
+        "status": preview_project.get("status"),
+        "blocked": bool(blocked_reason),
+        "blocked_reason": blocked_reason,
+        "has_live_assignments": bool(live_assignments),
+        "blocking_assignments": blocking_assignments,
+        "blocking_swarms": [
+            {
+                "swarm_id": str(item.get("swarm_id") or ""),
+                "swarm_alias": str(item.get("swarm_alias") or item.get("swarm_id") or ""),
+                "swarm_status": str(item.get("swarm_status") or "running"),
+            }
+            for item in {
+                str(entry.get("swarm_id") or ""): entry
+                for entry in blocking_assignments
+                if str(entry.get("swarm_id") or "").strip()
+            }.values()
+        ],
+        "retry_failed": bool(retry_failed),
+        "reverify_completed": bool(reverify_completed),
+        "worker_swarm_ids": list(preview_project.get("worker_swarm_ids") or []),
+        "counts_before": original_counts,
+        "counts_after": resulting_counts,
+        "summary": summary,
+        "changed_task_ids": changed_task_ids,
+        "task_changes": task_changes,
+    }
 
 
 def _resume_project_async(
@@ -5879,6 +5983,34 @@ def run_daemon(config, providers):
                     retry_failed=bool(payload.get("retry_failed")),
                     reverify_completed=bool(payload.get("reverify_completed", True)),
                 )
+
+            elif command == "project_resume_preview":
+                project_id = str(payload.get("project_id") or "").strip()
+                project = PROJECTS.get(project_id)
+                if not project:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": "unknown project_id",
+                    })
+                    continue
+                try:
+                    preview = _project_resume_preview(
+                        project,
+                        worker_swarm_ids=payload.get("worker_swarm_ids"),
+                        retry_failed=bool(payload.get("retry_failed")),
+                        reverify_completed=bool(payload.get("reverify_completed", True)),
+                    )
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e),
+                    })
+                    continue
+                emit_event("project_resume_preview", {
+                    "request_id": request_id,
+                    "project_id": project_id,
+                    "preview": preview,
+                })
 
             elif command == "swarm_list":
                 emit_event("swarm_list", {

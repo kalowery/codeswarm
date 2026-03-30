@@ -415,6 +415,25 @@ async function setWorkerSwarmByAlias(page, alias, checked) {
   assert.equal(result, true, `Worker swarm checkbox not found for alias ${alias}`)
 }
 
+async function setResumeWorkerSwarmByAlias(page, alias, checked) {
+  const result = await page.$$eval(
+    `${testIdSelector('project-resume-modal')} label`,
+    (labels, needle, nextChecked) => {
+      const label = labels.find((item) => (item.textContent || '').includes(String(needle)))
+      if (!label) return false
+      const input = label.querySelector('input[type="checkbox"]')
+      if (!input) return false
+      if (Boolean(input.checked) !== Boolean(nextChecked)) {
+        input.click()
+      }
+      return true
+    },
+    alias,
+    checked
+  )
+  assert.equal(result, true, `Resume worker swarm checkbox not found for alias ${alias}`)
+}
+
 async function launchMockSwarm(page, options) {
   const {
     alias,
@@ -692,11 +711,86 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         await waitForTestIdText(page, 'project-detail-title', new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
         await clickTestId(page, 'project-open-resume-button')
         await waitForTestId(page, 'project-resume-modal')
+        await waitForTestId(page, 'project-resume-preview')
+        await waitForTestIdText(page, 'project-resume-preview', /No task state changes|completed 0|kept 0/i, 30_000)
         await clickTestId(page, 'project-resume-submit-button')
         const completedProject = await waitForProject(stack, title, (item) => item.status === 'completed', 120_000)
         assert.equal(completedProject.status, 'completed')
         assert.ok((completedProject.resume_count || 0) >= 1, 'Expected resume_count after UI resume')
         await waitForTestId(page, 'project-resume-summary')
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('shows blocked resume preview and can clear it by terminating the blocking swarm', async () => {
+      const repo = await createRepoWithOrigin('resume-blocked-ui')
+      tempRepoRoots.push(repo.baseDir)
+      const { context, page } = await newPage(browser, stack)
+      const workerAliasA = `ui-resume-blocker-${Date.now()}`
+      const workerAliasB = `ui-resume-replacement-${Date.now()}`
+      const title = `UI Resume Blocked Project ${Date.now()}`
+      const tasks = JSON.stringify(
+        [
+          {
+            task_id: 'T-001',
+            title: 'Create blocking alpha file',
+            prompt: 'Create a file `ui-resume-blocked/alpha.txt` containing exactly `alpha blocked ui`.',
+            acceptance_criteria: ['`ui-resume-blocked/alpha.txt` exists with exact content `alpha blocked ui`.'],
+            depends_on: [],
+            owned_paths: ['ui-resume-blocked/alpha.txt']
+          }
+        ],
+        null,
+        2
+      )
+      try {
+        await launchMockSwarm(page, {
+          alias: workerAliasA,
+          prompt: '',
+          delayMs: 6000,
+          pushBranches: true
+        })
+        const workerA = await waitForSwarmReady(stack, workerAliasA, 60_000)
+        await launchMockSwarm(page, {
+          alias: workerAliasB,
+          prompt: '',
+          delayMs: 500,
+          pushBranches: true
+        })
+        await waitForSwarmReady(stack, workerAliasB, 60_000)
+        await createDirectProject(page, {
+          title,
+          repoPath: repo.repoDir,
+          workerAlias: workerAliasA,
+          tasksJson: tasks,
+          autoStart: true
+        })
+        await waitForProject(
+          stack,
+          title,
+          (item) => item.status === 'running' && Number(item.task_counts?.assigned ?? 0) >= 1,
+          60_000
+        )
+        await clickCardByText(page, 'project-card-', title)
+        await waitForTestIdText(page, 'project-detail-title', new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+        await clickTestId(page, 'project-open-resume-button')
+        await waitForTestId(page, 'project-resume-modal')
+        await setResumeWorkerSwarmByAlias(page, workerAliasB, true)
+        await waitForTestId(page, 'project-resume-preview-blocked')
+        await clickTestId(page, `project-resume-terminate-swarm-${workerA.swarm_id}`)
+        await page.waitForFunction(
+          () => !document.querySelector('[data-testid="project-resume-preview-blocked"]'),
+          { timeout: 45_000 }
+        )
+        await page.waitForFunction(
+          (selector) => {
+            const button = document.querySelector(selector)
+            return Boolean(button && !button.hasAttribute('disabled'))
+          },
+          { timeout: 15_000 },
+          testIdSelector('project-resume-submit-button')
+        )
       } finally {
         await context.close()
       }

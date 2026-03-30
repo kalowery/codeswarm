@@ -85,6 +85,10 @@ const pendingProvidersRequests = new Map<
   string,
   { resolve: (providers: any[]) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
 >();
+const pendingProjectResumePreviewRequests = new Map<
+  string,
+  { resolve: (preview: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }
+>();
 const pendingApprovalsRequests = new Map<
   string,
   {
@@ -1115,6 +1119,35 @@ function requestApprovalsSnapshot(
   });
 }
 
+function requestProjectResumePreview(
+  payload: {
+    project_id: string;
+    worker_swarm_ids?: string[];
+    retry_failed?: boolean;
+    reverify_completed?: boolean;
+  },
+  timeoutMs = 7000
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    if (!router.isConnected()) {
+      reject(new Error('Router unavailable'));
+      return;
+    }
+    let request_id = '';
+    try {
+      request_id = sendRouterCommand('project_resume_preview', payload);
+    } catch (err) {
+      reject(err instanceof Error ? err : new Error('Router unavailable'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingProjectResumePreviewRequests.delete(request_id);
+      reject(new Error('Timed out waiting for project_resume_preview'));
+    }, timeoutMs);
+    pendingProjectResumePreviewRequests.set(request_id, { resolve, reject, timer });
+  });
+}
+
 function stopApprovalsSyncLoop() {
   if (approvalsSyncTimer) {
     clearInterval(approvalsSyncTimer);
@@ -1402,6 +1435,12 @@ router.on('event', (msg: any) => {
       pendingApprovalsRequests.delete(requestId);
       pending.reject(new Error(typeof data?.reason === 'string' ? data.reason : 'command rejected'));
     }
+    if (requestId && pendingProjectResumePreviewRequests.has(requestId)) {
+      const pending = pendingProjectResumePreviewRequests.get(requestId)!;
+      clearTimeout(pending.timer);
+      pendingProjectResumePreviewRequests.delete(requestId);
+      pending.reject(new Error(typeof data?.reason === 'string' ? data.reason : 'command rejected'));
+    }
     if (requestId && approvalKeyByRequestId.has(requestId)) {
       const key = approvalKeyByRequestId.get(requestId)!;
       approvalKeyByRequestId.delete(requestId);
@@ -1491,6 +1530,16 @@ router.on('event', (msg: any) => {
       clearTimeout(pending.timer);
       pendingProvidersRequests.delete(requestId);
       pending.resolve(providers);
+    }
+  }
+
+  if (event === 'project_resume_preview') {
+    const requestId = typeof data?.request_id === 'string' ? data.request_id : '';
+    if (requestId && pendingProjectResumePreviewRequests.has(requestId)) {
+      const pending = pendingProjectResumePreviewRequests.get(requestId)!;
+      clearTimeout(pending.timer);
+      pendingProjectResumePreviewRequests.delete(requestId);
+      pending.resolve(data?.preview ?? null);
     }
   }
 
@@ -1876,19 +1925,42 @@ app.post('/terminate/:alias', (req, res) => {
   const swarm = state.getByAlias(req.params.alias);
   if (!swarm) return res.status(404).json({ error: 'Unknown swarm' });
   const downloadWorkspaces = Boolean(req.body?.download_workspaces_on_shutdown);
+  const force = Boolean(req.body?.force);
   let request_id = '';
   try {
+    const terminateParams: Record<string, any> = {};
+    if (downloadWorkspaces) terminateParams.download_workspaces_on_shutdown = true;
+    if (force) terminateParams.force = true;
     request_id = sendRouterCommand('swarm_terminate', {
       swarm_id: swarm.swarm_id,
-      terminate_params: downloadWorkspaces
-        ? { download_workspaces_on_shutdown: true }
-        : undefined
+      terminate_params: Object.keys(terminateParams).length > 0 ? terminateParams : undefined
     });
   } catch (err) {
     return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
   }
   requestSwarmMap[request_id] = swarm.swarm_id;
 
+  res.json({ request_id });
+});
+
+app.post('/swarms/:swarmId/terminate', (req, res) => {
+  const swarmId = String(req.params.swarmId || '').trim();
+  if (!swarmId) return res.status(400).json({ error: 'Missing swarm id' });
+  const downloadWorkspaces = Boolean(req.body?.download_workspaces_on_shutdown);
+  const force = Boolean(req.body?.force);
+  let request_id = '';
+  try {
+    const terminateParams: Record<string, any> = {};
+    if (downloadWorkspaces) terminateParams.download_workspaces_on_shutdown = true;
+    if (force) terminateParams.force = true;
+    request_id = sendRouterCommand('swarm_terminate', {
+      swarm_id: swarmId,
+      terminate_params: Object.keys(terminateParams).length > 0 ? terminateParams : undefined
+    });
+  } catch {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  requestSwarmMap[request_id] = swarmId;
   res.json({ request_id });
 });
 
@@ -2241,6 +2313,24 @@ app.post('/projects/:projectId/resume', (req, res) => {
     return res.json({ request_id, status: 'submitted' });
   } catch {
     return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+});
+
+app.post('/projects/:projectId/resume-preview', async (req, res) => {
+  if (!router.isConnected()) {
+    return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
+  }
+  const { worker_swarm_ids, retry_failed, reverify_completed } = req.body || {};
+  try {
+    const preview = await requestProjectResumePreview({
+      project_id: req.params.projectId,
+      worker_swarm_ids,
+      retry_failed: Boolean(retry_failed),
+      reverify_completed: reverify_completed === undefined ? true : Boolean(reverify_completed)
+    });
+    return res.json(preview ?? {});
+  } catch (err) {
+    return res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to build resume preview.' });
   }
 });
 

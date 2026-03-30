@@ -1505,14 +1505,12 @@ export default function Home() {
                     <button
                       data-testid="project-open-resume-button"
                       disabled={
-                        activeProject.status === 'running' ||
                         activeProject.status === 'starting' ||
                         activeProject.status === 'completed' ||
                         activeProject.status === 'resuming'
                       }
                       onClick={() => setResumeProjectId(activeProject.project_id)}
                       className={`px-3 py-1 rounded text-sm ${
-                        activeProject.status === 'running' ||
                         activeProject.status === 'starting' ||
                         activeProject.status === 'completed' ||
                         activeProject.status === 'resuming'
