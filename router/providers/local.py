@@ -276,7 +276,7 @@ class LocalProvider(ClusterProvider):
         value = str(result.stdout or "").strip()
         return value or None
 
-    def _clone_repository(self, source: str, target: Path) -> None:
+    def _resolved_clone_source(self, source: str) -> tuple[str, str | None]:
         github_repo = self._parse_github_repo_ref(source)
         clone_source = str(source)
         source_path = Path(str(source)).expanduser()
@@ -296,6 +296,10 @@ class LocalProvider(ClusterProvider):
                     clone_source = f"git@github.com:{github_repo}.git"
             else:
                 clone_source = f"git@github.com:{github_repo}.git"
+        return clone_source, inherited_origin
+
+    def _clone_repository(self, source: str, target: Path) -> None:
+        clone_source, inherited_origin = self._resolved_clone_source(source)
         result = subprocess.run(
             ["git", "clone", clone_source, str(target)],
             stdout=subprocess.PIPE,
@@ -315,9 +319,29 @@ class LocalProvider(ClusterProvider):
             )
 
     @staticmethod
+    def _remove_path(path: Path) -> None:
+        if not path.exists():
+            return
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+    @staticmethod
     def _has_git_commits(repo_path: Path) -> bool:
         result = subprocess.run(
             ["git", "-C", str(repo_path), "rev-parse", "--verify", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    @staticmethod
+    def _has_git_ref(repo_path: Path, ref_name: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--verify", ref_name],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -351,6 +375,22 @@ class LocalProvider(ClusterProvider):
             detail = create_result.stderr.strip() or create_result.stdout.strip()
             raise RuntimeError(
                 f"Failed to create branch '{branch_name}' for worker {worker_id}: {detail}"
+            )
+
+        remote_ref = f"refs/remotes/origin/{branch_name}"
+        if self._has_git_ref(repo_path, remote_ref):
+            track_result = subprocess.run(
+                ["git", "-C", str(repo_path), "checkout", "-B", branch_name, f"origin/{branch_name}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if track_result.returncode == 0:
+                return
+            detail = track_result.stderr.strip() or track_result.stdout.strip()
+            raise RuntimeError(
+                f"Failed to checkout remote branch '{branch_name}' for worker {worker_id}: {detail}"
             )
 
         detail = result.stderr.strip() or result.stdout.strip()
@@ -540,6 +580,8 @@ class LocalProvider(ClusterProvider):
 
         prepared_paths: list[str] = []
         branch_name = str(branch).strip() if isinstance(branch, str) and str(branch).strip() else None
+        resolved_clone_source, inherited_origin = self._resolved_clone_source(clone_source)
+        desired_origin = inherited_origin or resolved_clone_source
 
         for worker in workers:
             node_id = worker.get("node_id")
@@ -549,11 +591,36 @@ class LocalProvider(ClusterProvider):
             agent_dir.mkdir(parents=True, exist_ok=True)
             target = (agent_dir / subdir).resolve()
 
+            if target.exists():
+                if not (target / ".git").exists():
+                    self._remove_path(target)
+                else:
+                    current_origin = self._origin_remote_url(target)
+                    if current_origin and current_origin != desired_origin:
+                        self._remove_path(target)
             if not target.exists():
                 try:
-                    self._clone_repository(clone_source, target)
+                    self._clone_repository(resolved_clone_source, target)
                 except Exception as e:
                     raise RuntimeError(f"Failed to clone repository for worker {node_id}: {e}")
+            subprocess.run(
+                ["git", "-C", str(target), "remote", "set-url", "origin", desired_origin],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            fetch = subprocess.run(
+                ["git", "-C", str(target), "fetch", "origin", "--prune"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if fetch.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to refresh repository for worker {node_id}: {fetch.stderr.strip() or fetch.stdout.strip()}"
+                )
 
             if branch_name:
                 self._checkout_prepared_branch(target, branch_name, node_id)

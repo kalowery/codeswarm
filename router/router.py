@@ -66,6 +66,8 @@ APPROVAL_ACK_RETRY_SECONDS = 2.0
 # confirms delivery. Short outages can exceed fixed retry windows and otherwise
 # deadlock a turn until a new prompt re-triggers approval flow.
 APPROVAL_ACK_MAX_BACKOFF_SECONDS = 15.0
+PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
+PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
 
 
 def _pid_file_path():
@@ -76,6 +78,16 @@ def _pid_file_path():
 def _state_file_path():
     raw = str(os.environ.get("CODESWARM_ROUTER_STATE_FILE") or "").strip()
     return Path(raw).expanduser() if raw else STATE_FILE
+
+
+def _project_repo_cache_root():
+    raw = str(os.environ.get("CODESWARM_PROJECT_REPO_CACHE_ROOT") or "").strip()
+    return Path(raw).expanduser() if raw else PROJECT_REPO_CACHE_ROOT
+
+
+def _project_repo_cache_root():
+    raw = str(os.environ.get("CODESWARM_PROJECT_REPO_CACHE_ROOT") or "").strip()
+    return Path(raw).expanduser() if raw else PROJECT_REPO_CACHE_ROOT
 
 
 def _bump_approvals_version():
@@ -1369,6 +1381,233 @@ def _sanitize_branch_token(value):
     return text or "task"
 
 
+def _parse_github_repo_ref(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    shorthand = re.fullmatch(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", text)
+    if shorthand:
+        return f"{shorthand.group(1)}/{shorthand.group(2)}"
+    https_match = re.fullmatch(
+        r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+        text,
+    )
+    if https_match:
+        return f"{https_match.group(1)}/{https_match.group(2)}"
+    ssh_match = re.fullmatch(
+        r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+        text,
+    )
+    if ssh_match:
+        return f"{ssh_match.group(1)}/{ssh_match.group(2)}"
+    return None
+
+
+def _git_origin_remote_url(repo_path: Path):
+    if not repo_path.exists() or not (repo_path / ".git").exists():
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    value = str(result.stdout or "").strip()
+    return value or None
+
+
+def _remove_path(path: Path):
+    if not path.exists():
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _run_gh(args):
+    if not shutil.which("gh"):
+        return None, "gh CLI is not installed"
+    try:
+        completed = subprocess.run(
+            ["gh", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except Exception as e:
+        return None, str(e)
+    if completed.returncode != 0:
+        return None, (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+    return completed, None
+
+
+def _github_repo_metadata(name_with_owner):
+    completed, error = _run_gh([
+        "repo",
+        "view",
+        name_with_owner,
+        "--json",
+        "nameWithOwner,sshUrl,url,defaultBranchRef,visibility",
+    ])
+    if not completed:
+        return None, error
+    try:
+        parsed = json.loads(completed.stdout or "{}")
+    except Exception as e:
+        return None, f"Failed to parse gh repo view output: {e}"
+    if not isinstance(parsed, dict):
+        return None, "Unexpected gh repo view output"
+    return parsed, None
+
+
+def _ensure_github_repo(name_with_owner, create_if_missing=False, visibility="private"):
+    metadata, error = _github_repo_metadata(name_with_owner)
+    if metadata:
+        return metadata
+    if not create_if_missing:
+        raise RuntimeError(error or f"GitHub repository not found: {name_with_owner}")
+    visibility_flag = str(visibility or "private").strip().lower()
+    if visibility_flag not in ("public", "private", "internal"):
+        visibility_flag = "private"
+    _, create_error = _run_gh([
+        "repo",
+        "create",
+        name_with_owner,
+        f"--{visibility_flag}",
+    ])
+    if create_error:
+        raise RuntimeError(f"Failed to create GitHub repository {name_with_owner}: {create_error}")
+    metadata, error = _github_repo_metadata(name_with_owner)
+    if not metadata:
+        raise RuntimeError(error or f"Failed to inspect GitHub repository {name_with_owner} after creation")
+    return metadata
+
+
+def _sync_project_control_clone(clone_source, target: Path):
+    target = target.resolve()
+    desired_origin = str(clone_source or "").strip()
+    if not desired_origin:
+        raise RuntimeError("Repository clone source is required")
+    if target.exists():
+        if not (target / ".git").exists():
+            _remove_path(target)
+        else:
+            current_origin = _git_origin_remote_url(target)
+            if current_origin and current_origin != desired_origin:
+                _remove_path(target)
+    if not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["git", "clone", desired_origin, str(target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or f"clone failed for {desired_origin}"
+            raise RuntimeError(detail)
+        return
+    subprocess.run(
+        ["git", "-C", str(target), "remote", "set-url", "origin", desired_origin],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    fetch = subprocess.run(
+        ["git", "-C", str(target), "fetch", "origin", "--prune"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if fetch.returncode != 0:
+        detail = fetch.stderr.strip() or fetch.stdout.strip() or "git fetch failed"
+        raise RuntimeError(f"Failed to update cached repository clone: {detail}")
+
+
+def _resolve_project_repo_spec(
+    repo_path="",
+    repo_mode=None,
+    github_owner=None,
+    github_repo=None,
+    github_create_if_missing=False,
+    github_visibility="private",
+):
+    mode = str(repo_mode or "").strip().lower()
+    owner = str(github_owner or "").strip()
+    repo = str(github_repo or "").strip()
+    raw_repo_path = str(repo_path or "").strip()
+
+    if not mode:
+        if owner and repo:
+            mode = "github"
+        else:
+            mode = "local_path"
+
+    if mode == "github":
+        if not (owner and repo):
+            parsed = _parse_github_repo_ref(raw_repo_path)
+            if parsed:
+                owner, repo = parsed.split("/", 1)
+        if not (owner and repo):
+            raise RuntimeError("github repo mode requires github_owner and github_repo")
+        name_with_owner = f"{owner}/{repo}"
+        metadata = _ensure_github_repo(
+            name_with_owner,
+            create_if_missing=bool(github_create_if_missing),
+            visibility=github_visibility,
+        )
+        clone_source = str(metadata.get("sshUrl") or "").strip() or f"git@github.com:{name_with_owner}.git"
+        cache_root = _project_repo_cache_root() / owner / repo
+        _sync_project_control_clone(clone_source, cache_root)
+        default_branch_ref = metadata.get("defaultBranchRef") or {}
+        default_branch = str((default_branch_ref or {}).get("name") or "").strip() or None
+        return {
+            "repo_mode": "github",
+            "repo_path": str(cache_root.resolve()),
+            "repo_label": name_with_owner,
+            "repo_remote_url": clone_source,
+            "github_owner": owner,
+            "github_repo": repo,
+            "github_visibility": str(metadata.get("visibility") or github_visibility or "private"),
+            "github_create_if_missing": bool(github_create_if_missing),
+            "default_branch": default_branch,
+        }
+
+    source_path = Path(raw_repo_path).expanduser()
+    if not raw_repo_path:
+        raise RuntimeError("Repository path is required")
+    if not source_path.exists() or not source_path.is_dir():
+        raise RuntimeError(f"repo_path does not exist: {raw_repo_path}")
+    resolved = source_path.resolve()
+    if not (resolved / ".git").exists():
+        raise RuntimeError(f"Repository path is not a git repository: {resolved}")
+    remote_url = _git_origin_remote_url(resolved)
+    parsed = _parse_github_repo_ref(remote_url or "")
+    parsed_owner = None
+    parsed_repo = None
+    if parsed:
+        parsed_owner, parsed_repo = parsed.split("/", 1)
+    return {
+        "repo_mode": "local_path",
+        "repo_path": str(resolved),
+        "repo_label": str(resolved),
+        "repo_remote_url": remote_url,
+        "github_owner": parsed_owner,
+        "github_repo": parsed_repo,
+        "github_visibility": None,
+        "github_create_if_missing": False,
+        "default_branch": None,
+    }
+
+
 def _project_task_branch_name(project, task):
     project_token = _sanitize_branch_token(project.get("project_id"))
     task_kind = str(task.get("task_kind") or "implementation").strip().lower()
@@ -1636,12 +1875,14 @@ def _ensure_beads_repo(project):
 
 def _build_project_beads_description(project):
     repo_path = str(project.get("repo_path") or "").strip()
+    repo_label = str(project.get("repo_label") or repo_path).strip() or repo_path
     base_branch = str(project.get("base_branch") or "main").strip() or "main"
     workspace_subdir = str(project.get("workspace_subdir") or "repo").strip() or "repo"
     return (
         "Codeswarm orchestrated project.\n\n"
         f"Project ID: {project.get('project_id')}\n"
-        f"Repository: {repo_path}\n"
+        f"Repository: {repo_label}\n"
+        f"Repository local path: {repo_path}\n"
         f"Base branch: {base_branch}\n"
         f"Worker workspace subdir: {workspace_subdir}\n"
     )
@@ -1872,6 +2113,7 @@ def _create_project_record(
     raw_tasks,
     base_branch="main",
     workspace_subdir="repo",
+    repo_meta=None,
 ):
     if not title or not repo_path:
         raise RuntimeError("project requires title and repo_path")
@@ -1922,6 +2164,13 @@ def _create_project_record(
         "project_id": project_id,
         "title": str(title),
         "repo_path": str(repo_path),
+        "repo_mode": str((repo_meta or {}).get("repo_mode") or "local_path"),
+        "repo_label": str((repo_meta or {}).get("repo_label") or repo_path),
+        "repo_remote_url": (repo_meta or {}).get("repo_remote_url"),
+        "github_owner": (repo_meta or {}).get("github_owner"),
+        "github_repo": (repo_meta or {}).get("github_repo"),
+        "github_visibility": (repo_meta or {}).get("github_visibility"),
+        "github_create_if_missing": bool((repo_meta or {}).get("github_create_if_missing")),
         "base_branch": str(base_branch or "main"),
         "worker_swarm_ids": normalized_swarm_ids,
         "status": "draft",
@@ -1951,11 +2200,15 @@ def _create_project_record(
     return project
 
 
-def _build_project_plan_prompt(title, repo_path, spec_text, base_branch):
+def _build_project_plan_prompt(title, repo_path, spec_text, base_branch, workspace_subdir="repo", repo_label=None, repo_remote_url=None):
+    display_repo = str(repo_label or repo_path or "").strip() or str(repo_path or "").strip()
+    remote_url = str(repo_remote_url or "").strip()
+    repo_workspace = str(workspace_subdir or "repo").strip() or "repo"
     return (
         "You are the planning swarm for an orchestrated project.\n"
         "Decompose the specification into implementation-ready tasks for the referenced repository.\n"
         "Do not include the final merge/integration task yourself; Codeswarm appends that automatically after planning.\n"
+        "A clone of the repository is available in your workspace for inspection before planning.\n"
         "Each task must include task_id, title, prompt, acceptance_criteria, depends_on, and optional owned_paths.\n"
         "Do not return an empty task list.\n"
         "If the specification requires an exact task count, produce exactly that many tasks.\n"
@@ -1963,7 +2216,10 @@ def _build_project_plan_prompt(title, repo_path, spec_text, base_branch):
         "Your final answer must begin with `TASK_GRAPH_JSON` on its own line.\n"
         "The JSON top-level object must contain a `tasks` array.\n\n"
         f"Project title: {title}\n"
-        f"Repository path: {repo_path}\n"
+        f"Repository reference: {display_repo}\n"
+        f"Repository workspace: ./{repo_workspace}\n"
+        + (f"Repository remote: {remote_url}\n" if remote_url else "")
+        + f"Repository local path: {repo_path}\n"
         f"Base branch: {base_branch or 'main'}\n\n"
         "Specification:\n"
         f"{spec_text}\n\n"
@@ -2027,6 +2283,7 @@ def _record_project_plan_result(plan_id, data):
             graph.get("tasks") or [],
             base_branch=plan.get("base_branch") or "main",
             workspace_subdir=plan.get("workspace_subdir") or "repo",
+            repo_meta=plan,
         )
         emit_event("project_created", {
             "request_id": plan.get("request_id"),
@@ -2106,7 +2363,31 @@ def _dispatch_pending_project_plans(config):
                 plan.get("repo_path"),
                 plan.get("spec"),
                 plan.get("base_branch") or "main",
+                plan.get("workspace_subdir") or "repo",
+                plan.get("repo_label"),
+                plan.get("repo_remote_url"),
             )
+
+        try:
+            planner_preparation = planner_provider.prepare_repository(
+                str(planner_swarm.get("job_id")),
+                str(plan.get("repo_path")),
+                branch=plan.get("base_branch") or "main",
+                subdir=plan.get("workspace_subdir") or "repo",
+            )
+        except Exception as e:
+            with SCHEDULER_LOCK:
+                current = PENDING_PROJECT_PLANS.get(str(plan_id))
+                if current:
+                    current["status"] = "failed"
+                    current["last_error"] = str(e)
+                    current["updated_at"] = time.time()
+            emit_event("project_plan_failed", {
+                "plan_id": plan_id,
+                "reason": str(e),
+            })
+            save_state()
+            continue
 
         _mark_outstanding(planner_swarm_id, planner_node_id, +1)
         success, injection_id, error = perform_injection(
@@ -2140,6 +2421,7 @@ def _dispatch_pending_project_plans(config):
                 current["status"] = "planning"
                 current["planner_node_id"] = planner_node_id
                 current["injection_id"] = injection_id
+                current["planner_repo_preparation"] = planner_preparation
                 current["updated_at"] = time.time()
                 current["prompt"] = prompt
         save_state()
@@ -4972,10 +5254,27 @@ def run_daemon(config, providers):
 
             elif command == "project_create":
                 title = str(payload.get("title") or "").strip()
-                repo_path = str(payload.get("repo_path") or "").strip()
                 worker_swarm_ids = payload.get("worker_swarm_ids")
                 raw_tasks = payload.get("tasks")
-                base_branch = str(payload.get("base_branch") or "main").strip() or "main"
+                try:
+                    repo_meta = _resolve_project_repo_spec(
+                        repo_path=payload.get("repo_path") or "",
+                        repo_mode=payload.get("repo_mode"),
+                        github_owner=payload.get("github_owner"),
+                        github_repo=payload.get("github_repo"),
+                        github_create_if_missing=payload.get("github_create_if_missing"),
+                        github_visibility=payload.get("github_visibility") or "private",
+                    )
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e),
+                    })
+                    continue
+                repo_path = str(repo_meta.get("repo_path") or "").strip()
+                base_branch = str(
+                    payload.get("base_branch") or repo_meta.get("default_branch") or "main"
+                ).strip() or "main"
                 workspace_subdir = str(payload.get("workspace_subdir") or "repo").strip() or "repo"
                 auto_start = bool(payload.get("auto_start"))
                 try:
@@ -4986,6 +5285,7 @@ def run_daemon(config, providers):
                         raw_tasks,
                         base_branch=base_branch,
                         workspace_subdir=workspace_subdir,
+                        repo_meta=repo_meta,
                     )
                 except Exception as e:
                     emit_event("command_rejected", {
@@ -5010,11 +5310,28 @@ def run_daemon(config, providers):
 
             elif command == "project_plan":
                 title = str(payload.get("title") or "").strip()
-                repo_path = str(payload.get("repo_path") or "").strip()
                 spec_text = str(payload.get("spec") or "").strip()
                 planner_swarm_id = str(payload.get("planner_swarm_id") or "").strip()
                 worker_swarm_ids = payload.get("worker_swarm_ids")
-                base_branch = str(payload.get("base_branch") or "main").strip() or "main"
+                try:
+                    repo_meta = _resolve_project_repo_spec(
+                        repo_path=payload.get("repo_path") or "",
+                        repo_mode=payload.get("repo_mode"),
+                        github_owner=payload.get("github_owner"),
+                        github_repo=payload.get("github_repo"),
+                        github_create_if_missing=payload.get("github_create_if_missing"),
+                        github_visibility=payload.get("github_visibility") or "private",
+                    )
+                except Exception as e:
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(e),
+                    })
+                    continue
+                repo_path = str(repo_meta.get("repo_path") or "").strip()
+                base_branch = str(
+                    payload.get("base_branch") or repo_meta.get("default_branch") or "main"
+                ).strip() or "main"
                 workspace_subdir = str(payload.get("workspace_subdir") or "repo").strip() or "repo"
                 auto_start = bool(payload.get("auto_start"))
 
@@ -5038,7 +5355,15 @@ def run_daemon(config, providers):
                         "reason": "provider unavailable for planner swarm",
                     })
                     continue
-                prompt = _build_project_plan_prompt(title, repo_path, spec_text, base_branch)
+                prompt = _build_project_plan_prompt(
+                    title,
+                    repo_path,
+                    spec_text,
+                    base_branch,
+                    workspace_subdir,
+                    repo_meta.get("repo_label"),
+                    repo_meta.get("repo_remote_url"),
+                )
                 plan_id = str(uuid.uuid4())
                 with SCHEDULER_LOCK:
                     PENDING_PROJECT_PLANS[plan_id] = {
@@ -5046,6 +5371,13 @@ def run_daemon(config, providers):
                         "request_id": request_id,
                         "title": title,
                         "repo_path": repo_path,
+                        "repo_mode": repo_meta.get("repo_mode"),
+                        "repo_label": repo_meta.get("repo_label"),
+                        "repo_remote_url": repo_meta.get("repo_remote_url"),
+                        "github_owner": repo_meta.get("github_owner"),
+                        "github_repo": repo_meta.get("github_repo"),
+                        "github_visibility": repo_meta.get("github_visibility"),
+                        "github_create_if_missing": bool(repo_meta.get("github_create_if_missing")),
                         "spec": spec_text,
                         "planner_swarm_id": planner_swarm_id,
                         "planner_node_id": None,

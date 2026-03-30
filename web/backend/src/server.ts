@@ -2122,14 +2122,35 @@ app.post('/projects', (req, res) => {
   if (!router.isConnected()) {
     return res.status(503).json({ error: 'Router unavailable. Try again in a moment.' });
   }
-  const { title, repo_path, base_branch, worker_swarm_ids, tasks, workspace_subdir, auto_start } = req.body || {};
-  if (!title || !repo_path || !Array.isArray(worker_swarm_ids) || !Array.isArray(tasks)) {
-    return res.status(400).json({ error: 'title, repo_path, worker_swarm_ids, and tasks are required' });
+  const {
+    title,
+    repo_path,
+    repo_mode,
+    github_owner,
+    github_repo,
+    github_create_if_missing,
+    github_visibility,
+    base_branch,
+    worker_swarm_ids,
+    tasks,
+    workspace_subdir,
+    auto_start
+  } = req.body || {};
+  const hasRepoSpec =
+    (typeof repo_path === 'string' && repo_path.trim().length > 0) ||
+    (typeof github_owner === 'string' && github_owner.trim().length > 0 && typeof github_repo === 'string' && github_repo.trim().length > 0);
+  if (!title || !hasRepoSpec || !Array.isArray(worker_swarm_ids) || !Array.isArray(tasks)) {
+    return res.status(400).json({ error: 'title, a repository path or GitHub org/repo, worker_swarm_ids, and tasks are required' });
   }
   try {
     const request_id = sendRouterCommand('project_create', {
       title,
       repo_path,
+      repo_mode,
+      github_owner,
+      github_repo,
+      github_create_if_missing,
+      github_visibility,
       base_branch,
       worker_swarm_ids,
       tasks,
@@ -2149,6 +2170,11 @@ app.post('/projects/plan', (req, res) => {
   const {
     title,
     repo_path,
+    repo_mode,
+    github_owner,
+    github_repo,
+    github_create_if_missing,
+    github_visibility,
     spec,
     planner_swarm_id,
     worker_swarm_ids,
@@ -2156,15 +2182,23 @@ app.post('/projects/plan', (req, res) => {
     workspace_subdir,
     auto_start
   } = req.body || {};
-  if (!title || !repo_path || !spec || !planner_swarm_id || !Array.isArray(worker_swarm_ids)) {
+  const hasRepoSpec =
+    (typeof repo_path === 'string' && repo_path.trim().length > 0) ||
+    (typeof github_owner === 'string' && github_owner.trim().length > 0 && typeof github_repo === 'string' && github_repo.trim().length > 0);
+  if (!title || !hasRepoSpec || !spec || !planner_swarm_id || !Array.isArray(worker_swarm_ids)) {
     return res.status(400).json({
-      error: 'title, repo_path, spec, planner_swarm_id, and worker_swarm_ids are required'
+      error: 'title, a repository path or GitHub org/repo, spec, planner_swarm_id, and worker_swarm_ids are required'
     });
   }
   try {
     const request_id = sendRouterCommand('project_plan', {
       title,
       repo_path,
+      repo_mode,
+      github_owner,
+      github_repo,
+      github_create_if_missing,
+      github_visibility,
       spec,
       planner_swarm_id,
       worker_swarm_ids,

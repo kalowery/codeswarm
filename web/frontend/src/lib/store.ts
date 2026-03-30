@@ -189,6 +189,13 @@ export interface ProjectRecord {
   project_id: string
   title: string
   repo_path: string
+  repo_mode?: string
+  repo_label?: string
+  repo_remote_url?: string
+  github_owner?: string
+  github_repo?: string
+  github_visibility?: string | null
+  github_create_if_missing?: boolean
   base_branch?: string
   worker_swarm_ids?: string[]
   status: string

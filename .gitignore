@@ -5,13 +5,17 @@ cli/dist/
 
 # Router runtime state
 router_state.json
+router_state.json.*.tmp
 router.pid
+router-state-test-*.json
+router-test-*.pid
 
 # OS junk
 .DS_Store
 
 # Local provider runtime artifacts
 runs/
+.tmp/
 web/backend/state.json
 log.txt
 

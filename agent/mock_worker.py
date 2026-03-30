@@ -56,6 +56,43 @@ def extract_section_bullets(text: str, header: str) -> list[str]:
     return results
 
 
+def extract_task_prompt_text(text: str) -> str:
+    marker = "Task prompt:\n"
+    start = text.find(marker)
+    if start < 0:
+        return ""
+    start += len(marker)
+    end_markers = ("\n\nDependencies:\n", "\n\nAcceptance criteria:\n")
+    end_positions = [text.find(marker, start) for marker in end_markers if text.find(marker, start) >= 0]
+    end = min(end_positions) if end_positions else len(text)
+    return text[start:end].strip()
+
+
+def extract_prompt_file_targets(task_prompt: str) -> list[tuple[str, str]]:
+    if not isinstance(task_prompt, str) or not task_prompt.strip():
+        return []
+    patterns = [
+        re.compile(
+            r"create(?:s)? (?:a|the) file [`'\"](?P<path>[^`'\"]+)[`'\"] containing exactly [`'\"](?P<content>[^`'\"]*)[`'\"]",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"write [`'\"](?P<content>[^`'\"]*)[`'\"] to [`'\"](?P<path>[^`'\"]+)[`'\"]",
+            re.IGNORECASE,
+        ),
+    ]
+    targets: list[tuple[str, str]] = []
+    for pattern in patterns:
+        for match in pattern.finditer(task_prompt):
+            rel_path = str(match.group("path") or "").strip()
+            content = str(match.group("content") or "")
+            if rel_path:
+                targets.append((rel_path, content))
+        if targets:
+            break
+    return targets
+
+
 def extract_task_graph_override(spec_text: str):
     marker = "MOCK_TASK_GRAPH_JSON:"
     idx = spec_text.find(marker)
@@ -63,7 +100,7 @@ def extract_task_graph_override(spec_text: str):
         return None
     raw = spec_text[idx + len(marker):].strip()
     try:
-        parsed = json.loads(raw)
+        parsed, _ = json.JSONDecoder().raw_decode(raw)
     except Exception:
         return None
     return parsed
@@ -221,15 +258,29 @@ def build_task_result(content: str, repo_dir: Path) -> str:
     task_id = extract_between(content, "You are executing orchestrated project task ").split(".")[0].strip() or "T-UNKNOWN"
     branch = extract_between(content, "Working branch to create/use: ") or f"codeswarm/mock/{task_id.lower()}"
     title = extract_between(content, "Task title: ") or task_id
+    task_prompt = extract_task_prompt_text(content)
+    prompt_targets = extract_prompt_file_targets(task_prompt)
     push_enabled = str(os.environ.get("CODESWARM_MOCK_PUSH_BRANCHES") or "").strip().lower() in ("1", "true", "yes", "on")
     ensure_git_identity(repo_dir)
     run_git(["git", "checkout", "-B", branch], repo_dir)
-    task_dir = repo_dir / "mock_tasks"
-    task_dir.mkdir(parents=True, exist_ok=True)
-    filename_token = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_id).strip("_") or "task"
-    target = task_dir / f"{filename_token}.txt"
-    target.write_text(f"{task_id}\n{title}\n", encoding="utf-8")
-    run_git(["git", "add", str(target.relative_to(repo_dir))], repo_dir)
+    changed_paths: list[str] = []
+    if prompt_targets:
+        for rel_path, file_content in prompt_targets:
+            target = repo_dir / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(file_content, encoding="utf-8")
+            rel_text = str(target.relative_to(repo_dir))
+            changed_paths.append(rel_text)
+            run_git(["git", "add", rel_text], repo_dir)
+    else:
+        task_dir = repo_dir / "mock_tasks"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        filename_token = re.sub(r"[^a-zA-Z0-9._-]+", "_", task_id).strip("_") or "task"
+        target = task_dir / f"{filename_token}.txt"
+        target.write_text(f"{task_id}\n{title}\n", encoding="utf-8")
+        rel_text = str(target.relative_to(repo_dir))
+        changed_paths.append(rel_text)
+        run_git(["git", "add", rel_text], repo_dir)
     commit = run_git(["git", "commit", "-m", f"mock complete {task_id}"], repo_dir)
     if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr).lower():
         status = "failed"
@@ -248,7 +299,6 @@ def build_task_result(content: str, repo_dir: Path) -> str:
     head_commit = run_git(["git", "rev-parse", "HEAD"], repo_dir)
     base_rev = (base_commit.stdout or "").strip() or "unknown"
     head_rev = (head_commit.stdout or "").strip() or "unknown"
-    rel_path = str(target.relative_to(repo_dir))
     return (
         "TASK_RESULT\n"
         f"task_id: {task_id}\n"
@@ -257,10 +307,10 @@ def build_task_result(content: str, repo_dir: Path) -> str:
         f"base_commit: {base_rev}\n"
         f"head_commit: {head_rev}\n"
         "files_changed:\n"
-        f"- {rel_path}\n"
-        "verification:\n"
-        "- mock worker created and committed the file\n"
-        f"notes: {notes}\n"
+        + "".join(f"- {rel_path}\n" for rel_path in changed_paths)
+        + "verification:\n"
+        + ("- mock worker created prompt-directed file(s) and committed them\n" if prompt_targets else "- mock worker created and committed the file\n")
+        + f"notes: {notes}\n"
     )
 
 

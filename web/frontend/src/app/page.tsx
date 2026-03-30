@@ -1241,7 +1241,9 @@ export default function Home() {
                         {project.status}
                       </span>
                     </div>
-                    <div className="text-[11px] text-slate-500 mt-1 truncate">{project.repo_path}</div>
+                    <div className="text-[11px] text-slate-500 mt-1 truncate">
+                      {project.repo_label || project.repo_path}
+                    </div>
                     <div className="text-[11px] text-slate-500 mt-1">
                       ready {projectReadyCount(project)} · running {projectAssignedCount(project)} · done {projectCompletedCount(project)}
                     </div>
@@ -1384,7 +1386,12 @@ export default function Home() {
                     <div className="text-sm text-slate-400">
                       Status: {activeProject.status} · Base branch: {activeProject.base_branch || 'main'}
                     </div>
-                    <div className="text-xs text-slate-500 mt-1">{activeProject.repo_path}</div>
+                    <div className="text-xs text-slate-500 mt-1">{activeProject.repo_label || activeProject.repo_path}</div>
+                    {activeProject.repo_label && activeProject.repo_label !== activeProject.repo_path && (
+                      <div className="text-[11px] text-slate-600 mt-1 break-all">
+                        Local repo path: {activeProject.repo_path}
+                      </div>
+                    )}
                     <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px]">
                       <span className={`px-2 py-0.5 rounded border uppercase tracking-wide ${beadsStatusTone(activeProject.beads_sync_status)}`}>
                         Beads {activeProject.beads_sync_status || 'pending'}

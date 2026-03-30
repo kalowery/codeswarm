@@ -8,6 +8,7 @@ interface Props {
 }
 
 type Mode = 'plan' | 'tasks'
+type RepoMode = 'local' | 'github'
 
 const DEFAULT_TASKS_JSON = JSON.stringify(
   [
@@ -29,7 +30,12 @@ export default function ProjectModal({ onClose }: Props) {
   const selectSwarm = useSwarmStore((s) => s.selectSwarm)
   const [mode, setMode] = useState<Mode>('plan')
   const [title, setTitle] = useState('')
+  const [repoMode, setRepoMode] = useState<RepoMode>('local')
   const [repoPath, setRepoPath] = useState('')
+  const [githubOwner, setGithubOwner] = useState('')
+  const [githubRepo, setGithubRepo] = useState('')
+  const [githubCreateIfMissing, setGithubCreateIfMissing] = useState(true)
+  const [githubVisibility, setGithubVisibility] = useState<'private' | 'public' | 'internal'>('private')
   const [baseBranch, setBaseBranch] = useState('main')
   const [workspaceSubdir, setWorkspaceSubdir] = useState('repo')
   const [plannerSwarmId, setPlannerSwarmId] = useState('')
@@ -58,8 +64,12 @@ export default function ProjectModal({ onClose }: Props) {
       alert('Project title is required.')
       return
     }
-    if (!repoPath.trim()) {
+    if (repoMode === 'local' && !repoPath.trim()) {
       alert('Repository path is required.')
+      return
+    }
+    if (repoMode === 'github' && (!githubOwner.trim() || !githubRepo.trim())) {
+      alert('GitHub org and repo name are required.')
       return
     }
     if (workerSwarmIds.length === 0) {
@@ -98,7 +108,12 @@ export default function ProjectModal({ onClose }: Props) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             title: title.trim(),
-            repo_path: repoPath.trim(),
+            repo_mode: repoMode === 'github' ? 'github' : 'local_path',
+            repo_path: repoMode === 'local' ? repoPath.trim() : '',
+            github_owner: repoMode === 'github' ? githubOwner.trim() : '',
+            github_repo: repoMode === 'github' ? githubRepo.trim() : '',
+            github_create_if_missing: repoMode === 'github' ? githubCreateIfMissing : false,
+            github_visibility: repoMode === 'github' ? githubVisibility : undefined,
             spec,
             planner_swarm_id: plannerSwarmId,
             worker_swarm_ids: workerSwarmIds,
@@ -124,7 +139,12 @@ export default function ProjectModal({ onClose }: Props) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             title: title.trim(),
-            repo_path: repoPath.trim(),
+            repo_mode: repoMode === 'github' ? 'github' : 'local_path',
+            repo_path: repoMode === 'local' ? repoPath.trim() : '',
+            github_owner: repoMode === 'github' ? githubOwner.trim() : '',
+            github_repo: repoMode === 'github' ? githubRepo.trim() : '',
+            github_create_if_missing: repoMode === 'github' ? githubCreateIfMissing : false,
+            github_visibility: repoMode === 'github' ? githubVisibility : undefined,
             worker_swarm_ids: workerSwarmIds,
             tasks: parsedTasks,
             base_branch: baseBranch.trim() || 'main',
@@ -197,13 +217,21 @@ export default function ProjectModal({ onClose }: Props) {
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm text-slate-400 mb-1">Repository Path</label>
-              <input
-                value={repoPath}
-                onChange={(e) => setRepoPath(e.target.value)}
-                className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
-                placeholder="/absolute/path/to/repo"
-              />
+              <label className="block text-sm text-slate-400 mb-1">Repository Source</label>
+              <div className="inline-flex rounded border border-slate-700 overflow-hidden text-xs w-full">
+                <button
+                  onClick={() => setRepoMode('local')}
+                  className={`flex-1 px-3 py-2 ${repoMode === 'local' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+                >
+                  Local Path
+                </button>
+                <button
+                  onClick={() => setRepoMode('github')}
+                  className={`flex-1 px-3 py-2 ${repoMode === 'github' ? 'bg-cyan-600 text-white' : 'bg-slate-900 text-slate-300 hover:bg-slate-800'}`}
+                >
+                  GitHub Repo
+                </button>
+              </div>
             </div>
             <div>
               <label className="block text-sm text-slate-400 mb-1">Workspace Subdir</label>
@@ -215,6 +243,66 @@ export default function ProjectModal({ onClose }: Props) {
               />
             </div>
           </div>
+
+          {repoMode === 'local' ? (
+            <div>
+              <label className="block text-sm text-slate-400 mb-1">Repository Path</label>
+              <input
+                value={repoPath}
+                onChange={(e) => setRepoPath(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                placeholder="/absolute/path/to/repo"
+              />
+            </div>
+          ) : (
+            <div className="rounded border border-slate-700 p-3 bg-slate-950/30 space-y-4">
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm text-slate-400 mb-1">GitHub Org / Owner</label>
+                  <input
+                    value={githubOwner}
+                    onChange={(e) => setGithubOwner(e.target.value)}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                    placeholder="AMDResearch"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-slate-400 mb-1">Repository Name</label>
+                  <input
+                    value={githubRepo}
+                    onChange={(e) => setGithubRepo(e.target.value)}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                    placeholder="new-project"
+                  />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <label className="inline-flex items-center gap-2 text-sm text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={githubCreateIfMissing}
+                    onChange={(e) => setGithubCreateIfMissing(e.target.checked)}
+                  />
+                  <span>Create repo if missing</span>
+                </label>
+                <div>
+                  <label className="block text-sm text-slate-400 mb-1">Visibility</label>
+                  <select
+                    value={githubVisibility}
+                    onChange={(e) => setGithubVisibility(e.target.value as 'private' | 'public' | 'internal')}
+                    className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+                  >
+                    <option value="private">Private</option>
+                    <option value="public">Public</option>
+                    <option value="internal">Internal</option>
+                  </select>
+                </div>
+              </div>
+              <div className="text-xs text-slate-500">
+                Codeswarm will create or reuse the GitHub repository, materialize a local control clone for planning and Beads sync, and clone from that source into each worker workspace.
+              </div>
+            </div>
+          )}
 
           {mode === 'plan' && (
             <div>
