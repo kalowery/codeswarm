@@ -134,6 +134,8 @@ export interface SwarmRecord {
   termination_message?: string
   provider?: string
   provider_id?: string
+  agent_runtime?: string
+  claude_env_profile?: string
   known_exec_policies?: string[][]
   pending_approvals?: Record<number, PendingApproval[]>
   nodes: Record<number, NodeState>
@@ -1001,6 +1003,17 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           turns[existingIndex] = {
             ...existing,
             prompt: existing.prompt || prompt
+          }
+        } else if (
+          turns.length > 0 &&
+          turns[turns.length - 1].injection_id.startsWith('temp-') &&
+          (turns[turns.length - 1].prompt || '') === prompt
+        ) {
+          const provisional = turns[turns.length - 1]
+          turns[turns.length - 1] = {
+            ...provisional,
+            injection_id: payload.injection_id,
+            prompt: provisional.prompt || prompt
           }
         } else {
           turns.push({

@@ -624,6 +624,25 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
       }
     })
 
+    await t.test('keeps websocket connected through initial UI activity', async () => {
+      const { context, page } = await newPage(browser, stack)
+      try {
+        await waitForTestIdText(page, 'ws-status', /connected/i, 30_000)
+        await clickTestId(page, 'open-launch-modal-button')
+        await waitForTestId(page, 'launch-modal')
+        await clickTestId(page, 'launch-cancel-button')
+        await clickTestId(page, 'open-project-modal-button')
+        await waitForTestId(page, 'project-modal')
+        await clickTestId(page, 'project-cancel-button')
+        await new Promise((resolve) => setTimeout(resolve, 2500))
+        const wsStatusText = await page.$eval(testIdSelector('ws-status'), (el) => el.textContent || '')
+        assert.match(wsStatusText, /connected/i)
+        assert.doesNotMatch(wsStatusText, /disconnected/i)
+      } finally {
+        await context.close()
+      }
+    })
+
     await t.test('launches a mock swarm and shows prompt/response bubbles', async () => {
       const { context, page } = await newPage(browser, stack)
       const alias = `ui-chat-${Date.now()}`
@@ -635,6 +654,13 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         })
         await clickCardByText(page, 'swarm-card-', alias)
         await waitForTestIdText(page, 'swarm-detail-title', new RegExp(alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+        await waitForTestIdText(page, 'swarm-detail-title', new RegExp(alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+        await page.waitForFunction(() => {
+          return Array.from(document.querySelectorAll('div')).some((el) => {
+            const text = el.textContent || ''
+            return text.includes('Runtime: mock') && text.includes('Launch Profile: local-mock-worker')
+          })
+        }, { timeout: 30_000 })
         const promptText = 'Summarize your readiness for the UI smoke test.'
         await waitForTestId(page, 'swarm-prompt-input')
         await page.focus(testIdSelector('swarm-prompt-input'))
@@ -655,6 +681,43 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         await clickTestId(page, 'launch-provider-tab')
         assert.equal(await checkboxStateByTestId(page, 'launch-provider-field-native_auto_approve'), true)
         assert.equal(await checkboxStateByTestId(page, 'launch-provider-field-fresh_thread_per_injection'), true)
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('shows Claude as an available local agent runtime', async () => {
+      const { context, page } = await newPage(browser, stack)
+      try {
+        await clickTestId(page, 'open-launch-modal-button')
+        await waitForTestId(page, 'launch-modal')
+        await selectOptionByText(page, 'launch-provider-select', 'Local Dev')
+        await clickTestId(page, 'launch-provider-tab')
+        const runtimeOption = await optionStateByText(page, 'launch-provider-field-worker_mode', 'Claude')
+        assert.equal(runtimeOption.disabled, false)
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('shows the Claude gateway env profile in launch modal', async () => {
+      const { context, page } = await newPage(browser, stack)
+      try {
+        await clickTestId(page, 'open-launch-modal-button')
+        await waitForTestId(page, 'launch-modal')
+        await selectOptionByText(page, 'launch-provider-select', 'Local Dev')
+        await clickTestId(page, 'launch-provider-tab')
+        const profileOption = await optionStateByText(
+          page,
+          'launch-provider-field-claude_env_profile',
+          'amd-llm-gateway'
+        )
+        assert.equal(profileOption.disabled, false)
+        const selectedValue = await page.$eval(
+          testIdSelector('launch-provider-field-claude_env_profile'),
+          (el) => el.value
+        )
+        assert.equal(selectedValue, 'amd-llm-gateway')
       } finally {
         await context.close()
       }

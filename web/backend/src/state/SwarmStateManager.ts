@@ -7,6 +7,8 @@ export interface SwarmRecord {
   slurm_state?: string;
   provider?: string;
   provider_id?: string;
+  agent_runtime?: string;
+  claude_env_profile?: string;
   created_at: number;
 }
 
@@ -61,7 +63,14 @@ export class SwarmStateManager {
     alias: string,
     job_id: string,
     node_count: number,
-    options?: { provider?: string; provider_id?: string; status?: string; slurm_state?: string }
+    options?: {
+      provider?: string;
+      provider_id?: string;
+      status?: string;
+      slurm_state?: string;
+      agent_runtime?: string;
+      claude_env_profile?: string;
+    }
   ) {
     const normalized = alias.toLowerCase();
     if (this.aliasIndex.has(normalized)) {
@@ -77,6 +86,8 @@ export class SwarmStateManager {
       slurm_state: options?.slurm_state,
       provider: options?.provider,
       provider_id: options?.provider_id,
+      agent_runtime: options?.agent_runtime,
+      claude_env_profile: options?.claude_env_profile,
       created_at: Date.now()
     };
 
@@ -130,7 +141,13 @@ export class SwarmStateManager {
     this.saveState();
   }
 
-  updateProviderMeta(swarm_id: string, provider?: string, provider_id?: string) {
+  updateProviderMeta(
+    swarm_id: string,
+    provider?: string,
+    provider_id?: string,
+    agent_runtime?: string,
+    claude_env_profile?: string
+  ) {
     const swarm = this.swarms.get(swarm_id);
     if (!swarm) return;
     if (typeof provider === 'string' && provider.length > 0) {
@@ -138,6 +155,12 @@ export class SwarmStateManager {
     }
     if (typeof provider_id === 'string' && provider_id.length > 0) {
       swarm.provider_id = provider_id;
+    }
+    if (typeof agent_runtime === 'string' && agent_runtime.length > 0) {
+      swarm.agent_runtime = agent_runtime;
+    }
+    if (typeof claude_env_profile === 'string' && claude_env_profile.length > 0) {
+      swarm.claude_env_profile = claude_env_profile;
     }
     this.saveState();
   }

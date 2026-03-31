@@ -1778,6 +1778,12 @@ export default function Home() {
                     ? ` · ${(active.provider ?? '').toLowerCase() === 'slurm' ? 'Slurm' : 'Backend'}: ${active.slurm_state}`
                     : ''}
                 </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  Runtime: {active.agent_runtime ?? 'codex'}
+                  {active.provider_id ? ` · Launch Profile: ${active.provider_id}` : ''}
+                  {active.provider ? ` · Provider: ${active.provider}` : ''}
+                  {active.claude_env_profile ? ` · Claude Env: ${active.claude_env_profile}` : ''}
+                </div>
                 {activeIsTerminating && (
                   <div className="mt-2 inline-flex items-center gap-2 px-2 py-1 rounded border border-amber-500/40 bg-amber-500/10 text-amber-300 text-xs">
                     <span className="inline-block w-2 h-2 rounded-full bg-amber-400 animate-pulse" />

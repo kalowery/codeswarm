@@ -1505,7 +1505,16 @@ router.on('event', (msg: any) => {
   }
 
   if (event === 'swarm_launched') {
-    const { swarm_id, job_id, node_count, request_id, provider, provider_id } = data;
+    const {
+      swarm_id,
+      job_id,
+      node_count,
+      request_id,
+      provider,
+      provider_id,
+      agent_runtime,
+      claude_env_profile
+    } = data;
     if (typeof request_id === 'string' && request_id) {
       clearPendingLaunchTimer(request_id);
     }
@@ -1514,7 +1523,12 @@ router.on('event', (msg: any) => {
     const alias = pendingAliases[request_id] || `swarm-${swarm_id.slice(0, 8)}`;
     delete pendingAliases[request_id];
 
-    const record = state.createSwarm(swarm_id, alias, job_id, node_count, { provider, provider_id });
+    const record = state.createSwarm(swarm_id, alias, job_id, node_count, {
+      provider,
+      provider_id,
+      agent_runtime: typeof agent_runtime === 'string' ? agent_runtime : undefined,
+      claude_env_profile: typeof claude_env_profile === 'string' ? claude_env_profile : undefined
+    });
 
     // Initially mark as pending until Slurm confirms
     state.updateStatus(swarm_id, 'pending');
@@ -1534,6 +1548,8 @@ router.on('event', (msg: any) => {
             request_id,
             provider: provider || undefined,
             provider_id: provider_id || undefined,
+            agent_runtime: typeof agent_runtime === 'string' ? agent_runtime : undefined,
+            claude_env_profile: typeof claude_env_profile === 'string' ? claude_env_profile : undefined,
             stage: 'cleanup',
             message: 'Launch exceeded hard timeout; auto-terminating resources',
             timestamp: Date.now() / 1000
@@ -1544,8 +1560,11 @@ router.on('event', (msg: any) => {
       }
     }
 
-    // Immediately request real Slurm status
-    requestStatus(swarm_id);
+    // Only eager-poll remote/slow providers. Local workers can race their first
+    // heartbeat on startup and briefly look dead even though they are fine.
+    if (isSlowLaunchProvider(provider, provider_id)) {
+      requestStatus(swarm_id);
+    }
   }
 
   if (event === 'providers_list') {
@@ -1717,12 +1736,29 @@ router.on('event', (msg: any) => {
           {
             provider: swarm.provider,
             provider_id: swarm.provider_id,
+            agent_runtime: typeof swarm.agent_runtime === 'string' ? swarm.agent_runtime : undefined,
+            claude_env_profile:
+              typeof swarm.provider_params?.claude_env_profile === 'string'
+                ? swarm.provider_params.claude_env_profile
+                : typeof swarm.claude_env_profile === 'string'
+                  ? swarm.claude_env_profile
+                  : undefined,
             status: typeof swarm.status === 'string' ? swarm.status : 'unknown',
             slurm_state: typeof swarm.slurm_state === 'string' ? swarm.slurm_state : undefined
           }
         );
       } else {
-        state.updateProviderMeta(swarm_id, swarm.provider, swarm.provider_id);
+        state.updateProviderMeta(
+          swarm_id,
+          swarm.provider,
+          swarm.provider_id,
+          typeof swarm.agent_runtime === 'string' ? swarm.agent_runtime : undefined,
+          typeof swarm.provider_params?.claude_env_profile === 'string'
+            ? swarm.provider_params.claude_env_profile
+            : typeof swarm.claude_env_profile === 'string'
+              ? swarm.claude_env_profile
+              : undefined
+        );
         state.updateStatus(
           swarm_id,
           typeof swarm.status === 'string' ? swarm.status : undefined,

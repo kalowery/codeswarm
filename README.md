@@ -137,7 +137,7 @@ Recommended local launch presets for project work:
 - `local-orchestrated-planner`
 - `local-orchestrated-worker`
 
-These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and fresh-thread-per-injection behavior.
+These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and fresh-thread-per-injection behavior. The same launch path now also supports `worker_mode=claude`.
 
 ## Codex Sandbox and Approval
 
@@ -157,6 +157,23 @@ codex --sandbox workspace-write --ask-for-approval never
 ```
 
 If Codex is left in read-only or on-request modes, commands may execute inconsistently or fail to write files.
+
+## Claude Runtime
+
+Claude is supported as a local worker runtime through the Anthropic Claude Code SDK/CLI path.
+
+- select `worker_mode=claude` in the launch modal or provider defaults
+- `approval_policy=never` maps to Claude bypass mode
+- non-`never` approval policies route tool permissions through the normal Codeswarm approval UI
+- if no `claude_env_profile` is selected, Claude inherits the router process environment as-is
+
+The sample local configs include an AMD gateway profile named `amd-llm-gateway`. It expands `${LLM_GATEWAY_KEY}` from the host environment and injects:
+
+- `ANTHROPIC_API_KEY=dummy`
+- `ANTHROPIC_BASE_URL=https://llm-api.amd.com/Anthropic`
+- `ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}`
+- model defaults such as `ANTHROPIC_DEFAULT_SONNET_MODEL`
+- `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 
 For protocol debugging, you can enable continuous raw session capture from each worker:
 

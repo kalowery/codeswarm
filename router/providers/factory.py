@@ -6,6 +6,14 @@ from .local import LocalProvider
 def _resolve_backend_profile(cluster_cfg: dict, backend: str, profile: str | None = None):
     backend_cfg = cluster_cfg.get(backend)
     if not isinstance(backend_cfg, dict):
+        configured_backend = str(cluster_cfg.get("backend") or "").strip()
+        if configured_backend == backend:
+            flat_cfg = {
+                key: value
+                for key, value in cluster_cfg.items()
+                if key != "backend"
+            }
+            return flat_cfg, None
         return {}, None
 
     profiles = backend_cfg.get("profiles")
@@ -48,15 +56,16 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
         default_sandbox = local_cfg.get("default_sandbox_mode")
         if not isinstance(default_sandbox, str) or not default_sandbox.strip():
             default_sandbox = "danger-full-access"
-        return [
+        fields = [
             {
                 "key": "worker_mode",
-                "label": "Worker Mode",
+                "label": "Agent Runtime",
                 "type": "select",
                 "default": "codex",
                 "required": True,
                 "options": [
                     {"label": "Codex", "value": "codex"},
+                    {"label": "Claude", "value": "claude"},
                     {"label": "Mock", "value": "mock"},
                 ],
             },
@@ -100,6 +109,22 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                 "required": False,
             },
             {
+                "key": "claude_model",
+                "label": "Claude Model",
+                "type": "text",
+                "default": "",
+                "required": False,
+                "placeholder": "claude-sonnet-4-5",
+            },
+            {
+                "key": "claude_cli_path",
+                "label": "Claude CLI Path",
+                "type": "text",
+                "default": "",
+                "required": False,
+                "placeholder": "/path/to/claude",
+            },
+            {
                 "key": "mock_delay_ms",
                 "label": "Mock Delay (ms)",
                 "type": "number",
@@ -114,6 +139,27 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                 "required": False,
             },
         ]
+        raw_claude_profiles = local_cfg.get("claude_env_profiles")
+        if isinstance(raw_claude_profiles, dict):
+            profile_options = []
+            for raw_name in sorted(raw_claude_profiles.keys()):
+                name = str(raw_name or "").strip()
+                if not name:
+                    continue
+                profile_options.append({"label": name, "value": name})
+            if profile_options:
+                fields.insert(
+                    7,
+                    {
+                        "key": "claude_env_profile",
+                        "label": "Claude Env Profile",
+                        "type": "select",
+                        "default": "",
+                        "required": False,
+                        "options": profile_options,
+                    },
+                )
+        return fields
 
     if backend == "slurm":
         slurm_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}

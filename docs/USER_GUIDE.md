@@ -107,6 +107,7 @@ These presets default to:
 - `sandbox_mode=danger-full-access`
 - `native_auto_approve=true`
 - `fresh_thread_per_injection=true`
+- `claude_env_profile=amd-llm-gateway` in the sample local configs
 
 ## 3. Launch a swarm
 
@@ -117,13 +118,22 @@ In UI:
 - set system prompt
 - choose provider
 - fill provider-specific launch fields (if presented)
+- for Claude launches, optionally select a `Claude Env Profile`
 - optionally select an Agent Persona input:
   - single file: copied as `AGENTS.md`
   - persona directory: must contain root `AGENTS.md`; `skills/` is optional
 - baseline `AGENTS.md` from repo root is prepended automatically
 - launch
 
-Router emits `swarm_launched`, then injects the system prompt to all nodes.
+Router emits `swarm_launched`, then injects the system prompt to all nodes when it is non-empty.
+
+### Claude-specific notes
+
+- `worker_mode=claude` uses the Anthropic Claude Code SDK/CLI path
+- if `claude_env_profile` is unset, Claude falls back to inherited environment variables such as `ANTHROPIC_API_KEY`
+- if `claude_env_profile` is set, Codeswarm expands `${ENV_VAR}` placeholders against the launch host environment and injects the resolved Anthropic env into the worker
+- `approval_policy=never` maps to Claude bypass mode
+- other approval policies use the normal Codeswarm approval UI for Claude tool permissions
 
 ### Agent Persona copy rules
 

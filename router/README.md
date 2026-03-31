@@ -78,6 +78,14 @@ Optional `cluster_profile` (alias `cluster_config`) selects `cluster.<backend>.p
 Optional `launch_soft_timeout_seconds` and `launch_hard_timeout_seconds` define per-provider
 launch timeout behavior.
 
+For local providers, launch parameters can also select the worker runtime:
+
+- `worker_mode=codex`
+- `worker_mode=claude`
+- `worker_mode=mock`
+
+Local configs may define `claude_env_profiles` so Claude launches can inject named Anthropic environment bundles such as gateway routing settings.
+
 ### `swarm_launch`
 
 Provision a new backend job and create swarm entry.
@@ -102,7 +110,7 @@ Behavior:
 5. Extracts `job_id`.
 6. Registers new `swarm_id`.
 7. Emits `swarm_launched`.
-8. Injects `system_prompt` into all nodes asynchronously.
+8. Injects `system_prompt` into all nodes asynchronously when the prompt is non-empty.
 
 ### Orchestrated Projects
 

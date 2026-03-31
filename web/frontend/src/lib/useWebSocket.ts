@@ -15,6 +15,7 @@ export function useWebSocket() {
 
   useEffect(() => {
     let isMounted = true
+    let activeSocket: WebSocket | null = null
 
     const connect = () => {
       const wsUrl = getBackendWsOrigin()
@@ -22,9 +23,11 @@ export function useWebSocket() {
       setStatus(retryCount.current === 0 ? 'connecting' : 'reconnecting')
 
       const ws = new WebSocket(wsUrl)
+      activeSocket = ws
       socketRef.current = ws
 
       ws.onopen = () => {
+        if (socketRef.current !== ws) return
         if (!isMounted) return
         console.log('WebSocket connected')
         retryCount.current = 0
@@ -55,6 +58,7 @@ export function useWebSocket() {
       }
 
       ws.onmessage = (event) => {
+        if (socketRef.current !== ws) return
         try {
           const msg = JSON.parse(event.data)
           if (msg?.type === 'workspace_archive_ready' && typeof msg?.payload?.download_url === 'string') {
@@ -77,6 +81,11 @@ export function useWebSocket() {
       }
 
       ws.onclose = () => {
+        if (socketRef.current === ws) {
+          socketRef.current = null
+        } else {
+          return
+        }
         if (!isMounted) return
         console.log('WebSocket disconnected')
         setStatus('disconnected')
@@ -95,6 +104,7 @@ export function useWebSocket() {
       }
 
       ws.onerror = () => {
+        if (socketRef.current !== ws) return
         ws.close()
       }
     }
@@ -105,7 +115,12 @@ export function useWebSocket() {
       isMounted = false
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current)
       if (approvalsPollTimer.current) clearInterval(approvalsPollTimer.current)
-      if (socketRef.current) socketRef.current.close()
+      if (activeSocket && socketRef.current === activeSocket) {
+        socketRef.current = null
+      }
+      try {
+        activeSocket?.close()
+      } catch {}
     }
   }, [handleMessage, setProjects, setSwarms])
 

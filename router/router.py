@@ -868,6 +868,66 @@ def _pending_approvals_snapshot():
     return snapshot
 
 
+def _register_canonical_exec_approval(data):
+    if not isinstance(data, dict):
+        return None
+    job_id = str(data.get("job_id") or "")
+    swarm_id = str(data.get("swarm_id") or "")
+    node_id = data.get("node_id")
+    call_id = str(data.get("call_id") or "").strip()
+    if not job_id or not swarm_id or not isinstance(node_id, int) or node_id < 0 or not call_id:
+        return None
+
+    key = _approval_key(job_id, call_id, node_id)
+    existing = PENDING_APPROVALS.get(key)
+    if existing:
+        existing["updated_at_ts"] = time.time()
+        if isinstance(data.get("command"), (str, list, dict)):
+            existing["command"] = data.get("command")
+        if isinstance(data.get("reason"), str):
+            existing["reason"] = data.get("reason")
+        if isinstance(data.get("cwd"), str):
+            existing["cwd"] = data.get("cwd")
+        if isinstance(data.get("available_decisions"), list):
+            existing["available_decisions"] = list(data.get("available_decisions") or [])
+            existing["available_decisions_item"] = list(data.get("available_decisions") or [])
+        return existing.get("approval_id")
+
+    if _is_recently_resolved_approval(job_id, call_id, node_id):
+        return None
+
+    approval_id = str(uuid.uuid4())
+    available_decisions = (
+        list(data.get("available_decisions") or [])
+        if isinstance(data.get("available_decisions"), list)
+        else ["accept", "cancel"]
+    )
+    PENDING_APPROVALS[key] = {
+        "approval_id": approval_id,
+        "approval_status": "pending",
+        "swarm_id": swarm_id,
+        "node_id": node_id,
+        "injection_id": data.get("injection_id"),
+        "turn_id": data.get("turn_id"),
+        "rpc_id": None,
+        "request_id_hint": None,
+        "approval_method": str(data.get("approval_method") or "worker/exec_approval_required"),
+        "command": data.get("command"),
+        "reason": data.get("reason"),
+        "cwd": data.get("cwd"),
+        "proposed_execpolicy_amendment": data.get("proposed_execpolicy_amendment"),
+        "available_decisions": available_decisions,
+        "available_decisions_native": [],
+        "available_decisions_item": available_decisions,
+        "synthetic_request": False,
+        "has_native_approval": False,
+        "created_at_ts": time.time(),
+        "updated_at_ts": time.time(),
+    }
+    _bump_approvals_version()
+    return approval_id
+
+
 def _send_approval_decision(
     provider,
     job_id,
@@ -4587,6 +4647,10 @@ def launch_swarm(config, nodes, partition, time_limit, account=None, qos=None):
 # Injection
 # ================================
 
+def _has_nonempty_text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
 def perform_injection(config, provider, request_id, swarm_id, job_id, node_id, content, count_outstanding=True):
     injection_id = str(uuid.uuid4())
 
@@ -4665,6 +4729,24 @@ def translate_event(event):
                 "node_id": node_id,
                 "injection_id": injection_id,
                 "message": message,
+                "raw": event,
+            },
+        )
+
+    if event_type == "worker_event":
+        event_name = str(event.get("event") or "").strip()
+        if not event_name:
+            return None
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        return (
+            event_name,
+            {
+                "swarm_id": swarm_id,
+                "job_id": job_id,
+                "node_id": node_id,
+                "injection_id": injection_id,
+                **payload,
                 "raw": event,
             },
         )
@@ -5925,6 +6007,11 @@ def run_daemon(config, providers):
                 translated = translate_event(event)
                 if translated:
                     event_name, data = translated
+                    suppress_emit = False
+                    if event_name == "exec_approval_required":
+                        approval_id = _register_canonical_exec_approval(data)
+                        if approval_id and not data.get("approval_id"):
+                            data = {**data, "approval_id": approval_id, "approvals_version": APPROVALS_VERSION}
                     if event_name == "thread_status":
                         status = data.get("status") or {}
                         status_type = status.get("type") if isinstance(status, dict) else None
@@ -5990,7 +6077,21 @@ def run_daemon(config, providers):
                         _dispatch_project_tasks(config)
                     if event_name == "usage":
                         _update_project_usage_for_injection(data)
-                    emit_event(event_name, data)
+                    if event_name in ("command_started", "command_completed", "filechange_started", "filechange_completed"):
+                        call_id = data.get("call_id")
+                        node_id = data.get("node_id")
+                        job_id = data.get("job_id")
+                        if isinstance(call_id, str) and call_id and isinstance(node_id, int) and isinstance(job_id, str):
+                            _prune_pending_approval_for_call(job_id, node_id, call_id, event_name)
+                    if event_name == "exec_approval_resolved":
+                        call_id = data.get("call_id")
+                        node_id = data.get("node_id")
+                        job_id = data.get("job_id")
+                        if isinstance(call_id, str) and call_id and isinstance(node_id, int) and isinstance(job_id, str):
+                            _prune_pending_approval_for_call(job_id, node_id, call_id, "worker_exec_approval_resolved")
+                            suppress_emit = True
+                    if not suppress_emit:
+                        emit_event(event_name, data)
 
         for backend in dead_backends:
             follower_procs.pop(backend, None)
@@ -6024,6 +6125,8 @@ def run_daemon(config, providers):
             if command == "swarm_launch":
                 nodes = payload.get("nodes", 1)
                 system_prompt = payload.get("system_prompt", "")
+                if not isinstance(system_prompt, str):
+                    system_prompt = ""
                 agents_md_content = payload.get("agents_md_content")
                 agents_bundle = payload.get("agents_bundle")
                 default_agents_md = _load_default_agents_md()
@@ -6174,6 +6277,11 @@ def run_daemon(config, providers):
                         "node_count": launch_nodes,
                         "system_prompt": launch_system_prompt,
                         "status": "running",
+                        "agent_runtime": str(
+                            launch_effective_params.get("agent_runtime")
+                            or launch_effective_params.get("worker_mode")
+                            or "codex"
+                        ).strip().lower(),
                         "provider": launch_provider_ref,
                         "provider_backend": launch_provider_backend,
                         "provider_id": launch_provider_id,
@@ -6197,22 +6305,27 @@ def run_daemon(config, providers):
                         "node_count": launch_nodes,
                         "provider": launch_provider_backend,
                         "provider_id": launch_provider_id,
+                        "agent_runtime": SWARMS[swarm_id].get("agent_runtime"),
+                        "claude_env_profile": (
+                            SWARMS[swarm_id].get("provider_params", {}) or {}
+                        ).get("claude_env_profile"),
                     })
 
-                    for node_id in range(launch_nodes):
-                        threading.Thread(
-                            target=perform_injection,
-                            args=(
-                                config,
-                                launch_provider_obj,
-                                launch_request_id,
-                                swarm_id,
-                                job_id,
-                                node_id,
-                                launch_system_prompt,
-                            ),
-                            daemon=True
-                        ).start()
+                    if _has_nonempty_text(launch_system_prompt):
+                        for node_id in range(launch_nodes):
+                            threading.Thread(
+                                target=perform_injection,
+                                args=(
+                                    config,
+                                    launch_provider_obj,
+                                    launch_request_id,
+                                    swarm_id,
+                                    job_id,
+                                    node_id,
+                                    launch_system_prompt,
+                                ),
+                                daemon=True
+                            ).start()
                     _dispatch_inter_swarm_queue(config)
 
                 threading.Thread(target=_run_launch, daemon=True).start()

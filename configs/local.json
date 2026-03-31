@@ -2,7 +2,19 @@
   "cluster": {
     "backend": "local",
     "workspace_root": "runs",
-    "archive_root": "/tmp/archives"
+    "archive_root": "/tmp/archives",
+    "claude_env_profiles": {
+      "amd-llm-gateway": {
+        "ANTHROPIC_API_KEY": "dummy",
+        "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+        "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}",
+        "ANTHROPIC_MODEL": "Claude-Sonnet-4.5",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": "Claude-Opus-4.5",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "Claude-Sonnet-4.5",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "Claude-Haiku-4.5",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+      }
+    }
   },
   "launch_providers": [
     {
@@ -14,7 +26,8 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": false,
-        "fresh_thread_per_injection": false
+        "fresh_thread_per_injection": false,
+        "claude_env_profile": "amd-llm-gateway"
       }
     },
     {
@@ -26,7 +39,8 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": true,
-        "fresh_thread_per_injection": true
+        "fresh_thread_per_injection": true,
+        "claude_env_profile": "amd-llm-gateway"
       }
     },
     {
@@ -38,7 +52,8 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": true,
-        "fresh_thread_per_injection": true
+        "fresh_thread_per_injection": true,
+        "claude_env_profile": "amd-llm-gateway"
       }
     },
     {
@@ -50,7 +65,8 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": false,
-        "fresh_thread_per_injection": false
+        "fresh_thread_per_injection": false,
+        "claude_env_profile": "amd-llm-gateway"
       }
     }
   ]

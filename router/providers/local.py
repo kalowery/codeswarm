@@ -8,12 +8,16 @@ import signal
 import tarfile
 import sys
 import time
+import importlib.util
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional
 
 
 from .base import ClusterProvider
+
+
+_ENV_TEMPLATE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class LocalProvider(ClusterProvider):
@@ -52,6 +56,14 @@ class LocalProvider(ClusterProvider):
             value = 30.0
         return value if value > 0 else 30.0
 
+    def _worker_startup_grace_seconds(self) -> float:
+        configured = self.config.get("worker_startup_grace_seconds")
+        try:
+            value = float(configured)
+        except Exception:
+            value = 10.0
+        return value if value > 0 else 10.0
+
     def _has_fresh_worker_heartbeat(self, job_id: str, node_id: int) -> bool:
         path = self._worker_heartbeat_path(job_id, node_id)
         try:
@@ -68,6 +80,73 @@ class LocalProvider(ClusterProvider):
             return "danger-full-access"
         return "workspace-write"
 
+    def _configured_claude_env_profiles(self) -> Dict[str, dict]:
+        raw_profiles = self.config.get("claude_env_profiles")
+        if not isinstance(raw_profiles, dict):
+            return {}
+        profiles: Dict[str, dict] = {}
+        for raw_name, raw_profile in raw_profiles.items():
+            name = str(raw_name or "").strip()
+            if not name or not isinstance(raw_profile, dict):
+                continue
+            normalized: dict[str, str] = {}
+            for raw_key, raw_value in raw_profile.items():
+                key = str(raw_key or "").strip()
+                if not key or raw_value is None:
+                    continue
+                normalized[key] = str(raw_value)
+            if normalized:
+                profiles[name] = normalized
+        return profiles
+
+    @staticmethod
+    def _expand_env_templates(value: str, env_source: dict[str, str]) -> str:
+        def repl(match: re.Match[str]) -> str:
+            env_key = str(match.group(1) or "").strip()
+            if not env_key:
+                return ""
+            resolved = env_source.get(env_key)
+            if resolved is None:
+                raise RuntimeError(
+                    f"Missing environment variable '{env_key}' required for Claude environment profile"
+                )
+            return str(resolved)
+
+        return _ENV_TEMPLATE_PATTERN.sub(repl, str(value))
+
+    def _resolve_claude_profile_env(self, launch_params: dict, base_env: dict[str, str]) -> dict[str, str]:
+        profile_name = str(launch_params.get("claude_env_profile") or "").strip()
+        if not profile_name:
+            return {}
+        profiles = self._configured_claude_env_profiles()
+        profile = profiles.get(profile_name)
+        if not isinstance(profile, dict):
+            available = ", ".join(sorted(profiles.keys()))
+            detail = f" Available profiles: {available}." if available else ""
+            raise RuntimeError(f"Unknown Claude environment profile '{profile_name}'.{detail}")
+        resolved: dict[str, str] = {}
+        env_source = dict(base_env)
+        for key, value in profile.items():
+            expanded = self._expand_env_templates(value, env_source)
+            resolved[str(key)] = expanded
+            env_source[str(key)] = expanded
+        return resolved
+
+    def _resolve_claude_env_overrides(self, launch_params: dict, base_env: dict[str, str]) -> dict[str, str]:
+        raw_env = launch_params.get("claude_env")
+        if not isinstance(raw_env, dict):
+            return {}
+        resolved: dict[str, str] = {}
+        env_source = dict(base_env)
+        for raw_key, raw_value in raw_env.items():
+            key = str(raw_key or "").strip()
+            if not key or raw_value is None:
+                continue
+            expanded = self._expand_env_templates(str(raw_value), env_source)
+            resolved[key] = expanded
+            env_source[key] = expanded
+        return resolved
+
     def _job_metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / ".codeswarm-job.json"
 
@@ -77,6 +156,15 @@ class LocalProvider(ClusterProvider):
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def _job_is_within_startup_grace(self, job_id: str) -> bool:
+        metadata = self._read_job_metadata(job_id) or {}
+        launched_at = metadata.get("launched_at")
+        try:
+            launched_ts = float(launched_at)
+        except Exception:
+            return False
+        return (time.time() - launched_ts) <= self._worker_startup_grace_seconds()
 
     def _write_job_metadata(self, job_id: str, updates: dict) -> None:
         path = self._job_metadata_path(job_id)
@@ -184,7 +272,11 @@ class LocalProvider(ClusterProvider):
 
         cmdline = self._read_proc_cmdline(pid)
         if cmdline:
-            return ("codex_worker.py" in cmdline) or ("mock_worker.py" in cmdline)
+            return (
+                ("codex_worker.py" in cmdline)
+                or ("claude_worker.py" in cmdline)
+                or ("mock_worker.py" in cmdline)
+            )
         # Fallback if command line is unavailable on this platform.
         return True
 
@@ -442,7 +534,22 @@ class LocalProvider(ClusterProvider):
         job_id = f"local_{uuid.uuid4().hex[:8]}"
         workers: List[dict] = []
         launch_params = launch_params if isinstance(launch_params, dict) else {}
-        worker_mode = str(launch_params.get("worker_mode") or "codex").strip().lower()
+        worker_mode = str(
+            launch_params.get("agent_runtime")
+            or launch_params.get("worker_mode")
+            or "codex"
+        ).strip().lower()
+        approval_policy = str(launch_params.get("approval_policy") or "never").strip().lower() or "never"
+        sandbox_mode = str(
+            launch_params.get("sandbox_mode") or self._default_worker_sandbox_mode()
+        ).strip() or self._default_worker_sandbox_mode()
+        if worker_mode not in {"codex", "claude", "mock"}:
+            raise RuntimeError(f"Unsupported local agent runtime: {worker_mode}")
+        if worker_mode == "claude":
+            if importlib.util.find_spec("claude_agent_sdk") is None:
+                raise RuntimeError(
+                    "Claude runtime requires the Python package 'claude-agent-sdk' to be installed on the launch host"
+                )
 
         for i in range(nodes):
             agent_index = f"{i:02d}"
@@ -453,7 +560,12 @@ class LocalProvider(ClusterProvider):
                 self._write_worker_codex_config(agent_dir, launch_params)
 
             # Locate worker relative to repository root
-            worker_name = "mock_worker.py" if worker_mode == "mock" else "codex_worker.py"
+            if worker_mode == "mock":
+                worker_name = "mock_worker.py"
+            elif worker_mode == "claude":
+                worker_name = "claude_worker.py"
+            else:
+                worker_name = "codex_worker.py"
             worker_path = Path(__file__).resolve().parents[2] / "agent" / worker_name
 
             env = os.environ.copy()
@@ -461,6 +573,8 @@ class LocalProvider(ClusterProvider):
                 "CODESWARM_JOB_ID": job_id,
                 "CODESWARM_NODE_ID": str(i),
                 "CODESWARM_BASE_DIR": str(self.workspace_root.resolve()),
+                "CODESWARM_ASK_FOR_APPROVAL": approval_policy,
+                "CODESWARM_SANDBOX_MODE": sandbox_mode,
             })
             if "fresh_thread_per_injection" in launch_params:
                 env["CODESWARM_FRESH_THREAD_PER_INJECTION"] = (
@@ -468,6 +582,20 @@ class LocalProvider(ClusterProvider):
                 )
             if "native_auto_approve" in launch_params:
                 env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1" if bool(launch_params.get("native_auto_approve")) else "0"
+            if worker_mode == "claude":
+                env.setdefault("CLAUDE_CONFIG_DIR", str(agent_dir / ".claude"))
+                env.update(self._resolve_claude_profile_env(launch_params, env))
+                env.update(self._resolve_claude_env_overrides(launch_params, env))
+                claude_model = str(launch_params.get("claude_model") or "").strip()
+                if claude_model:
+                    env["CODESWARM_CLAUDE_MODEL"] = claude_model
+                claude_cli_path = str(launch_params.get("claude_cli_path") or "").strip()
+                if claude_cli_path:
+                    env["CODESWARM_CLAUDE_CLI_PATH"] = claude_cli_path
+                permission_mode = str(launch_params.get("claude_permission_mode") or "").strip()
+                if not permission_mode:
+                    permission_mode = "bypassPermissions" if approval_policy == "never" else "default"
+                env["CODESWARM_CLAUDE_PERMISSION_MODE"] = permission_mode
             if worker_mode == "mock" and bool(launch_params.get("mock_push_branches")):
                 env["CODESWARM_MOCK_PUSH_BRANCHES"] = "1"
             if worker_mode == "mock":
@@ -503,9 +631,11 @@ class LocalProvider(ClusterProvider):
         self._write_job_metadata(job_id, {
             "job_id": job_id,
             "provider": "local",
+            "agent_runtime": worker_mode,
             "worker_mode": worker_mode,
             "workers": workers,
             "node_count": int(nodes),
+            "launched_at": time.time(),
         })
         if callable(progress_cb):
             progress_cb("ready", f"Local swarm ready: {job_id}")
@@ -685,7 +815,15 @@ class LocalProvider(ClusterProvider):
         }
 
     def get_job_state(self, job_id: str) -> Optional[str]:
-        return "RUNNING" if self._active_workers_for_job(job_id) else None
+        if self._active_workers_for_job(job_id):
+            return "RUNNING"
+        workers = self.jobs.get(job_id)
+        if not workers:
+            metadata = self._read_job_metadata(job_id) or {}
+            workers = self._normalize_worker_records(metadata.get("workers"))
+        if workers and self._job_is_within_startup_grace(job_id):
+            return "STARTING"
+        return None
 
     def list_active_jobs(self) -> Dict[str, str]:
         states = {}
