@@ -28,3 +28,8 @@ log.txt
 # Local personal configs
 configs/hpcfund.json
 configs/combined.json
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
