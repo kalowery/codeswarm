@@ -1174,6 +1174,19 @@ def _startup_reconcile_timeout_seconds(config, provider_ref):
     return STARTUP_RECONCILE_TIMEOUT_SECONDS
 
 
+def _set_provider_spec_disabled_state(provider_ref, disabled, reason=None):
+    normalized_ref = str(provider_ref or "").strip().lower()
+    if not normalized_ref:
+        return
+    resolved_reason = str(reason).strip() if reason is not None and str(reason).strip() else None
+    for spec in PROVIDER_SPECS:
+        spec_ref = str(spec.get("provider_ref") or "").strip().lower()
+        if spec_ref != normalized_ref:
+            continue
+        spec["disabled"] = bool(disabled)
+        spec["disabled_reason"] = resolved_reason if disabled else None
+
+
 def reconcile(providers, config=None):
     global JOB_TO_SWARM
     running_jobs_by_provider = {}
@@ -1201,6 +1214,8 @@ def reconcile(providers, config=None):
     for provider_ref, (thread, timeout_s) in provider_threads.items():
         thread.join(timeout_s)
         if thread.is_alive():
+            reason = f"Provider reconcile timed out after {int(timeout_s)}s during router startup"
+            _set_provider_spec_disabled_state(provider_ref, True, reason)
             startup_log(
                 f"provider {provider_ref} did not finish reconcile within {int(timeout_s)}s; continuing with empty active-job set"
             )
@@ -1208,10 +1223,12 @@ def reconcile(providers, config=None):
             continue
         error = provider_errors.get(provider_ref)
         if error:
+            _set_provider_spec_disabled_state(provider_ref, True, f"Provider reconcile failed during router startup: {error}")
             startup_log(f"provider {provider_ref} reconcile failed: {error}")
             running_jobs_by_provider[provider_ref] = {}
             continue
         jobs = provider_results.get(provider_ref)
+        _set_provider_spec_disabled_state(provider_ref, False, None)
         running_jobs_by_provider[provider_ref] = jobs if isinstance(jobs, dict) else {}
         startup_log(
             f"provider {provider_ref} reconcile complete ({len(running_jobs_by_provider[provider_ref])} active job(s))"
@@ -6028,6 +6045,12 @@ def run_daemon(config, providers):
                     emit_event("command_rejected", {
                         "request_id": request_id,
                         "reason": f"unknown provider: {provider_id}"
+                    })
+                    continue
+                if bool(provider_spec.get("disabled")):
+                    emit_event("command_rejected", {
+                        "request_id": request_id,
+                        "reason": str(provider_spec.get("disabled_reason") or f"provider disabled: {provider_id}")
                     })
                     continue
                 provider_backend = provider_spec.get("backend")

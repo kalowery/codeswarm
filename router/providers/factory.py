@@ -364,20 +364,24 @@ def _build_backend_provider(config: dict, backend: str, cluster_profile: str | N
 def build_providers(config: dict, provider_specs: list[dict]):
     providers = {}
     normalized_specs = []
+    provider_status_by_ref = {}
     for spec in provider_specs:
         spec_copy = dict(spec)
         backend = str(spec.get("backend") or "").strip()
         provider_ref = str(spec.get("provider_ref") or "").strip()
         cluster_profile = spec.get("cluster_profile")
-        if not backend or not provider_ref or provider_ref in providers:
+        if not backend or not provider_ref:
             normalized_specs.append(spec_copy)
             continue
-        try:
-            providers[provider_ref] = _build_backend_provider(config, backend, cluster_profile)
-            spec_copy["disabled"] = False
-            spec_copy["disabled_reason"] = None
-        except Exception as e:
-            spec_copy["disabled"] = True
-            spec_copy["disabled_reason"] = str(e)
+        status = provider_status_by_ref.get(provider_ref)
+        if status is None:
+            try:
+                providers[provider_ref] = _build_backend_provider(config, backend, cluster_profile)
+                status = {"disabled": False, "disabled_reason": None}
+            except Exception as e:
+                status = {"disabled": True, "disabled_reason": str(e)}
+            provider_status_by_ref[provider_ref] = status
+        spec_copy["disabled"] = bool(status.get("disabled"))
+        spec_copy["disabled_reason"] = status.get("disabled_reason")
         normalized_specs.append(spec_copy)
     return providers, normalized_specs
