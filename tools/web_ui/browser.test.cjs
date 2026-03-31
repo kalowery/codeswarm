@@ -357,6 +357,25 @@ async function selectOptionByText(page, testId, text) {
   await page.select(testIdSelector(testId), value)
 }
 
+async function optionStateByText(page, testId, text) {
+  await waitForTestId(page, testId)
+  const result = await page.$eval(
+    testIdSelector(testId),
+    (el, needle) => {
+      const option = Array.from(el.options).find((item) => (item.textContent || '').includes(String(needle)))
+      if (!option) return null
+      return {
+        value: option.value,
+        disabled: Boolean(option.disabled),
+        text: option.textContent || ''
+      }
+    },
+    text
+  )
+  assert.ok(result, `Unable to find option text ${text} for ${testId}`)
+  return result
+}
+
 async function waitForTestIdText(page, testId, pattern, timeoutMs = 30_000) {
   await page.waitForFunction(
     ([selector, source, flags]) => {
@@ -568,7 +587,21 @@ const tempRepoRoots = []
 
 test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   stack = await startStack()
-  browser = await puppeteer.launch({ headless: true })
+  browser = await puppeteer.launch({
+    headless: true,
+    userDataDir: path.join(stack.tempRoot, 'chrome-profile'),
+    env: {
+      ...process.env,
+      HOME: stack.tempRoot
+    },
+    args: [
+      '--disable-breakpad',
+      '--disable-crash-reporter',
+      '--disable-crashpad',
+      '--no-default-browser-check',
+      '--no-first-run'
+    ]
+  })
 
   try {
     await t.test('renders project modal repo mode controls', async () => {
@@ -603,6 +636,71 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         await page.keyboard.type(promptText)
         await page.keyboard.press('Enter')
         await waitForPromptResponse(page, promptText, 30_000)
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('disables failed providers in the launch modal', async () => {
+      const { context, page } = await newPage(browser, stack)
+      try {
+        await page.evaluate(() => {
+          const originalFetch = window.fetch.bind(window)
+          window.fetch = async (input, init) => {
+            const url = typeof input === 'string' ? input : input instanceof Request ? input.url : String(input)
+            if (url.endsWith('/providers')) {
+              return new Response(
+                JSON.stringify([
+                  {
+                    id: 'local-disabled',
+                    label: 'Local Disabled',
+                    backend: 'local',
+                    disabled: true,
+                    disabled_reason: 'Router is disconnected',
+                    defaults: {},
+                    launch_fields: [],
+                    launch_panels: []
+                  },
+                  {
+                    id: 'aws-disabled',
+                    label: 'AWS Disabled',
+                    backend: 'aws',
+                    disabled: true,
+                    disabled_reason: 'Timed out during provider reconcile',
+                    defaults: {},
+                    launch_fields: [],
+                    launch_panels: []
+                  }
+                ]),
+                {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json' }
+                }
+              )
+            }
+            return originalFetch(input, init)
+          }
+        })
+
+        await clickTestId(page, 'open-launch-modal-button')
+        await waitForTestId(page, 'launch-modal')
+        await waitForTestId(page, 'launch-provider-select')
+
+        const localOption = await optionStateByText(page, 'launch-provider-select', 'Local Disabled')
+        assert.equal(localOption.disabled, true)
+        assert.match(localOption.text, /\(disabled\)/)
+
+        const disabledOption = await optionStateByText(page, 'launch-provider-select', 'AWS Disabled')
+        assert.equal(disabledOption.disabled, true)
+        assert.match(disabledOption.text, /\(disabled\)/)
+
+        const disabledLaunchDisabled = await page.$eval(
+          testIdSelector('launch-submit-button'),
+          (el) => Boolean(el.disabled)
+        )
+        assert.equal(disabledLaunchDisabled, true)
+        await waitForTestIdText(page, 'launch-modal', /All configured providers are currently disabled/)
+        await waitForTestIdText(page, 'launch-modal', /Router is disconnected/)
       } finally {
         await context.close()
       }

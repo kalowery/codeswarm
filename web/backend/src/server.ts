@@ -1178,11 +1178,38 @@ setInterval(() => {
   logApprovalTrace('metrics_summary', approvalMetricsSnapshot());
 }, 30000);
 
-function fallbackProvidersCatalog(): any[] {
+function fallbackProvidersCatalog(reason = 'Provider status unavailable'): any[] {
   return [
-    { id: 'local', label: 'LOCAL', backend: 'local', defaults: {}, launch_fields: [], launch_panels: [] },
-    { id: 'slurm', label: 'SLURM', backend: 'slurm', defaults: {}, launch_fields: [], launch_panels: [] },
-    { id: 'aws', label: 'AWS', backend: 'aws', defaults: {}, launch_fields: [], launch_panels: [] }
+    {
+      id: 'local',
+      label: 'LOCAL',
+      backend: 'local',
+      defaults: {},
+      launch_fields: [],
+      launch_panels: [],
+      disabled: true,
+      disabled_reason: reason
+    },
+    {
+      id: 'slurm',
+      label: 'SLURM',
+      backend: 'slurm',
+      defaults: {},
+      launch_fields: [],
+      launch_panels: [],
+      disabled: true,
+      disabled_reason: reason
+    },
+    {
+      id: 'aws',
+      label: 'AWS',
+      backend: 'aws',
+      defaults: {},
+      launch_fields: [],
+      launch_panels: [],
+      disabled: true,
+      disabled_reason: reason
+    }
   ];
 }
 
@@ -2015,7 +2042,7 @@ app.get('/providers', async (req, res) => {
     if (launchProviders.length > 0) {
       return res.json(launchProviders);
     }
-    return res.json(fallbackProvidersCatalog());
+    return res.json(fallbackProvidersCatalog('Router is disconnected'));
   }
   try {
     let providers = await requestProvidersCatalog();
@@ -2026,7 +2053,7 @@ app.get('/providers', async (req, res) => {
       if (launchProviders.length > 0) {
         return res.json(launchProviders);
       }
-      return res.json(fallbackProvidersCatalog());
+      return res.json(fallbackProvidersCatalog('Provider catalog did not load from router'));
     }
     return res.json(providers);
   } catch (err) {
@@ -2034,7 +2061,7 @@ app.get('/providers', async (req, res) => {
     if (launchProviders.length > 0) {
       return res.json(launchProviders);
     }
-    return res.json(fallbackProvidersCatalog());
+    return res.json(fallbackProvidersCatalog('Failed to load provider catalog from router'));
   }
 });
 
