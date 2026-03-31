@@ -162,6 +162,8 @@ If Codex is left in read-only or on-request modes, commands may execute inconsis
 
 Claude is supported as a local worker runtime through the Anthropic Claude Code SDK/CLI path.
 
+- current support scope is local swarms and local orchestrated planner/worker runs
+- remote Claude launch for Slurm/AWS is intentionally deferred
 - select `worker_mode=claude` in the launch modal or provider defaults
 - `approval_policy=never` maps to Claude bypass mode
 - non-`never` approval policies route tool permissions through the normal Codeswarm approval UI
@@ -174,6 +176,42 @@ The sample local configs include an AMD gateway profile named `amd-llm-gateway`.
 - `ANTHROPIC_CUSTOM_HEADERS=Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}`
 - model defaults such as `ANTHROPIC_DEFAULT_SONNET_MODEL`
 - `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+
+Claude launch/runtime precedence is:
+
+1. `worker_mode=claude` selects the Claude worker implementation.
+2. `claude_env_profile` injects a named Anthropic environment bundle from the active local backend config's `claude_env_profiles`.
+3. If no profile is selected, the worker uses inherited host env such as `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and `ANTHROPIC_MODEL`.
+4. `claude_model` overrides the model passed to the Claude SDK for that swarm.
+5. `pricing_model` can override billing lookup independently from the runtime-selected model.
+
+Auth selection is therefore deterministic:
+
+- profile selected: use the resolved profile values, with `${VAR}` placeholders expanded from the router host environment at launch time
+- no profile selected: use whatever Anthropic env vars already exist in the router process environment
+- placeholder missing: swarm launch fails rather than silently running with incomplete auth
+
+This means Codeswarm will use plain `ANTHROPIC_API_KEY`-style environment configuration by default, and can also route Claude through the AMD LLM gateway when a profile injects gateway-specific values.
+
+## Model Pricing and Billing Tables
+
+Router-side usage accounting is model-aware and no longer assumes a single model for the entire project.
+
+- pricing tables live in the top-level `model_pricing` object in the router config, for example [configs/local.json](/Users/keithlowery/codeswarm/configs/local.json)
+- router also ships with a built-in default catalog in [router/router.py](/Users/keithlowery/codeswarm/router/router.py)
+- configured `model_pricing` entries override built-in defaults on a per-model basis
+- launch-time `pricing_model` overrides the label used for spend lookup
+- if `pricing_model` is omitted, router falls back to the resolved agent model; Codex defaults to `gpt-5.4`
+- mixed-model task/project aggregates are labeled `mixed` when usage from different pricing models is combined
+
+Each pricing entry currently supports:
+
+- `input_tokens_usd_per_m`
+- `cached_input_tokens_usd_per_m`
+- `output_tokens_usd_per_m`
+- `reasoning_output_tokens_usd_per_m`
+
+The UI now surfaces router-computed spend totals at the swarm, task, and project levels, so the config file is the source of truth for token billing rates.
 
 For protocol debugging, you can enable continuous raw session capture from each worker:
 

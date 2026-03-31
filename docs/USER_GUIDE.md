@@ -109,6 +109,35 @@ These presets default to:
 - `fresh_thread_per_injection=true`
 - `claude_env_profile=amd-llm-gateway` in the sample local configs
 
+Additional local config keys now used by Claude and spend accounting:
+
+- `cluster.claude_env_profiles`
+- top-level `model_pricing`
+
+Example shape from [configs/local.json](/Users/keithlowery/codeswarm/configs/local.json):
+
+```json
+{
+  "cluster": {
+    "backend": "local",
+    "claude_env_profiles": {
+      "amd-llm-gateway": {
+        "ANTHROPIC_API_KEY": "dummy",
+        "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+        "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}"
+      }
+    }
+  },
+  "model_pricing": {
+    "gpt-5.4": {
+      "input_tokens_usd_per_m": 2.5,
+      "cached_input_tokens_usd_per_m": 0.25,
+      "output_tokens_usd_per_m": 15.0
+    }
+  }
+}
+```
+
 ## 3. Launch a swarm
 
 In UI:
@@ -130,10 +159,32 @@ Router emits `swarm_launched`, then injects the system prompt to all nodes when 
 ### Claude-specific notes
 
 - `worker_mode=claude` uses the Anthropic Claude Code SDK/CLI path
+- current Claude support is for local launches; remote provider rollout is still pending
 - if `claude_env_profile` is unset, Claude falls back to inherited environment variables such as `ANTHROPIC_API_KEY`
 - if `claude_env_profile` is set, Codeswarm expands `${ENV_VAR}` placeholders against the launch host environment and injects the resolved Anthropic env into the worker
 - `approval_policy=never` maps to Claude bypass mode
 - other approval policies use the normal Codeswarm approval UI for Claude tool permissions
+- `claude_model` overrides the model sent to the Claude SDK for that swarm
+- `pricing_model` overrides which billing table entry router uses for spend accounting
+
+API key and model selection precedence:
+
+1. `claude_env_profile` selected:
+   the worker receives the resolved profile values from the active local backend config's `claude_env_profiles`
+2. no `claude_env_profile` selected:
+   the worker inherits `ANTHROPIC_*` values from the router process environment
+3. `claude_model` set:
+   the worker passes that model explicitly to the Claude SDK
+4. `pricing_model` set:
+   router uses that catalog key for spend calculation
+5. otherwise:
+   router uses the resolved agent model; Codex falls back to `gpt-5.4`
+
+Important consequence:
+
+- a profile can route Claude through the AMD LLM gateway using `ANTHROPIC_BASE_URL` plus gateway headers
+- without a profile, standard Anthropic env configuration works as long as the router process already has the needed env vars
+- unresolved `${ENV_VAR}` placeholders are treated as launch errors
 
 ### Agent Persona copy rules
 
@@ -266,7 +317,21 @@ Backend forwards to router `/approval`, and router sends normalized control mess
 - errors: `agent_error`, `command_rejected`
 - projects: `project_created`, `project_started`, `projects_updated`, `project_resume_preview`, `project_resumed`
 
-## 11. Auto-routing from task completion
+## 11. Billing and Spend Accounting
+
+Spend is computed in router, not in the frontend.
+
+- pricing tables are loaded from top-level `model_pricing` in the active router config
+- configured pricing entries override the built-in defaults in [router/router.py](/Users/keithlowery/codeswarm/router/router.py)
+- usage events carry `model_name`, `pricing_model`, `estimated_cost_usd`, and `last_estimated_cost_usd` when router can price them
+- project, task, and worker totals are aggregated by router so mixed Codex/Claude projects are billed correctly
+
+The main storage locations are:
+
+- router config pricing table: [configs/local.json](/Users/keithlowery/codeswarm/configs/local.json)
+- built-in fallback table: [router/router.py](/Users/keithlowery/codeswarm/router/router.py)
+
+## 12. Auto-routing from task completion
 
 When a node finishes a task, backend inspects final assistant output (`task_complete`) for line-level directives:
 

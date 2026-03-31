@@ -264,9 +264,15 @@ This avoids:
 
 ## Worker Event Translation
 
-Worker emits `codex_rpc` events.
+Worker runtimes currently include:
 
-Router translates:
+- `codex`
+- `claude`
+- `mock`
+
+Router consumes runtime-specific worker output and emits a normalized event stream for the backend/UI.
+
+For Codex, the worker emits `codex_rpc` events and router translates:
 
 | Worker Method | Router Event |
 |---------------|-------------|
@@ -275,6 +281,15 @@ Router translates:
 | `agent_message_content_delta` | `assistant_delta` |
 | `agent_message` | `assistant` |
 | token usage updates | `usage` |
+
+For Claude, the local Claude worker emits normalized Codeswarm events directly for:
+
+- turn lifecycle
+- assistant streaming/final text
+- approval requests
+- command/file edit visibility
+- usage updates
+- task completion
 
 All events include:
 - `swarm_id`
@@ -295,6 +310,26 @@ All events include:
 - `last_reasoning_output_tokens`
 - `model_context_window`
 - `usage_source` (`codex/event/token_count` or `thread/tokenUsage/updated`)
+
+When pricing can be resolved, router also annotates usage with:
+
+- `model_name`
+- `pricing_model`
+- `estimated_cost_usd`
+- `last_estimated_cost_usd`
+
+Pricing lookup is driven by:
+
+- built-in defaults in [router.py](/Users/keithlowery/codeswarm/router/router.py)
+- top-level `model_pricing` entries in the active config, which override those defaults
+
+Claude authentication/model selection is resolved at worker launch:
+
+- `claude_env_profile` selects a named env bundle from the active local backend config's `claude_env_profiles`
+- profile values may reference `${ENV_VAR}` placeholders from the router host environment
+- if no profile is selected, the worker inherits `ANTHROPIC_*` variables from the router process environment
+- `claude_model` overrides the model passed to the Claude SDK
+- `pricing_model` overrides which catalog entry router uses for billing
 
 ---
 
