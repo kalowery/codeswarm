@@ -33,6 +33,8 @@ interface LaunchProvider {
   id: string
   label?: string
   backend: string
+  disabled?: boolean
+  disabled_reason?: string | null
   defaults?: Record<string, any>
   launch_fields?: ProviderLaunchField[]
   launch_panels?: ProviderLaunchPanel[]
@@ -90,6 +92,9 @@ export default function LaunchModal({ onClose }: Props) {
     const provider = providers.find((item) => item.id === providerId)
     setProviderValues(buildProviderDefaults(provider))
   }
+
+  const firstEnabledProviderId = (list: LaunchProvider[]) =>
+    (list.find((provider) => !provider.disabled)?.id ?? list[0]?.id ?? '')
 
   const applyPersonaSelection = (
     rootName: string,
@@ -197,7 +202,7 @@ export default function LaunchModal({ onClose }: Props) {
           const nextProviderId =
             selectedProvider && list.some((p) => p.id === selectedProvider)
               ? selectedProvider
-              : list[0].id
+              : firstEnabledProviderId(list)
           setSelectedProvider(nextProviderId)
           setProviderValues(buildProviderDefaults(list.find((p) => p.id === nextProviderId)))
           return
@@ -233,6 +238,16 @@ export default function LaunchModal({ onClose }: Props) {
 
     if (isNaN(nodeCount) || nodeCount < 1) {
       alert('Agent count must be at least 1')
+      return
+    }
+
+    if (!activeProvider) {
+      alert('Select a provider')
+      return
+    }
+
+    if (activeProvider.disabled) {
+      alert(activeProvider.disabled_reason || 'Selected provider is disabled')
       return
     }
 
@@ -485,6 +500,9 @@ export default function LaunchModal({ onClose }: Props) {
     return Array.isArray(activeProvider.launch_fields) && activeProvider.launch_fields.length > 0
   })()
 
+  const noEnabledProviders =
+    providers.length > 0 && providers.every((provider) => provider.disabled)
+
   const showProviderTab = hasProviderParams
 
   useEffect(() => {
@@ -505,18 +523,35 @@ export default function LaunchModal({ onClose }: Props) {
           ) : providersError ? (
             <div className="text-sm text-rose-400">{providersError}</div>
           ) : (
-            <select
-              data-testid="launch-provider-select"
-              value={selectedProvider}
-              onChange={(e) => applyProviderSelection(e.target.value)}
-              className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
-            >
-              {providers.map((provider) => (
-                <option key={provider.id} value={provider.id}>
-                  {provider.label || provider.id}
-                </option>
-              ))}
-            </select>
+            <div className="space-y-2">
+              <select
+                data-testid="launch-provider-select"
+                value={selectedProvider}
+                onChange={(e) => applyProviderSelection(e.target.value)}
+                className="w-full bg-slate-800 border border-slate-700 rounded px-3 py-2"
+              >
+                {providers.map((provider) => (
+                  <option key={provider.id} value={provider.id} disabled={Boolean(provider.disabled)}>
+                    {provider.label || provider.id}{provider.disabled ? ' (disabled)' : ''}
+                  </option>
+                ))}
+              </select>
+              {activeProvider?.disabled && (
+                <div className="rounded border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-300">
+                  {activeProvider.disabled_reason || 'This provider is disabled by the router.'}
+                </div>
+              )}
+              {!activeProvider?.disabled && activeProvider?.backend && (
+                <div className="text-xs text-slate-500">
+                  Backend: {activeProvider.backend}
+                </div>
+              )}
+              {noEnabledProviders && (
+                <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
+                  All configured providers are currently disabled. Check router startup output for provider initialization failures.
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -651,7 +686,7 @@ export default function LaunchModal({ onClose }: Props) {
           <button
             data-testid="launch-submit-button"
             onClick={handleLaunch}
-            disabled={loading}
+            disabled={loading || !activeProvider || Boolean(activeProvider.disabled)}
             className="px-4 py-2 bg-indigo-600 rounded disabled:opacity-50"
           >
             {loading ? 'Launching...' : 'Launch'}

@@ -1795,6 +1795,14 @@ app.post('/launch', (req, res) => {
   const matchedProvider = launchProviders.find(
     (p) => p && typeof p.id === 'string' && p.id === normalizedProvider
   );
+  if (matchedProvider?.disabled) {
+    return res.status(400).json({
+      error:
+        typeof matchedProvider?.disabled_reason === 'string' && matchedProvider.disabled_reason.trim()
+          ? matchedProvider.disabled_reason
+          : 'Selected provider is disabled'
+    });
+  }
   const providerBackend =
     typeof matchedProvider?.backend === 'string'
       ? matchedProvider.backend
