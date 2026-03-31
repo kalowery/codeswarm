@@ -173,6 +173,8 @@ export interface ProjectTaskRecord {
   attempts?: number
   assigned_swarm_id?: string
   assigned_node_id?: number
+  last_assigned_swarm_id?: string
+  last_assigned_node_id?: number
   assignment_injection_id?: string
   branch?: string
   base_commit?: string
@@ -187,7 +189,18 @@ export interface ProjectTaskRecord {
   beads_id?: string
   beads_sync_status?: string
   beads_last_error?: string
+  usage?: TokenUsage
+  active_attempt_usage?: TokenUsage
+  usage_updated_at?: number
   created_at?: number
+  updated_at?: number
+}
+
+export interface ProjectWorkerUsageRecord {
+  swarm_id: string
+  swarm_alias?: string
+  node_id: number
+  usage?: TokenUsage
   updated_at?: number
 }
 
@@ -226,6 +239,9 @@ export interface ProjectRecord {
   last_resume_at?: number
   last_resumed_by_worker_swarm_ids?: string[]
   resume_summary?: Record<string, number>
+  usage?: TokenUsage
+  usage_updated_at?: number
+  worker_usage?: Record<string, ProjectWorkerUsageRecord>
 }
 
 export type FocusTarget = 'swarm' | 'project'

@@ -20,15 +20,24 @@ def require_beads():
     raise SystemExit("bd CLI not installed")
 
 
-def make_repo(prefix: str) -> Path:
-    repo_dir = Path(tempfile.mkdtemp(prefix=prefix))
-    subprocess.run(["git", "init", "-b", "main"], cwd=repo_dir, check=True, capture_output=True, text=True)
-    subprocess.run(["git", "config", "user.email", "smoke@example.test"], cwd=repo_dir, check=True)
-    subprocess.run(["git", "config", "user.name", "Codeswarm Smoke"], cwd=repo_dir, check=True)
-    (repo_dir / "README.md").write_text("# Beads Smoke Repo\n", encoding="utf-8")
-    subprocess.run(["git", "add", "README.md"], cwd=repo_dir, check=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=repo_dir, check=True, capture_output=True, text=True)
-    return repo_dir
+def git(args: list[str], cwd: Path, env: dict | None = None) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True, env=env)
+
+
+def make_remote_repo(prefix: str) -> tuple[Path, Path, Path]:
+    root_dir = Path(tempfile.mkdtemp(prefix=prefix))
+    origin_dir = root_dir / "origin.git"
+    work_dir = root_dir / "work"
+    subprocess.run(["git", "init", "--bare", str(origin_dir)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "clone", str(origin_dir), str(work_dir)], check=True, capture_output=True, text=True)
+    git(["config", "user.email", "smoke@example.test"], cwd=work_dir)
+    git(["config", "user.name", "Codeswarm Smoke"], cwd=work_dir)
+    (work_dir / "README.md").write_text("# Beads Smoke Repo\n", encoding="utf-8")
+    git(["add", "README.md"], cwd=work_dir)
+    git(["commit", "-m", "init"], cwd=work_dir)
+    git(["push", "-u", "origin", "HEAD:main"], cwd=work_dir)
+    git(["checkout", "-B", "main"], cwd=work_dir)
+    return root_dir, origin_dir, work_dir
 
 
 def make_task(task_id: str, title: str, prompt: str, depends_on: list[str]) -> dict:
@@ -102,8 +111,71 @@ def show_issue(repo_dir: Path, issue_id: str) -> dict:
     return payload[0]
 
 
+def parse_jsonl(path: Path) -> list[dict]:
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        snippet = line.strip()
+        if not snippet:
+            continue
+        records.append(json.loads(snippet))
+    return records
+
+
+def assert_remote_control_branch(project: dict, origin_dir: Path) -> list[dict]:
+    branch = router_module._project_beads_control_branch(project)
+    ls_remote = subprocess.run(
+        ["git", "ls-remote", "--heads", str(origin_dir), branch],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if branch not in ls_remote.stdout:
+        raise RuntimeError(f"Expected control branch {branch} to be pushed")
+
+    checkout_dir = Path(tempfile.mkdtemp(prefix="codeswarmbeadscontrol"))
+    subprocess.run(
+        ["git", "clone", "--branch", branch, str(origin_dir), str(checkout_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    issues_path = checkout_dir / ".beads" / "issues.jsonl"
+    if not issues_path.exists():
+        raise RuntimeError("Expected .beads/issues.jsonl on control branch")
+    records = parse_jsonl(issues_path)
+    if not records:
+        raise RuntimeError("Expected Beads export to contain records")
+    shutil.rmtree(checkout_dir, ignore_errors=True)
+    return records
+
+
+def assert_bootstrap_from_control_branch(origin_dir: Path, project: dict, issue_id: str):
+    branch = router_module._project_beads_control_branch(project)
+    recovery_dir = Path(tempfile.mkdtemp(prefix="codeswarmbeadsrecovery"))
+    try:
+        subprocess.run(
+            ["git", "clone", "--branch", branch, str(origin_dir), str(recovery_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["bd", "bootstrap"],
+            cwd=recovery_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=router_module._beads_env(),
+        )
+        recovered = show_issue(recovery_dir, issue_id)
+        if recovered.get("id") != issue_id:
+            raise RuntimeError("Recovered Beads database did not contain expected issue")
+    finally:
+        shutil.rmtree(recovery_dir, ignore_errors=True)
+
+
 def run_disabled_case():
-    repo_dir = make_repo("codeswarmbeadsdisabled")
+    root_dir, _, repo_dir = make_remote_repo("codeswarmbeadsdisabled")
     project = make_project(repo_dir)
     original_disable = os.environ.get("CODESWARM_DISABLE_BEADS_SYNC")
     try:
@@ -114,13 +186,13 @@ def run_disabled_case():
             os.environ.pop("CODESWARM_DISABLE_BEADS_SYNC", None)
         else:
             os.environ["CODESWARM_DISABLE_BEADS_SYNC"] = original_disable
-        shutil.rmtree(repo_dir, ignore_errors=True)
+        shutil.rmtree(root_dir, ignore_errors=True)
     if project.get("beads_sync_status") != "disabled":
         raise RuntimeError(f"Expected disabled Beads status, got {project.get('beads_sync_status')}")
 
 
 def run_enabled_case():
-    repo_dir = make_repo("codeswarmbeadsenabled")
+    root_dir, origin_dir, repo_dir = make_remote_repo("codeswarmbeadsenabled")
     beads_home = Path(tempfile.mkdtemp(prefix="codeswarmbeadshome"))
     project = make_project(repo_dir)
     original_disable = os.environ.get("CODESWARM_DISABLE_BEADS_SYNC")
@@ -140,6 +212,12 @@ def run_enabled_case():
         if not task_one.get("beads_id") or not task_two.get("beads_id"):
             raise RuntimeError("Task beads were not created")
 
+        exported_records = assert_remote_control_branch(project, origin_dir)
+        exported_ids = {str(record.get("id") or "") for record in exported_records if isinstance(record, dict)}
+        expected_ids = {project["beads_root_id"], task_one["beads_id"], task_two["beads_id"]}
+        if not expected_ids.issubset(exported_ids):
+            raise RuntimeError("Control branch export is missing expected Beads records")
+
         issue_two = show_issue(repo_dir, task_two["beads_id"])
         dependencies = issue_two.get("dependencies") or []
         if not any(dep.get("id") == task_one["beads_id"] for dep in dependencies if isinstance(dep, dict)):
@@ -156,6 +234,16 @@ def run_enabled_case():
         router_module._sync_task_status_to_beads(project, task_one)
         if show_issue(repo_dir, task_one["beads_id"]).get("status") != "closed":
             raise RuntimeError("Completed task bead did not close")
+
+        exported_records = assert_remote_control_branch(project, origin_dir)
+        exported_task_one = next(
+            (record for record in exported_records if str(record.get("id") or "") == task_one["beads_id"]),
+            None,
+        )
+        if not isinstance(exported_task_one, dict) or exported_task_one.get("status") != "closed":
+            raise RuntimeError("Control branch export did not capture the closed task status")
+
+        assert_bootstrap_from_control_branch(origin_dir, project, task_one["beads_id"])
     finally:
         if original_disable is None:
             os.environ.pop("CODESWARM_DISABLE_BEADS_SYNC", None)
@@ -165,7 +253,7 @@ def run_enabled_case():
             os.environ.pop("CODESWARM_BEADS_HOME", None)
         else:
             os.environ["CODESWARM_BEADS_HOME"] = original_home
-        shutil.rmtree(repo_dir, ignore_errors=True)
+        shutil.rmtree(root_dir, ignore_errors=True)
         shutil.rmtree(beads_home, ignore_errors=True)
 
 

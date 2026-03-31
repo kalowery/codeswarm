@@ -8,6 +8,7 @@ import os
 import select
 import copy
 import tempfile
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 import threading
@@ -50,6 +51,7 @@ SCHEDULER_LOCK = threading.Lock()
 STATE_SAVE_LOCK = threading.Lock()
 TERMINATION_IN_PROGRESS = set()
 FORCE_TERMINATION_REQUESTED = set()
+PROJECT_BEADS_PERSIST_LOCKS = defaultdict(threading.Lock)
 
 # Retention policy
 TERMINATED_TTL_SECONDS = 900  # 15 minutes
@@ -68,6 +70,7 @@ APPROVAL_ACK_RETRY_SECONDS = 2.0
 APPROVAL_ACK_MAX_BACKOFF_SECONDS = 15.0
 PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
 PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
+PROJECT_CONTROL_BRANCH_PREFIX = "codeswarm/project-control"
 
 
 def _pid_file_path():
@@ -88,6 +91,10 @@ def _project_repo_cache_root():
 def _project_repo_cache_root():
     raw = str(os.environ.get("CODESWARM_PROJECT_REPO_CACHE_ROOT") or "").strip()
     return Path(raw).expanduser() if raw else PROJECT_REPO_CACHE_ROOT
+
+
+def _project_control_cache_root():
+    return _project_repo_cache_root() / "_control"
 
 
 def _bump_approvals_version():
@@ -1267,6 +1274,88 @@ def _normalize_usage_payload(base, total_usage, last_usage, model_context_window
     }
 
 
+USAGE_COUNTER_FIELDS = (
+    "total_tokens",
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+
+def _empty_usage_totals():
+    return {field: 0 for field in USAGE_COUNTER_FIELDS}
+
+
+def _normalize_usage_snapshot(payload):
+    if not isinstance(payload, dict):
+        return None
+    total_tokens = _to_int(payload.get("total_tokens"))
+    if total_tokens is None:
+        return None
+    snapshot = _empty_usage_totals()
+    snapshot["total_tokens"] = total_tokens
+    for field in USAGE_COUNTER_FIELDS:
+        if field == "total_tokens":
+            continue
+        value = _to_int(payload.get(field))
+        snapshot[field] = value if value is not None else 0
+    model_context_window = _to_int(payload.get("model_context_window"))
+    if model_context_window is not None:
+        snapshot["model_context_window"] = model_context_window
+    usage_source = str(payload.get("usage_source") or "").strip()
+    if usage_source:
+        snapshot["usage_source"] = usage_source
+    return snapshot
+
+
+def _usage_delta(current_snapshot, previous_snapshot):
+    if not isinstance(current_snapshot, dict):
+        return None
+    previous = previous_snapshot if isinstance(previous_snapshot, dict) else {}
+    delta = _empty_usage_totals()
+    changed = False
+    for field in USAGE_COUNTER_FIELDS:
+        current_value = _to_int(current_snapshot.get(field)) or 0
+        previous_value = _to_int(previous.get(field)) or 0
+        field_delta = current_value - previous_value
+        if field_delta < 0:
+            field_delta = current_value
+        delta[field] = field_delta
+        if field_delta:
+            changed = True
+    if not changed:
+        return None
+    if "model_context_window" in current_snapshot:
+        delta["model_context_window"] = current_snapshot.get("model_context_window")
+    if "usage_source" in current_snapshot:
+        delta["usage_source"] = current_snapshot.get("usage_source")
+    return delta
+
+
+def _apply_usage_delta(record, delta):
+    if not isinstance(record, dict) or not isinstance(delta, dict):
+        return False
+    usage = record.get("usage")
+    if not isinstance(usage, dict):
+        usage = _empty_usage_totals()
+    changed = False
+    for field in USAGE_COUNTER_FIELDS:
+        current_value = _to_int(usage.get(field)) or 0
+        next_value = current_value + (_to_int(delta.get(field)) or 0)
+        if next_value != current_value:
+            changed = True
+        usage[field] = next_value
+    model_context_window = _to_int(delta.get("model_context_window"))
+    if model_context_window is not None:
+        usage["model_context_window"] = model_context_window
+    usage_source = str(delta.get("usage_source") or "").strip()
+    if usage_source:
+        usage["usage_source"] = usage_source
+    record["usage"] = usage
+    return changed
+
+
 def cleanup_terminated():
     now = time.time()
 
@@ -1582,6 +1671,55 @@ def _run_git(repo_path: Path, args):
         text=True,
         check=False,
     )
+
+
+def _git_config_value(repo_path: Path, key):
+    completed = _run_git(repo_path, ["config", "--get", str(key)])
+    if completed.returncode != 0:
+        return None
+    value = str(completed.stdout or "").strip()
+    return value or None
+
+
+def _git_global_config_value(key):
+    completed = subprocess.run(
+        ["git", "config", "--global", "--get", str(key)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    value = str(completed.stdout or "").strip()
+    return value or None
+
+
+def _ensure_git_identity(repo_path: Path, source_repo: Path | None = None):
+    user_name = _git_config_value(repo_path, "user.name")
+    user_email = _git_config_value(repo_path, "user.email")
+    if user_name and user_email:
+        return
+
+    source_name = _git_config_value(source_repo, "user.name") if source_repo else None
+    source_email = _git_config_value(source_repo, "user.email") if source_repo else None
+    fallback_name = source_name or _git_global_config_value("user.name") or "Codeswarm Router"
+    fallback_email = source_email or _git_global_config_value("user.email") or "codeswarm-router@local"
+
+    if not user_name:
+        _run_git(repo_path, ["config", "user.name", fallback_name])
+    if not user_email:
+        _run_git(repo_path, ["config", "user.email", fallback_email])
+
+
+def _git_has_remote(repo_path: Path, remote_name="origin"):
+    completed = _run_git(repo_path, ["remote", "get-url", str(remote_name)])
+    return completed.returncode == 0
+
+
+def _git_has_commit(repo_path: Path):
+    completed = _run_git(repo_path, ["rev-parse", "--verify", "HEAD"])
+    return completed.returncode == 0
 
 
 def _project_repo_dir(project):
@@ -1921,6 +2059,146 @@ def _beads_safe_prefix(repo_path):
     return token[:40]
 
 
+def _project_beads_control_branch(project):
+    project_token = _sanitize_branch_token((project or {}).get("project_id"))
+    return f"{PROJECT_CONTROL_BRANCH_PREFIX}/{project_token}"
+
+
+def _project_control_clone_source(project):
+    remote_url = str((project or {}).get("repo_remote_url") or "").strip()
+    if remote_url:
+        return remote_url
+    repo_path = str((project or {}).get("repo_path") or "").strip()
+    if repo_path:
+        origin_url = _git_origin_remote_url(Path(repo_path).expanduser().resolve())
+        if origin_url:
+            return origin_url
+    if repo_path:
+        return str(Path(repo_path).expanduser().resolve())
+    raise RuntimeError("project repository source is unavailable")
+
+
+def _project_control_clone_dir(project):
+    project_id = str((project or {}).get("project_id") or "").strip() or "project"
+    source = _project_control_clone_source(project)
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    return (_project_control_cache_root() / f"{project_id}-{digest}").resolve()
+
+
+def _resolve_control_branch_start_ref(repo_dir: Path, branch_name, base_branch):
+    return _git_resolve_revision(
+        repo_dir,
+        [
+            f"origin/{branch_name}",
+            f"refs/remotes/origin/{branch_name}",
+            branch_name,
+            f"refs/heads/{branch_name}",
+            base_branch,
+            f"origin/{base_branch}",
+            f"refs/heads/{base_branch}",
+            f"refs/remotes/origin/{base_branch}",
+            "HEAD",
+        ],
+    )
+
+
+def _checkout_project_control_branch(repo_dir: Path, branch_name, base_branch):
+    start_ref = _resolve_control_branch_start_ref(repo_dir, branch_name, base_branch)
+    if start_ref:
+        completed = _run_git(repo_dir, ["checkout", "-B", branch_name, start_ref])
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "git checkout failed"
+            raise RuntimeError(f"Failed to prepare control branch {branch_name}: {detail}")
+        return
+    if _git_has_commit(repo_dir):
+        completed = _run_git(repo_dir, ["checkout", "-B", branch_name])
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "git checkout failed"
+            raise RuntimeError(f"Failed to prepare control branch {branch_name}: {detail}")
+        return
+    completed = _run_git(repo_dir, ["checkout", "--orphan", branch_name])
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "git checkout failed"
+        raise RuntimeError(f"Failed to create orphan control branch {branch_name}: {detail}")
+
+
+def _export_project_beads_snapshot(project, output_path: Path):
+    repo_dir = _project_repo_dir(project)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _, error = _run_beads(repo_dir, ["export", "-o", str(output_path)])
+    if error:
+        raise RuntimeError(f"Failed to export Beads issues: {error}")
+
+
+def _copy_portable_beads_files(project, control_dir: Path):
+    repo_dir = _project_repo_dir(project)
+    source_root = repo_dir / ".beads"
+    if not source_root.exists():
+        return []
+    copied_paths = []
+    for relative_path in (
+        Path(".beads/.gitignore"),
+        Path(".beads/README.md"),
+        Path(".beads/config.yaml"),
+        Path(".beads/metadata.json"),
+    ):
+        source_path = repo_dir / relative_path
+        if not source_path.exists() or not source_path.is_file():
+            continue
+        target_path = control_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_path, target_path)
+        copied_paths.append(relative_path.as_posix())
+    return copied_paths
+
+
+def _persist_project_beads_snapshot(project):
+    if not project or not _project_beads_available(project):
+        return
+    project_id = str((project or {}).get("project_id") or "").strip() or "project"
+    with PROJECT_BEADS_PERSIST_LOCKS[project_id]:
+        repo_dir = _project_repo_dir(project)
+        control_dir = _project_control_clone_dir(project)
+        _sync_project_control_clone(_project_control_clone_source(project), control_dir)
+        _ensure_git_identity(control_dir, repo_dir)
+
+        branch_name = _project_beads_control_branch(project)
+        base_branch = str((project or {}).get("base_branch") or "main").strip() or "main"
+        _checkout_project_control_branch(control_dir, branch_name, base_branch)
+
+        export_path = control_dir / ".beads" / "issues.jsonl"
+        stage_paths = _copy_portable_beads_files(project, control_dir)
+        _export_project_beads_snapshot(project, export_path)
+        stage_paths.append(".beads/issues.jsonl")
+        add_result = _run_git(control_dir, ["add", "--force", *stage_paths])
+        if add_result.returncode != 0:
+            detail = add_result.stderr.strip() or add_result.stdout.strip() or "git add failed"
+            raise RuntimeError(f"Failed to stage Beads export: {detail}")
+
+        diff_result = _run_git(control_dir, ["diff", "--cached", "--quiet", "--", *stage_paths])
+        if diff_result.returncode == 0:
+            return
+        if diff_result.returncode not in (0, 1):
+            detail = diff_result.stderr.strip() or diff_result.stdout.strip() or "git diff failed"
+            raise RuntimeError(f"Failed to inspect staged Beads export: {detail}")
+
+        commit_message = (
+            f"codeswarm: persist beads snapshot for {project.get('project_id')}\n\n"
+            f"Project: {project.get('title')}\n"
+            f"Branch: {branch_name}\n"
+        )
+        commit_result = _run_git(control_dir, ["commit", "-m", commit_message])
+        if commit_result.returncode != 0:
+            detail = commit_result.stderr.strip() or commit_result.stdout.strip() or "git commit failed"
+            raise RuntimeError(f"Failed to commit Beads export: {detail}")
+
+        if _git_has_remote(control_dir):
+            push_result = _run_git(control_dir, ["push", "-u", "origin", branch_name])
+            if push_result.returncode != 0:
+                detail = push_result.stderr.strip() or push_result.stdout.strip() or "git push failed"
+                raise RuntimeError(f"Failed to push Beads export: {detail}")
+
+
 def _project_beads_status(project):
     status = str(project.get("beads_sync_status") or "").strip()
     return status or "disabled"
@@ -2126,6 +2404,10 @@ def _sync_project_to_beads(project):
         _set_project_beads_status(project, "partial", "; ".join(task_errors[:3]))
     else:
         _set_project_beads_status(project, "synced")
+    try:
+        _persist_project_beads_snapshot(project)
+    except Exception as e:
+        _set_project_beads_status(project, "warning", str(e))
 
 
 def _sync_task_status_to_beads(project, task):
@@ -2145,6 +2427,10 @@ def _sync_task_status_to_beads(project, task):
             _set_task_beads_status(task, "warning", error)
         else:
             _set_task_beads_status(task, "synced")
+            try:
+                _persist_project_beads_snapshot(project)
+            except Exception as e:
+                _set_project_beads_status(project, "warning", str(e))
         return
 
     if task_status == "completed":
@@ -2154,6 +2440,10 @@ def _sync_task_status_to_beads(project, task):
             _set_task_beads_status(task, "warning", error)
         else:
             _set_task_beads_status(task, "closed")
+            try:
+                _persist_project_beads_snapshot(project)
+            except Exception as e:
+                _set_project_beads_status(project, "warning", str(e))
         return
 
     if task_status == "failed":
@@ -2163,6 +2453,10 @@ def _sync_task_status_to_beads(project, task):
             _set_task_beads_status(task, "warning", error)
         else:
             _set_task_beads_status(task, "synced")
+            try:
+                _persist_project_beads_snapshot(project)
+            except Exception as e:
+                _set_project_beads_status(project, "warning", str(e))
 
 
 def _parse_task_graph_json_block(text):
@@ -2292,6 +2586,9 @@ def _create_project_record(
         "last_resume_at": None,
         "last_resumed_by_worker_swarm_ids": [],
         "resume_summary": None,
+        "usage": _empty_usage_totals(),
+        "usage_updated_at": None,
+        "worker_usage": {},
         "created_at": now,
         "updated_at": now,
     }
@@ -2567,6 +2864,8 @@ def _normalize_task_payload(raw_task, index):
         "attempts": 0,
         "assigned_swarm_id": None,
         "assigned_node_id": None,
+        "last_assigned_swarm_id": None,
+        "last_assigned_node_id": None,
         "assignment_injection_id": None,
         "branch": None,
         "base_commit": None,
@@ -2582,6 +2881,9 @@ def _normalize_task_payload(raw_task, index):
         "beads_sync_status": "pending",
         "beads_last_error": None,
         "beads_dependencies_synced": [],
+        "usage": _empty_usage_totals(),
+        "active_attempt_usage": None,
+        "usage_updated_at": None,
         "created_at": now,
         "updated_at": now,
     }
@@ -2719,6 +3021,68 @@ def _project_first_idle_target(project):
     return None, None
 
 
+def _update_project_usage_for_injection(payload):
+    if not isinstance(payload, dict):
+        return False
+    project_id, task_id = _find_project_and_task_by_injection(payload.get("injection_id"))
+    if not project_id or not task_id:
+        return False
+
+    changed = False
+    with SCHEDULER_LOCK:
+        project = PROJECTS.get(str(project_id))
+        if not isinstance(project, dict):
+            return False
+        task = (project.get("tasks") or {}).get(str(task_id))
+        if not isinstance(task, dict):
+            return False
+
+        current_snapshot = _normalize_usage_snapshot(payload)
+        if not current_snapshot:
+            return False
+        previous_snapshot = task.get("active_attempt_usage")
+        delta = _usage_delta(current_snapshot, previous_snapshot)
+        task["active_attempt_usage"] = current_snapshot
+        if not delta:
+            return False
+
+        task_changed = _apply_usage_delta(task, delta)
+        if task_changed:
+            task["usage_updated_at"] = time.time()
+            changed = True
+
+        if _apply_usage_delta(project, delta):
+            project["usage_updated_at"] = time.time()
+            changed = True
+
+        swarm_id = str(payload.get("swarm_id") or task.get("assigned_swarm_id") or "").strip()
+        node_id = payload.get("node_id")
+        if swarm_id and isinstance(node_id, int):
+            worker_usage = project.get("worker_usage")
+            if not isinstance(worker_usage, dict):
+                worker_usage = {}
+                project["worker_usage"] = worker_usage
+            worker_key = f"{swarm_id}:{node_id}"
+            worker_record = worker_usage.get(worker_key)
+            if not isinstance(worker_record, dict):
+                worker_record = {
+                    "swarm_id": swarm_id,
+                    "node_id": int(node_id),
+                }
+                worker_usage[worker_key] = worker_record
+            swarm = SWARMS.get(swarm_id)
+            alias = str((swarm or {}).get("alias") or "").strip()
+            if alias:
+                worker_record["swarm_alias"] = alias
+            if _apply_usage_delta(worker_record, delta):
+                worker_record["updated_at"] = time.time()
+                changed = True
+
+    if changed:
+        _emit_projects_updated()
+    return changed
+
+
 def _record_project_task_result(project_id, task_id, data):
     project_ref = None
     task_ref = None
@@ -2736,6 +3100,7 @@ def _record_project_task_result(project_id, task_id, data):
         task["assigned_swarm_id"] = None
         task["assigned_node_id"] = None
         task["assignment_injection_id"] = None
+        task["active_attempt_usage"] = None
         task["branch"] = parsed.get("branch") if isinstance(parsed, dict) else task.get("branch")
         task["base_commit"] = parsed.get("base_commit") if isinstance(parsed, dict) else task.get("base_commit")
         task["head_commit"] = parsed.get("head_commit") if isinstance(parsed, dict) else task.get("head_commit")
@@ -2946,6 +3311,7 @@ def _reconcile_project_for_resume(project, retry_failed=False, reverify_complete
                 task["assigned_swarm_id"] = None
                 task["assigned_node_id"] = None
                 task["assignment_injection_id"] = None
+                task["active_attempt_usage"] = None
                 task["verified_branch_commit"] = None
                 task["verified_at"] = None
                 task["resume_decision"] = "downgraded_to_pending"
@@ -2964,6 +3330,7 @@ def _reconcile_project_for_resume(project, retry_failed=False, reverify_complete
             task["assigned_swarm_id"] = None
             task["assigned_node_id"] = None
             task["assignment_injection_id"] = None
+            task["active_attempt_usage"] = None
             if verification.get("recoverable"):
                 task["status"] = "completed"
                 task["result_status"] = str(task.get("result_status") or "recovered_from_branch")
@@ -2987,6 +3354,7 @@ def _reconcile_project_for_resume(project, retry_failed=False, reverify_complete
             task["assigned_swarm_id"] = None
             task["assigned_node_id"] = None
             task["assignment_injection_id"] = None
+            task["active_attempt_usage"] = None
             task["last_error"] = None
             task["resume_decision"] = "retried_failed"
             task["last_resume_reason"] = "Failed task reset to pending during resume"
@@ -3017,6 +3385,7 @@ def _reconcile_project_for_resume(project, retry_failed=False, reverify_complete
             task["assigned_swarm_id"] = None
             task["assigned_node_id"] = None
             task["assignment_injection_id"] = None
+            task["active_attempt_usage"] = None
             task["verified_branch_commit"] = None
             task["verified_at"] = None
             task["resume_decision"] = "dependency_reset"
@@ -3357,7 +3726,10 @@ def _dispatch_project_tasks(config):
                         task["attempts"] = int(task.get("attempts") or 0) + 1
                         task["assigned_swarm_id"] = str(swarm_id)
                         task["assigned_node_id"] = int(node_id)
+                        task["last_assigned_swarm_id"] = str(swarm_id)
+                        task["last_assigned_node_id"] = int(node_id)
                         task["assignment_injection_id"] = injection_id
+                        task["active_attempt_usage"] = None
                         task["branch"] = branch_name
                         task["last_error"] = None
                         task["updated_at"] = time.time()
@@ -5492,6 +5864,8 @@ def run_daemon(config, providers):
                         _dispatch_inter_swarm_queue(config)
                         _dispatch_pending_project_plans(config)
                         _dispatch_project_tasks(config)
+                    if event_name == "usage":
+                        _update_project_usage_for_injection(data)
                     emit_event(event_name, data)
 
         for backend in dead_backends:

@@ -16,6 +16,7 @@ import type {
   NodeSystemEvent,
   ProjectRecord,
   ProjectTaskRecord,
+  ProjectWorkerUsageRecord,
   FocusTarget
 } from '@/lib/store'
 import remarkGfm from 'remark-gfm'
@@ -103,6 +104,12 @@ function formatUsd(value: number) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 4
   })
+}
+
+function formatTokenCount(value: number | undefined) {
+  const amount = Number(value ?? 0)
+  if (!Number.isFinite(amount)) return '0'
+  return Math.max(0, Math.round(amount)).toLocaleString()
 }
 
 type ApprovalChangeDetail = {
@@ -292,6 +299,37 @@ export default function Home() {
 
   function projectCompletedCount(project: ProjectRecord) {
     return Number(project.task_counts?.completed ?? 0)
+  }
+
+  function projectUsage(project: ProjectRecord | undefined) {
+    return project?.usage
+  }
+
+  function projectSpend(project: ProjectRecord | undefined) {
+    return estimateUsageUsd(projectUsage(project))
+  }
+
+  function taskUsage(task: ProjectTaskRecord | undefined) {
+    return task?.usage
+  }
+
+  function taskSpend(task: ProjectTaskRecord | undefined) {
+    return estimateUsageUsd(taskUsage(task))
+  }
+
+  function projectWorkerUsageRows(project: ProjectRecord | undefined): ProjectWorkerUsageRecord[] {
+    if (!project?.worker_usage) return []
+    return Object.values(project.worker_usage)
+      .filter((entry): entry is ProjectWorkerUsageRecord => !!entry && typeof entry === 'object')
+      .sort((a, b) => {
+        const spendDiff = estimateUsageUsd(b.usage) - estimateUsageUsd(a.usage)
+        if (spendDiff !== 0) return spendDiff
+        const tokenDiff = (b.usage?.total_tokens ?? 0) - (a.usage?.total_tokens ?? 0)
+        if (tokenDiff !== 0) return tokenDiff
+        const aliasA = `${a.swarm_alias ?? a.swarm_id}:${a.node_id}`
+        const aliasB = `${b.swarm_alias ?? b.swarm_id}:${b.node_id}`
+        return aliasA.localeCompare(aliasB)
+      })
   }
 
   function formatTimestamp(value: number | undefined) {
@@ -1275,6 +1313,9 @@ export default function Home() {
                     <div className="text-[11px] text-slate-500 mt-1">
                       ready {projectReadyCount(project)} · running {projectAssignedCount(project)} · done {projectCompletedCount(project)}
                     </div>
+                    <div className="text-[11px] text-slate-500 mt-1">
+                      spend {formatUsd(projectSpend(project))} · tokens {formatTokenCount(projectUsage(project)?.total_tokens)}
+                    </div>
                     <div className="mt-2 flex items-center gap-2">
                       <span className={`px-2 py-0.5 rounded border text-[10px] uppercase tracking-wide ${beadsStatusTone(project.beads_sync_status)}`}>
                         Beads {project.beads_sync_status || 'pending'}
@@ -1398,6 +1439,7 @@ export default function Home() {
         {activeProject && (
           (() => {
             const selectedTask = selectedProjectTask(activeProject)
+            const projectWorkers = projectWorkerUsageRows(activeProject)
             const assignedSwarm = selectedTask?.assigned_swarm_id ? swarms[selectedTask.assigned_swarm_id] : undefined
             const assignedNodeId =
               typeof selectedTask?.assigned_node_id === 'number' ? selectedTask.assigned_node_id : undefined
@@ -1416,6 +1458,11 @@ export default function Home() {
                       Status: {activeProject.status} · Base branch: {activeProject.base_branch || 'main'}
                     </div>
                     <div className="text-xs text-slate-500 mt-1">{activeProject.repo_label || activeProject.repo_path}</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-300">
+                      <span>Total spend: {formatUsd(projectSpend(activeProject))}</span>
+                      <span>Total tokens: {formatTokenCount(projectUsage(activeProject)?.total_tokens)}</span>
+                      <span>Workers billed: {projectWorkers.length}</span>
+                    </div>
                     {activeProject.repo_label && activeProject.repo_label !== activeProject.repo_path && (
                       <div className="text-[11px] text-slate-600 mt-1 break-all">
                         Local repo path: {activeProject.repo_path}
@@ -1567,6 +1614,9 @@ export default function Home() {
                                 {swarms[task.assigned_swarm_id]?.alias ?? task.assigned_swarm_id} · agent {task.assigned_node_id}
                               </div>
                             )}
+                            <div className="text-[11px] text-slate-500 mt-1">
+                              spend {formatUsd(taskSpend(task))} · tokens {formatTokenCount(taskUsage(task)?.total_tokens)}
+                            </div>
                             {task.last_error && (
                               <div className="text-[11px] text-rose-300 mt-1 line-clamp-2">{task.last_error}</div>
                             )}
@@ -1607,10 +1657,13 @@ export default function Home() {
                               <div>Result: {selectedTask.result_status ?? 'n/a'}</div>
                               <div>Beads issue: {selectedTask.beads_id ?? 'n/a'}</div>
                               <div>Resume: {resumeDecisionLabel(selectedTask.resume_decision)}</div>
+                              <div>Spend: {formatUsd(taskSpend(selectedTask))}</div>
+                              <div>Tokens: {formatTokenCount(taskUsage(selectedTask)?.total_tokens)}</div>
                             </div>
                             <div>
                               <div>Assigned swarm: {selectedTask.assigned_swarm_id ? (swarms[selectedTask.assigned_swarm_id]?.alias ?? selectedTask.assigned_swarm_id) : 'unassigned'}</div>
                               <div>Assigned agent: {typeof selectedTask.assigned_node_id === 'number' ? selectedTask.assigned_node_id : 'n/a'}</div>
+                              <div>Last worker: {selectedTask.last_assigned_swarm_id ? `${swarms[selectedTask.last_assigned_swarm_id]?.alias ?? selectedTask.last_assigned_swarm_id} · agent ${typeof selectedTask.last_assigned_node_id === 'number' ? selectedTask.last_assigned_node_id : 'n/a'}` : 'n/a'}</div>
                               <div>Branch: {selectedTask.branch ?? 'n/a'}</div>
                               <div>Beads sync: {selectedTask.beads_sync_status ?? 'pending'}</div>
                             </div>
@@ -1653,6 +1706,44 @@ export default function Home() {
                             </div>
                           ) : (
                             <div className="text-sm text-slate-500">This task is not currently assigned to a live worker.</div>
+                          )}
+                        </div>
+
+                        <div className="rounded border border-slate-800 bg-slate-900 p-4">
+                          <div className="flex items-center justify-between mb-3">
+                            <div className="text-xs uppercase tracking-wide text-slate-500">Worker Spend</div>
+                            <div className="text-xs text-slate-500">
+                              Project total {formatUsd(projectSpend(activeProject))}
+                            </div>
+                          </div>
+                          {projectWorkers.length > 0 ? (
+                            <div className="space-y-2">
+                              {projectWorkers.map((entry) => (
+                                <div
+                                  key={`${entry.swarm_id}:${entry.node_id}`}
+                                  className="rounded border border-slate-800 bg-slate-950 p-3 text-sm"
+                                >
+                                  <div className="flex items-start justify-between gap-3">
+                                    <div>
+                                      <div className="font-medium text-slate-200">
+                                        {entry.swarm_alias ?? swarms[entry.swarm_id]?.alias ?? entry.swarm_id} · agent {entry.node_id}
+                                      </div>
+                                      <div className="text-[11px] text-slate-500">
+                                        {entry.swarm_id}
+                                      </div>
+                                    </div>
+                                    <div className="text-right">
+                                      <div className="text-slate-200">{formatUsd(estimateUsageUsd(entry.usage))}</div>
+                                      <div className="text-[11px] text-slate-500">
+                                        {formatTokenCount(entry.usage?.total_tokens)} tokens
+                                      </div>
+                                    </div>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="text-sm text-slate-500">No worker usage has been recorded for this project yet.</div>
                           )}
                         </div>
                       </>
