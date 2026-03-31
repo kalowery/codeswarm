@@ -92,6 +92,7 @@ def main():
     codex_home = str(Path.home() / ".codex")
     workspace_dir = os.getcwd()
     workspace_root = Path(workspace_dir).resolve()
+    heartbeat_path = workspace_root / "heartbeat.json"
     stderr_log_path = Path(workspace_dir) / "codex.stderr.log"
 
     def launch_codex_proc():
@@ -146,6 +147,22 @@ def main():
     restart_count = 0
     last_restart_ts = 0.0
     rehydrate_history_on_thread_start = None
+    heartbeat_interval_seconds = 1.0
+    last_heartbeat_at = 0.0
+
+    def write_heartbeat(force: bool = False):
+        nonlocal last_heartbeat_at
+        now = time.time()
+        if not force and (now - last_heartbeat_at) < heartbeat_interval_seconds:
+            return
+        heartbeat_path.write_text(json.dumps({
+            "timestamp": now,
+            "job_id": job_id,
+            "node_id": node_id,
+            "worker_type": "codex",
+            "pid": os.getpid(),
+        }), encoding="utf-8")
+        last_heartbeat_at = now
 
     def handle_shutdown(signum, frame):
         nonlocal shutdown_requested
@@ -842,6 +859,7 @@ def main():
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "capture_all_session": capture_all_session,
         })
+        write_heartbeat(force=True)
 
         # LSP-style handshake
         send_request("initialize", {
@@ -862,6 +880,7 @@ def main():
         running = True
 
         while running and not shutdown_requested:
+            write_heartbeat()
 
             # ---- STDOUT (JSON-RPC) ----
             ready_out, _, _ = select.select([proc.stdout], [], [], 0.1)

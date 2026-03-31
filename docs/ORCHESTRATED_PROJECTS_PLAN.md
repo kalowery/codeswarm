@@ -1,5 +1,25 @@
 # Orchestrated Projects Plan
 
+## Implementation Status
+
+This document began as a forward plan. The repository now implements the core orchestration/runtime path plus the first resume UX wave:
+
+- router-backed project/task runtime
+- planner-driven project planning path
+- deterministic worker dispatch
+- per-worker isolated repository preparation
+- automatic final integration task
+- web UI project/task visibility
+- project resume and resume preview
+- CLI support for project resume
+
+Open higher-level follow-on work still includes:
+
+- worker-generated follow-up task proposal normalization
+- richer project policy controls
+- cost/latency-aware assignment
+- automated worker provisioning during resume
+
 ## Goal
 
 Add an opt-in Codeswarm capability for deterministic coordination of multiple agents working on the same software project without replacing the current uncoordinated swarm model.
@@ -215,7 +235,7 @@ Add richer resume UX:
 - explicit retry policies for failed tasks
 - CLI support for project resume
 
-## Phase 1 Scope Being Implemented
+## Phase 1 Scope
 
 This repository change set focuses on:
 
@@ -225,4 +245,4 @@ This repository change set focuses on:
 - read/write backend APIs for projects
 - initial frontend project observability with direct access to live worker transcripts
 
-Planner-driven Beads graph generation is still part of the target architecture, but Phase 1 in this repo is scoped to the runtime/project foundation needed to execute those graphs deterministically once supplied.
+Planner-driven Beads graph generation remains part of the target architecture, but this repository now includes both the runtime/project foundation and the initial planning/resume UX required to execute those graphs deterministically once supplied.

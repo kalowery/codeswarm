@@ -53,6 +53,7 @@ Codeswarm model:
 - Multi-agent parallelism under one control plane.
 - Enqueue and route work across swarms.
 - Event-sourced visibility of state, queue, and completion.
+- Deterministic project execution with restart-safe resume semantics.
 
 ---
 
@@ -69,6 +70,9 @@ Mitigation: Lifecycle provenance, explicit ownership, audit-friendly event logs.
 
 Risk: Operational brittleness from runtime event variation.
 Mitigation: Normalized control-plane events and completion fallbacks.
+
+Risk: Interrupted software projects lose forward progress.
+Mitigation: Router-owned project state plus repository-verified resume from durable task branches.
 
 ---
 

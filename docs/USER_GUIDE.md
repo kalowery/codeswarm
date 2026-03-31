@@ -60,8 +60,9 @@ CLI launch also supports the same launch-only payloads the web UI sends:
 - backend: `cluster.backend = "local"`
 - workers run as local subprocesses
 - mailbox under `runs/mailbox` by default
-- active swarms survive router restart as long as the local worker processes are still alive
-- old local swarms launched before PID metadata existed cannot be reconstructed after their router state is lost
+- active swarms survive router restart only when the provider can prove workers are still alive
+- on non-Linux hosts, local recovery uses fresh per-worker heartbeats instead of weak PID-only evidence
+- stale local swarms should not reappear after router restart once their workers stop emitting heartbeats
 
 ### Slurm mode
 
@@ -94,6 +95,19 @@ CLI launch also supports the same launch-only payloads the web UI sends:
 - backend profiles live under `cluster.<backend>.profiles.<name>`
   - useful for multiple AWS variants (cpu/gpu) and multiple Slurm login nodes/partitions
 
+Common local presets used for deterministic project execution:
+
+- `local-orchestrated-planner`
+- `local-orchestrated-worker`
+
+These presets default to:
+
+- `worker_mode=codex`
+- `approval_policy=never`
+- `sandbox_mode=danger-full-access`
+- `native_auto_approve=true`
+- `fresh_thread_per_injection=true`
+
 ## 3. Launch a swarm
 
 In UI:
@@ -121,7 +135,71 @@ When a persona directory is selected, each worker workspace receives:
 
 Files outside persona `AGENTS.md` and `skills/` are ignored.
 
-## 4. Inject prompts
+## 4. Orchestrated projects
+
+Codeswarm supports an opt-in project mode that keeps router-owned task state alongside the normal ad hoc swarm model.
+
+Project creation paths:
+
+- direct project creation from an explicit task list
+- planner-driven project creation from a spec plus planner swarm
+
+Repository inputs:
+
+- absolute path to an existing local git repo
+- GitHub owner/repo reference
+- GitHub repo creation flow for project planning/execution
+
+Planner mode requires:
+
+- one planner swarm
+- one or more worker swarms
+
+Resume requires:
+
+- one or more worker swarms
+- no planner swarm is needed unless you want to replan the project itself
+
+The router appends a final integration task automatically. A project is not complete until that integration task succeeds.
+
+## 5. Project UI flow
+
+In the web UI:
+
+- create a planner swarm and worker swarms first
+- open `Create Project`
+- choose direct-task mode or planner mode
+- for planner mode, select the planner swarm and one or more worker swarms
+- submit the project
+
+The UI lets you observe:
+
+- project status and task counts
+- the selected task prompt and acceptance criteria
+- assigned swarm/node for each running task
+- live worker transcript for the active swarm
+
+## 6. Resume a project
+
+Resume is available from the project detail pane for non-completed projects.
+
+Resume behavior:
+
+- opens a resume modal for the selected project
+- shows a live resume preview before submission
+- lets you replace the worker swarm set
+- optionally retries failed tasks
+- optionally reverifies completed tasks against durable task branches
+- shows blocked reasons when live assignments must be terminated first
+
+CLI equivalents:
+
+```bash
+codeswarm project resume-preview <project-id> --config configs/local.json
+codeswarm project resume <project-id> --config configs/local.json
+```
+
+## 7. Inject prompts
 
 UI supports:
 
@@ -142,7 +220,7 @@ Backend maps aliases -> swarm IDs and sends either:
 
 For routed prompts, target node turns display the injected prompt text in the turn bubble once `turn_started` arrives.
 
-## 5. Inter-swarm queue visibility
+## 8. Inter-swarm queue visibility
 
 Frontend sidebar shows queued cross-swarm work:
 
@@ -153,7 +231,7 @@ Frontend sidebar shows queued cross-swarm work:
 
 Router events `queue_list` and `queue_updated` keep this panel synchronized.
 
-## 6. Approval flow for tool execution
+## 9. Approval flow for tool execution
 
 When Codex requests command approval, UI receives `exec_approval_required` and shows approval controls.
 
@@ -164,7 +242,7 @@ Available actions depend on `available_decisions` from worker/runtime. UI can se
 
 Backend forwards to router `/approval`, and router sends normalized control message to worker inbox.
 
-## 7. Runtime events visible in UI
+## 10. Runtime events visible in UI
 
 - turn lifecycle: `turn_started`, `turn_complete`
 - streaming text: `assistant_delta`, `assistant`
@@ -176,8 +254,9 @@ Backend forwards to router `/approval`, and router sends normalized control mess
 - approvals: `exec_approval_required`, `exec_approval_resolved`
 - token usage: `usage`
 - errors: `agent_error`, `command_rejected`
+- projects: `project_created`, `project_started`, `projects_updated`, `project_resume_preview`, `project_resumed`
 
-## 8. Auto-routing from task completion
+## 11. Auto-routing from task completion
 
 When a node finishes a task, backend inspects final assistant output (`task_complete`) for line-level directives:
 
@@ -190,7 +269,7 @@ When a node finishes a task, backend inspects final assistant output (`task_comp
 Matching lines are auto-submitted as new routes, enabling chained multi-swarm execution.
 When `/reply` is used, backend correlates destination completion and injects the result back to the original sender node as a follow-up prompt.
 
-## 9. Terminate a swarm
+## 12. Terminate a swarm
 
 Use the Terminate action in UI.
 
@@ -207,16 +286,17 @@ For AWS, router supports shorter graceful wait before force terminate via:
 
 - `router.aws_graceful_terminate_timeout_seconds` (default `45`)
 
-## 10. Attention and navigation
+## 13. Attention and navigation
 
 - node-level and swarm-level attention indicators pulse when unseen activity completes
 - node tabs are horizontally scrollable for large node counts
 
-## 11. Status and persistence notes
+## 14. Status and persistence notes
 
 - Router persists swarm registry in `router_state.json`.
 - Router persists inter-swarm queue state in `router_state.json`.
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
+- Router persists orchestrated projects and pending project plans in `router_state.json`.
 - User-terminated swarms are removed from router active state immediately after `swarm_terminated`.
 - UI shows per-agent and per-swarm estimated spend from cumulative token usage.
 - Optional frontend pricing env vars (USD per 1M tokens):
@@ -226,7 +306,18 @@ For AWS, router supports shorter graceful wait before force terminate via:
   - `NEXT_PUBLIC_REASONING_OUTPUT_TOKENS_USD_PER_1M`
 - Current defaults are set for `gpt-5.3-codex`: input `1.75`, cached input `0.175`, output `14`, reasoning output `0` (reasoning billed via output unless overridden).
 
-## 12. Troubleshooting
+## 15. Automated testing
+
+Headless UI and project automation now exist in-repo:
+
+```bash
+npm run test:web-ui
+python3 tools/orchestrated_project_resume_smoke.py
+```
+
+The browser suite uses Puppeteer and covers critical web flows including project creation, worker interaction, and resume modal behavior.
+
+## 16. Troubleshooting
 
 ### Codex authentication
 

@@ -9,7 +9,20 @@ Define a practical, staged test strategy for Codeswarm covering:
 - Provider behavior (local and Slurm)
 - HPC execution quality on AMD Instinct + ROCm clusters
 
-This plan is optimized for current repository state (minimal automated tests, no existing test harness).
+This plan is optimized for the current repository state, which now includes targeted automated smoke coverage for orchestrated projects and a headless browser suite for the web UI.
+
+## 1.1 Current Automated Coverage
+
+Implemented repository-level automation now includes:
+
+- Python compile smoke for router and worker code
+- TypeScript compile/build coverage for CLI and web packages
+- headless browser UI tests via Puppeteer:
+  - `node --test tools/web_ui/browser.test.cjs`
+- orchestrated project resume smoke:
+  - `python3 tools/orchestrated_project_resume_smoke.py`
+
+These suites exercise project creation, worker interaction, resume preview, blocked-resume handling, and end-to-end project completion behavior in the current web stack.
 
 ## 2. Scope
 
@@ -101,6 +114,11 @@ Required scenarios:
   - `/approval` call returns `exec_approval_resolved`
 5. Termination and cleanup:
   - `swarm_terminate` + router/backend state convergence.
+6. Orchestrated project runtime:
+  - project create/start through router/backend
+  - deterministic task dispatch to worker swarms
+  - project resume with replacement worker swarm
+  - resume preview blocked/unblocked paths
 
 Pass Criteria:
 - 100% pass on required scenarios.
@@ -186,6 +204,7 @@ Targets (initial):
 1. L0 static/build gates.
 2. L1 unit tests.
 3. L2 local integration tests.
+4. Headless browser UI suite for core web flows.
 
 ### Required on merge to `main`
 

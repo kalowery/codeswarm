@@ -46,6 +46,13 @@ Core idea:
 
 In practical terms, Codeswarm supplies a control plane where swarms and nodes can be launched, targeted, observed, and coordinated through structured events and command workflows.
 
+The current implementation now extends beyond ad hoc swarm routing with an opt-in orchestrated project mode:
+
+- a planner swarm can convert a software specification into a task graph
+- the router schedules tasks deterministically across worker swarms
+- users can observe project/task progress and live worker execution in one UI
+- incomplete projects can be resumed from durable repository state
+
 ---
 
 ## 3. System Model
@@ -125,6 +132,7 @@ The key shift:
 
 - Manual relay becomes structured delegation.
 - Sequential conversation becomes distributed workflow.
+- Project execution becomes a restart-safe runtime rather than a best-effort chat convention.
 
 ---
 

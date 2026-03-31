@@ -28,6 +28,8 @@ This document reflects the configuration keys currently used by router and provi
 - `cluster.archive_root` (optional)
 - `cluster.local.workspace_root` (optional override)
 - `cluster.local.archive_root` (optional override)
+- `cluster.local.default_sandbox_mode` (optional provider default, typically `danger-full-access` on macOS and `workspace-write` on Linux)
+- `cluster.local.worker_heartbeat_timeout_seconds` (optional, default `30`; local recovery window for active worker heartbeat freshness)
 
 Example:
 
@@ -110,6 +112,48 @@ Optional but recommended for mixed environments. Each preset includes:
 - `launch_soft_timeout_seconds` (optional): how long launch can run before UI marks it delayed
 - `launch_hard_timeout_seconds` (optional): hard timeout after which launch is marked failed and late materialization is auto-terminated
 
+Common local-provider default fields used by the web UI and CLI:
+
+- `worker_mode`: `codex` or `mock`
+- `approval_policy`
+- `sandbox_mode`
+- `native_auto_approve`
+- `fresh_thread_per_injection`
+- `network_access` (workspace-write Codex config generation)
+- `mock_delay_ms`
+- `mock_push_branches`
+
+Typical orchestrated-project local presets:
+
+```json
+[
+  {
+    "id": "local-orchestrated-planner",
+    "label": "Local Orchestrated Planner",
+    "backend": "local",
+    "defaults": {
+      "worker_mode": "codex",
+      "approval_policy": "never",
+      "sandbox_mode": "danger-full-access",
+      "native_auto_approve": true,
+      "fresh_thread_per_injection": true
+    }
+  },
+  {
+    "id": "local-orchestrated-worker",
+    "label": "Local Orchestrated Worker",
+    "backend": "local",
+    "defaults": {
+      "worker_mode": "codex",
+      "approval_policy": "never",
+      "sandbox_mode": "danger-full-access",
+      "native_auto_approve": true,
+      "fresh_thread_per_injection": true
+    }
+  }
+]
+```
+
 ### Backend profiles (optional)
 
 Each backend config can define multiple named profiles under `profiles`:
@@ -161,6 +205,7 @@ New configs should use `login_host` under `cluster.slurm` or `cluster.slurm.prof
 - `graceful_terminate_poll_seconds`
 - `local_graceful_terminate_timeout_seconds`
 - `aws_graceful_terminate_timeout_seconds`
+- `download_archive_root`
 
 ## Validation behavior
 

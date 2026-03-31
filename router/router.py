@@ -1144,7 +1144,7 @@ def reconcile(providers):
 
     JOB_TO_SWARM.clear()
 
-    to_remove = []
+    stale_swarms = []
 
     for swarm_id, swarm in SWARMS.items():
         provider_ref = swarm.get("provider") or swarm.get("backend")
@@ -1158,16 +1158,58 @@ def reconcile(providers):
             swarm["status"] = "running"
             JOB_TO_SWARM[job_id] = swarm_id
         else:
-            to_remove.append((swarm_id, job_id))
+            stale_swarms.append((swarm_id, job_id))
 
-    # Mark terminated instead of immediate removal
-    for swarm_id, job_id in to_remove:
-        swarm = SWARMS.get(swarm_id)
-        if swarm and swarm.get("status") != "terminated":
-            swarm["status"] = "terminated"
-            swarm["terminated_at"] = time.time()
+    approvals_changed = False
+    for swarm_id, job_id in stale_swarms:
+        swarm = SWARMS.pop(str(swarm_id), None)
         if job_id:
-            JOB_TO_SWARM.pop(job_id, None)
+            JOB_TO_SWARM.pop(str(job_id), None)
+
+        with SCHEDULER_LOCK:
+            node_count = int((swarm or {}).get("node_count") or 0)
+            for node_id in range(node_count):
+                key = _node_key(swarm_id, node_id)
+                NODE_THREAD_ACTIVE.pop(key, None)
+                NODE_OUTSTANDING.pop(key, None)
+
+            stale_final_keys = [
+                key for key in FINAL_ANSWER_SEEN
+                if isinstance(key, tuple) and len(key) == 3 and str(key[0]) == str(swarm_id)
+            ]
+            for key in stale_final_keys:
+                FINAL_ANSWER_SEEN.discard(key)
+
+            dropped = list(INTER_SWARM_QUEUE.pop(str(swarm_id), []))
+
+        for item in dropped:
+            emit_event("inter_swarm_dropped", {
+                "queue_id": item.get("queue_id"),
+                "request_id": item.get("request_id"),
+                "source_swarm_id": item.get("source_swarm_id"),
+                "target_swarm_id": str(swarm_id),
+                "reason": "target swarm unavailable during reconcile",
+            })
+
+        if job_id:
+            stale_approvals = [
+                key for key in list(PENDING_APPROVALS.keys())
+                if isinstance(key, tuple) and len(key) == 3 and str(key[0]) == str(job_id)
+            ]
+            for key in stale_approvals:
+                PENDING_APPROVALS.pop(key, None)
+                PENDING_APPROVAL_DECISIONS.pop(key, None)
+                RESOLVED_APPROVALS.pop(key, None)
+                RECENT_APPROVAL_RESULTS.pop(key, None)
+                approvals_changed = True
+
+        emit_event("swarm_removed", {
+            "swarm_id": str(swarm_id),
+            "reason": "provider reported no active job during reconcile",
+        })
+
+    if approvals_changed:
+        _bump_approvals_version()
 
     save_state()
 

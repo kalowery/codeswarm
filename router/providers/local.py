@@ -7,6 +7,7 @@ import re
 import signal
 import tarfile
 import sys
+import time
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Dict, List, Optional
@@ -39,6 +40,25 @@ class LocalProvider(ClusterProvider):
 
     def _agent_dir(self, job_id: str, node_id: int) -> Path:
         return self._job_dir(job_id) / f"agent_{int(node_id):02d}"
+
+    def _worker_heartbeat_path(self, job_id: str, node_id: int) -> Path:
+        return self._agent_dir(job_id, node_id) / "heartbeat.json"
+
+    def _worker_heartbeat_timeout_seconds(self) -> float:
+        configured = self.config.get("worker_heartbeat_timeout_seconds")
+        try:
+            value = float(configured)
+        except Exception:
+            value = 30.0
+        return value if value > 0 else 30.0
+
+    def _has_fresh_worker_heartbeat(self, job_id: str, node_id: int) -> bool:
+        path = self._worker_heartbeat_path(job_id, node_id)
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return False
+        return (time.time() - float(mtime)) <= self._worker_heartbeat_timeout_seconds()
 
     def _default_worker_sandbox_mode(self) -> str:
         configured = str(self.config.get("default_sandbox_mode") or "").strip()
@@ -132,9 +152,20 @@ class LocalProvider(ClusterProvider):
         except Exception:
             return ""
 
-    def _is_worker_alive(self, worker: dict) -> bool:
+    def _is_worker_alive(self, worker: dict, job_id: str | None = None) -> bool:
         pid = worker.get("pid")
         start_ticks = worker.get("start_ticks")
+        node_id = worker.get("node_id")
+        if isinstance(job_id, str) and job_id and isinstance(node_id, int) and node_id >= 0:
+            if self._has_fresh_worker_heartbeat(job_id, node_id):
+                return True
+
+        # On non-Linux hosts, pid-only recovery is too weak because we cannot
+        # reliably disambiguate pid reuse without /proc start ticks. Require a
+        # fresh heartbeat for recovery in that case.
+        if sys.platform != "linux" and (not isinstance(start_ticks, int) or start_ticks <= 0):
+            return False
+
         if not isinstance(pid, int) or pid <= 0:
             return False
 
@@ -166,7 +197,7 @@ class LocalProvider(ClusterProvider):
                 self.jobs[job_id] = workers
         if not workers:
             return []
-        return [worker for worker in workers if self._is_worker_alive(worker)]
+        return [worker for worker in workers if self._is_worker_alive(worker, job_id=job_id)]
 
     @staticmethod
     def _safe_skill_rel_path(path: str) -> str | None:

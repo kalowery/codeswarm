@@ -1,6 +1,6 @@
 # Codeswarm CLI
 
-The Codeswarm CLI is the control-plane client for managing distributed Codex swarms running under Slurm.
+The Codeswarm CLI is the control-plane client for managing Codeswarm routers, swarms, and orchestrated projects across local, Slurm, and AWS-backed execution.
 
 It communicates with the Codeswarm router daemon over a local TCP control channel (`127.0.0.1:8765`) using a versioned JSON-line protocol (`codeswarm.router.v1`).
 
@@ -12,10 +12,8 @@ It communicates with the Codeswarm router daemon over a local TCP control channe
 CLI (Node.js)
    ↓ TCP (127.0.0.1:8765)
 Router (Python daemon)
-   ↓ SSH
-HPC Login Node
-   ↓ Slurm
-Compute Nodes
+   ↓ Provider
+Local / Slurm / AWS
 ```
 
 ### Control Plane
@@ -144,6 +142,20 @@ codeswarm list --config ../configs/hpcfund.json
 
 Returns all known swarms from router state.
 
+### Run the Web Stack
+
+```bash
+codeswarm web --config ../configs/local.json
+```
+
+This starts or reuses:
+
+- router
+- backend on `:4000`
+- frontend on `:3000`
+
+Use `--no-open` to skip automatic browser launch.
+
 ### Stop Everything
 
 ```bash
@@ -182,7 +194,7 @@ codeswarm status <swarm_id> \
 Includes:
 
 - Router state
-- Slurm state (via `squeue`)
+- provider-backed live state when available
 
 ---
 
@@ -204,6 +216,29 @@ codeswarm inject <swarm_id> \
   --prompt "Focus on GEMM tiling strategy." \
   --config ../configs/hpcfund.json
 ```
+
+### Project Resume Preview
+
+```bash
+codeswarm project resume-preview <project-id> --config ../configs/local.json
+```
+
+Options:
+
+- `--worker-swarm-id <swarmId>` repeatable override
+- `--retry-failed`
+- `--no-reverify-completed`
+- `--json`
+
+The preview reports blocked reasons, before/after task counts, resume summary, and per-task changes.
+
+### Resume a Project
+
+```bash
+codeswarm project resume <project-id> --config ../configs/local.json
+```
+
+Resume uses the existing project graph and worker swarm set unless you override workers with repeated `--worker-swarm-id`.
 
 ---
 

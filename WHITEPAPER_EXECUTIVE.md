@@ -17,6 +17,7 @@ Codeswarm enables:
 - Human-supervised routing of work to teams (swarms).
 - Queue-based delegation between teams.
 - Persistent, event-driven visibility into execution state.
+- Deterministic project execution and recovery for software delivery workflows.
 
 This combination can substantially increase throughput, reduce orchestration overhead, and enable self-sustaining multi-agent workflows.
 
@@ -70,6 +71,8 @@ Key operational features:
 
 - Directed injection (`/all`, `/node[...]`, `/swarm[alias]/...`)
 - Inter-swarm queueing and idle dispatch
+- Planner-to-worker orchestration for project task graphs
+- Resume from durable task branches in the canonical repository
 - Approval workflows for execution-sensitive actions
 - Durable state and reconciliation semantics
 

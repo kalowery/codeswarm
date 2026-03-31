@@ -3,20 +3,21 @@
 The Codeswarm Router is the persistent control-plane daemon responsible for:
 
 - Managing multiple concurrent swarms
-- Provisioning Slurm jobs
+- Provisioning local, Slurm, and AWS-backed jobs
 - Routing prompt injections
+- Running orchestrated project scheduling
 - Streaming distributed agent events
-- Reconciling state with Slurm
+- Reconciling state with providers
 - Emitting structured protocol events over TCP
 
-It is the authoritative control boundary between the CLI and the HPC cluster.
+It is the authoritative control boundary between the CLI/web stack and provider-backed worker execution.
 
 ---
 
 ## Architectural Role
 
 ```
-CLI → TCP → Router → SSH → Slurm → Compute Nodes
+CLI/Web → TCP → Router → Provider → Workers
 ```
 
 The router:
@@ -26,6 +27,7 @@ The router:
 - Uses SSH only for cluster interactions
 - Streams worker events via a single scalable SSH follower
 - Maintains durable swarm registry
+- Maintains durable project/task registry
 - Emits versioned protocol events
 
 ---
@@ -104,8 +106,18 @@ Behavior:
 
 ### Orchestrated Projects
 
-Project planning produces implementation tasks only. Codeswarm appends a final
-system-generated integration task automatically. That task:
+Router now supports an opt-in orchestrated project runtime.
+
+Implemented capabilities include:
+
+- project creation from explicit task lists
+- planner-driven project planning
+- deterministic task dispatch to idle worker nodes
+- structured `TASK_RESULT` parsing
+- automatic final integration task insertion
+- project resume and resume preview
+
+Project planning produces implementation tasks only. Codeswarm appends a final system-generated integration task automatically. That task:
 
 - waits for all implementation tasks to complete
 - creates `codeswarm/<project-id>/integration`
@@ -142,19 +154,26 @@ Lifecycle:
 
 ### `swarm_list`
 
-Returns all known swarms from in-memory registry.
+Returns the currently known active swarm registry after provider reconciliation.
 
 ---
 
 ### `swarm_status`
 
-Queries Slurm via:
+Queries the underlying provider for current liveness/state when supported.
 
-```
-ssh <login> squeue -j <job_id> -h -o '%T'
-```
+---
 
-Executed in background thread to avoid blocking control loop.
+### Project commands
+
+Supported project commands now include:
+
+- `project_create`
+- `project_plan`
+- `project_start`
+- `project_resume`
+- `project_resume_preview`
+- `project_list`
 
 ---
 
@@ -196,22 +215,17 @@ Loaded at startup and reconciled with Slurm.
 Persisted fields include swarm registry and inter-swarm queue, so queued
 `enqueue_inject` work resumes after router restart.
 
+Project state and pending planner work are also persisted in `router_state.json`.
+
 ---
 
-## Slurm Reconciliation
+## Provider Reconciliation
 
 At startup:
 
-```
-squeue -h -o '%i|%j|%T'
-```
+For each provider, router asks for active jobs and reconciles persisted swarm state against that provider view.
 
-For each known swarm:
-
-- If job present → `running`
-- If missing → `terminated`
-
-This ensures router restart safety.
+For local workers on non-Linux hosts, recovery now requires fresh per-worker heartbeats rather than weak PID-only evidence. This prevents dead local swarms from being resurfaced as running after restart.
 
 ---
 

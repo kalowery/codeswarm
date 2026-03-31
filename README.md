@@ -8,6 +8,11 @@ Codeswarm is a provider-agnostic execution system for orchestrating multi-node C
 
 It provides a router control plane, a backend API/WebSocket bridge, and a Next.js frontend.
 
+Current implementation includes two complementary operating modes:
+
+- ad hoc swarm operation with direct prompt routing
+- opt-in orchestrated projects with planner-generated task graphs, deterministic worker dispatch, live project/task UI, and project resume
+
 ## Install via curl | bash
 
 ```bash
@@ -93,6 +98,47 @@ Optional web-launch parity flags:
 - `--provider-params-json '{"key":"value"}'` passes provider overrides as JSON
 - `--detach` exits after launch; otherwise the CLI follows INFO activity logs by default
 
+## Orchestrated Projects
+
+Codeswarm now supports a deterministic project mode alongside normal swarm usage.
+
+High-level flow:
+
+1. Launch or select a planner swarm.
+2. Launch one or more worker swarms.
+3. In the web UI, create a project in one of two modes:
+   - plan from a spec plus planner swarm
+   - create directly from an explicit task list
+4. Router schedules one task at a time to idle worker nodes, with each task executed on its own branch in an isolated per-worker repo checkout.
+5. A final integration task is appended automatically and runs after implementation tasks complete.
+
+Repository inputs supported by the project UI and backend:
+
+- existing local git repo path
+- existing GitHub repo reference
+- GitHub owner/repo with create-if-missing behavior for project planning/execution flows
+
+Project resume is also implemented:
+
+- resume reconciles router project state against durable task branches in the canonical repo
+- assigned tasks can be recovered or reset
+- failed tasks can optionally be retried
+- worker swarms can be replaced at resume time
+
+CLI support:
+
+```bash
+codeswarm project resume-preview <project-id> --config configs/local.json
+codeswarm project resume <project-id> --config configs/local.json
+```
+
+Recommended local launch presets for project work:
+
+- `local-orchestrated-planner`
+- `local-orchestrated-worker`
+
+These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and fresh-thread-per-injection behavior.
+
 ## Codex Sandbox and Approval
 
 Codeswarm handles execution approval in its own UI/router flow (`exec_approval_required` -> `/approval` -> router `approve_execution`).
@@ -144,6 +190,8 @@ Core principles:
 - Mailbox contract: worker inbox/outbox JSONL files.
 - Durable control state: `router_state.json` and backend `state.json`.
 
+For local swarms on macOS and other non-Linux hosts, active-worker recovery now requires a fresh per-worker heartbeat rather than weak PID-only evidence. This prevents dead local swarms from being resurfaced as running after restart.
+
 ## Providers
 
 ### Local
@@ -171,6 +219,12 @@ Router command set (protocol `codeswarm.router.v1`):
 - `swarm_status`
 - `approve_execution`
 - `swarm_terminate`
+- `project_create`
+- `project_plan`
+- `project_start`
+- `project_resume`
+- `project_resume_preview`
+- `project_list`
 
 ## Prompt Routing
 
@@ -226,6 +280,16 @@ Backend inspects `task_complete` final assistant output and auto-submits any lin
 - `/swarm[alias]/node[...] ...`
 
 This enables self-sustaining multi-swarm workflows where one swarm emits follow-on work for another.
+
+## Automated Testing
+
+Current repository-level automation includes:
+
+- CLI build: `npm --workspace=cli run build`
+- headless browser UI tests: `npm run test:web-ui`
+- orchestrated project resume smoke: `python3 tools/orchestrated_project_resume_smoke.py`
+
+The browser suite uses Puppeteer and covers launch flows, project creation, worker interaction, and project resume behavior through the live frontend.
 
 ## Troubleshooting
 

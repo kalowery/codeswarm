@@ -328,6 +328,25 @@ def main():
     inbox_path = base / "mailbox" / "inbox" / f"{job_id}_{node_id:02d}.jsonl"
     outbox_path = base / "mailbox" / "outbox" / f"{job_id}_{node_id:02d}.jsonl"
     agent_dir = Path.cwd()
+    heartbeat_path = agent_dir / "heartbeat.json"
+    heartbeat_interval_seconds = 1.0
+    last_heartbeat_at = 0.0
+
+    def write_heartbeat(force: bool = False) -> None:
+        nonlocal last_heartbeat_at
+        now = time.time()
+        if not force and (now - last_heartbeat_at) < heartbeat_interval_seconds:
+            return
+        heartbeat_path.write_text(
+            json.dumps({
+                "timestamp": now,
+                "job_id": job_id,
+                "node_id": node_id,
+                "worker_type": "mock",
+            }),
+            encoding="utf-8",
+        )
+        last_heartbeat_at = now
 
     write_jsonl(outbox_path, {
         "type": "start",
@@ -336,6 +355,7 @@ def main():
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "mock_worker": True,
     })
+    write_heartbeat(force=True)
     try:
         response_delay_ms = max(0, int(os.environ.get("CODESWARM_MOCK_DELAY_MS") or "0"))
     except Exception:
@@ -344,6 +364,7 @@ def main():
     offset = 0
     while True:
         time.sleep(0.05)
+        write_heartbeat()
         if not inbox_path.exists():
             continue
         size = inbox_path.stat().st_size
