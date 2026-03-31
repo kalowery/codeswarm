@@ -343,6 +343,11 @@ async function setCheckboxByTestId(page, testId, checked) {
   )
 }
 
+async function checkboxStateByTestId(page, testId) {
+  await waitForTestId(page, testId)
+  return await page.$eval(testIdSelector(testId), (el) => Boolean(el.checked))
+}
+
 async function selectOptionByText(page, testId, text) {
   await waitForTestId(page, testId)
   const value = await page.$eval(
@@ -636,6 +641,20 @@ test('Codeswarm browser UI', { timeout: TEST_TIMEOUT_MS }, async (t) => {
         await page.keyboard.type(promptText)
         await page.keyboard.press('Enter')
         await waitForPromptResponse(page, promptText, 30_000)
+      } finally {
+        await context.close()
+      }
+    })
+
+    await t.test('applies orchestrated worker provider defaults in launch modal', async () => {
+      const { context, page } = await newPage(browser, stack)
+      try {
+        await clickTestId(page, 'open-launch-modal-button')
+        await waitForTestId(page, 'launch-modal')
+        await selectOptionByText(page, 'launch-provider-select', 'Local Orchestrated Worker')
+        await clickTestId(page, 'launch-provider-tab')
+        assert.equal(await checkboxStateByTestId(page, 'launch-provider-field-native_auto_approve'), true)
+        assert.equal(await checkboxStateByTestId(page, 'launch-provider-field-fresh_thread_per_injection'), true)
       } finally {
         await context.close()
       }

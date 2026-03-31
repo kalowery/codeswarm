@@ -80,7 +80,7 @@ export default function LaunchModal({ onClose }: Props) {
     ]
     for (const field of fields) {
       const providerDefault = provider.defaults?.[field.key]
-      const fieldDefault = typeof field.default !== 'undefined' ? field.default : providerDefault
+      const fieldDefault = typeof providerDefault !== 'undefined' ? providerDefault : field.default
       if (typeof fieldDefault === 'undefined' || fieldDefault === null) continue
       defaults[field.key] = String(fieldDefault)
     }

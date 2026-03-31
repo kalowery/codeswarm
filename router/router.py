@@ -1367,6 +1367,14 @@ USAGE_COUNTER_FIELDS = (
     "reasoning_output_tokens",
 )
 
+USAGE_LAST_FIELD_MAP = {
+    "total_tokens": "last_total_tokens",
+    "input_tokens": "last_input_tokens",
+    "cached_input_tokens": "last_cached_input_tokens",
+    "output_tokens": "last_output_tokens",
+    "reasoning_output_tokens": "last_reasoning_output_tokens",
+}
+
 
 def _empty_usage_totals():
     return {field: 0 for field in USAGE_COUNTER_FIELDS}
@@ -1416,6 +1424,33 @@ def _usage_delta(current_snapshot, previous_snapshot):
     if "usage_source" in current_snapshot:
         delta["usage_source"] = current_snapshot.get("usage_source")
     return delta
+
+
+def _usage_delta_for_project_accounting(current_snapshot, previous_snapshot, payload):
+    if not isinstance(current_snapshot, dict):
+        return None
+    payload_dict = payload if isinstance(payload, dict) else {}
+    delta = _empty_usage_totals()
+    saw_last_value = False
+    changed = False
+    for field, last_field in USAGE_LAST_FIELD_MAP.items():
+        last_value = _to_int(payload_dict.get(last_field))
+        if last_value is None:
+            continue
+        saw_last_value = True
+        field_delta = max(0, last_value)
+        delta[field] = field_delta
+        if field_delta:
+            changed = True
+    if saw_last_value:
+        if not changed:
+            return None
+        if "model_context_window" in current_snapshot:
+            delta["model_context_window"] = current_snapshot.get("model_context_window")
+        if "usage_source" in current_snapshot:
+            delta["usage_source"] = current_snapshot.get("usage_source")
+        return delta
+    return _usage_delta(current_snapshot, previous_snapshot)
 
 
 def _apply_usage_delta(record, delta):
@@ -3130,7 +3165,7 @@ def _update_project_usage_for_injection(payload):
         if not current_snapshot:
             return False
         previous_snapshot = task.get("active_attempt_usage")
-        delta = _usage_delta(current_snapshot, previous_snapshot)
+        delta = _usage_delta_for_project_accounting(current_snapshot, previous_snapshot, payload)
         task["active_attempt_usage"] = current_snapshot
         if not delta:
             return False
