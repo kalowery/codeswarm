@@ -71,6 +71,10 @@ APPROVAL_ACK_MAX_BACKOFF_SECONDS = 15.0
 PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
 PROJECT_REPO_CACHE_ROOT = Path(__file__).resolve().parents[1] / ".tmp" / "project_repos"
 PROJECT_CONTROL_BRANCH_PREFIX = "codeswarm/project-control"
+STARTUP_RECONCILE_TIMEOUT_SECONDS = 20.0
+LOCAL_STARTUP_RECONCILE_TIMEOUT_SECONDS = 5.0
+SLURM_STARTUP_RECONCILE_TIMEOUT_SECONDS = 60.0
+AWS_STARTUP_RECONCILE_TIMEOUT_SECONDS = 60.0
 
 
 def _pid_file_path():
@@ -1140,14 +1144,78 @@ def remove_pid_file():
         pass
 
 
-def reconcile(providers):
+def _startup_reconcile_timeout_seconds(config, provider_ref):
+    router_cfg = config.get("router") if isinstance(config, dict) else {}
+    router_cfg = router_cfg if isinstance(router_cfg, dict) else {}
+    backend = str(provider_ref or "").split(":", 1)[0].strip().lower()
+
+    backend_key_map = {
+        "local": "local_startup_reconcile_timeout_seconds",
+        "slurm": "slurm_startup_reconcile_timeout_seconds",
+        "aws": "aws_startup_reconcile_timeout_seconds",
+    }
+    raw_value = router_cfg.get(backend_key_map.get(backend, ""))
+    if raw_value is None:
+        raw_value = router_cfg.get("startup_reconcile_timeout_seconds")
+
+    try:
+        resolved = float(raw_value)
+    except Exception:
+        resolved = None
+
+    if resolved is not None and resolved > 0:
+        return resolved
+    if backend == "local":
+        return LOCAL_STARTUP_RECONCILE_TIMEOUT_SECONDS
+    if backend == "slurm":
+        return SLURM_STARTUP_RECONCILE_TIMEOUT_SECONDS
+    if backend == "aws":
+        return AWS_STARTUP_RECONCILE_TIMEOUT_SECONDS
+    return STARTUP_RECONCILE_TIMEOUT_SECONDS
+
+
+def reconcile(providers, config=None):
     global JOB_TO_SWARM
     running_jobs_by_provider = {}
-    for provider_ref, provider in providers.items():
+    provider_threads = {}
+    provider_results = {}
+    provider_errors = {}
+
+    def _list_provider_jobs(provider_ref, provider):
         try:
-            running_jobs_by_provider[provider_ref] = provider.list_active_jobs()
-        except Exception:
+            provider_results[provider_ref] = provider.list_active_jobs()
+        except Exception as e:
+            provider_errors[provider_ref] = str(e)
+
+    for provider_ref, provider in providers.items():
+        timeout_s = _startup_reconcile_timeout_seconds(config, provider_ref)
+        startup_log(f"reconciling provider {provider_ref} (timeout {int(timeout_s)}s)")
+        thread = threading.Thread(
+            target=_list_provider_jobs,
+            args=(provider_ref, provider),
+            daemon=True,
+        )
+        provider_threads[provider_ref] = (thread, timeout_s)
+        thread.start()
+
+    for provider_ref, (thread, timeout_s) in provider_threads.items():
+        thread.join(timeout_s)
+        if thread.is_alive():
+            startup_log(
+                f"provider {provider_ref} did not finish reconcile within {int(timeout_s)}s; continuing with empty active-job set"
+            )
             running_jobs_by_provider[provider_ref] = {}
+            continue
+        error = provider_errors.get(provider_ref)
+        if error:
+            startup_log(f"provider {provider_ref} reconcile failed: {error}")
+            running_jobs_by_provider[provider_ref] = {}
+            continue
+        jobs = provider_results.get(provider_ref)
+        running_jobs_by_provider[provider_ref] = jobs if isinstance(jobs, dict) else {}
+        startup_log(
+            f"provider {provider_ref} reconcile complete ({len(running_jobs_by_provider[provider_ref])} active job(s))"
+        )
 
     JOB_TO_SWARM.clear()
 
@@ -1434,6 +1502,10 @@ def emit_event(event_name, data):
 def debug_event(message):
     if DEBUG:
         emit_event("debug", {"source": "router", "message": message})
+
+
+def startup_log(message):
+    print(f"[router startup] {message}", file=sys.stderr, flush=True)
 
 
 def approval_trace(stage, **fields):
@@ -7155,8 +7227,14 @@ def main():
 
     # Build provider catalog/instances
     global PROVIDER_SPECS, PROVIDERS
-    PROVIDER_SPECS = get_provider_specs(config)
-    PROVIDERS = build_providers(config, PROVIDER_SPECS)
+    requested_provider_specs = get_provider_specs(config)
+    PROVIDERS, PROVIDER_SPECS = build_providers(config, requested_provider_specs)
+    disabled_specs = [spec for spec in PROVIDER_SPECS if bool(spec.get("disabled"))]
+    if disabled_specs:
+        for spec in disabled_specs:
+            startup_log(
+                f"provider {spec.get('id') or spec.get('provider_ref') or 'unknown'} disabled: {spec.get('disabled_reason') or 'initialization failed'}"
+            )
 
     # Load persisted state and reconcile with cluster backends
     load_state()
@@ -7199,7 +7277,7 @@ def main():
                 swarm["provider_backend"] = default_provider_backend
     save_state()
 
-    reconcile(PROVIDERS)
+    reconcile(PROVIDERS, config)
 
     # Ensure state is flushed on shutdown
     import signal

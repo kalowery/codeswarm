@@ -825,6 +825,49 @@ async function resumeProjectAndWait(
   });
 }
 
+async function loadJsonConfigIfPresent(configPath: string): Promise<any | null> {
+  try {
+    const raw = await fs.readFile(configPath, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function collectConfiguredBackends(config: any): string[] {
+  const backends = new Set<string>();
+  const launchProviders = config?.launch_providers;
+  if (Array.isArray(launchProviders)) {
+    for (const provider of launchProviders) {
+      const backend = typeof provider?.backend === "string" ? provider.backend.trim() : "";
+      if (backend) backends.add(backend);
+    }
+  } else if (launchProviders && typeof launchProviders === "object") {
+    for (const provider of Object.values(launchProviders)) {
+      const backend = typeof (provider as any)?.backend === "string" ? String((provider as any).backend).trim() : "";
+      if (backend) backends.add(backend);
+    }
+  }
+  const legacyBackend = typeof config?.cluster?.backend === "string" ? config.cluster.backend.trim() : "";
+  if (legacyBackend) backends.add(legacyBackend);
+  return Array.from(backends.values()).sort();
+}
+
+function resolveRouterStartupTimeoutMs(config: any): number {
+  const routerCfg = config?.router && typeof config.router === "object" ? config.router : {};
+  const explicit = Number(routerCfg.startup_health_timeout_seconds);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.round(explicit * 1000);
+  }
+  const remoteExplicit = Number(routerCfg.remote_startup_health_timeout_seconds);
+  const backends = collectConfiguredBackends(config);
+  const hasRemote = backends.some((backend) => backend === "slurm" || backend === "aws");
+  if (hasRemote && Number.isFinite(remoteExplicit) && remoteExplicit > 0) {
+    return Math.round(remoteExplicit * 1000);
+  }
+  return hasRemote ? 90_000 : 15_000;
+}
+
 program
   .name("codeswarm")
   .description("Codeswarm CLI")
@@ -1516,9 +1559,19 @@ async function runWebStack(opts: any) {
   const configPath = opts.config
     ? path.resolve(process.cwd(), opts.config)
     : path.join(repoRoot, "configs", "hpcfund.json");
+  const startupConfig = await loadJsonConfigIfPresent(configPath);
   const pythonCmd = resolvePythonCommand();
+  const configuredBackends = collectConfiguredBackends(startupConfig);
+  const routerStartupTimeoutMs = resolveRouterStartupTimeoutMs(startupConfig);
 
   console.log("[web] Starting Codeswarm web stack...\n");
+  console.log(`[web] Config: ${configPath}`);
+  console.log(
+    `[web] Configured backends: ${configuredBackends.length > 0 ? configuredBackends.join(", ") : "none"}`
+  );
+  console.log(
+    `[web] Router startup health timeout: ${Math.round(routerStartupTimeoutMs / 1000)}s`
+  );
 
   const children: any[] = [];
   let routerStartedByWeb = false;
@@ -1611,9 +1664,17 @@ async function runWebStack(opts: any) {
     timeoutMs: number
   ): Promise<boolean> {
     const start = Date.now();
+    let lastProgressLogAt = 0;
     while (Date.now() - start < timeoutMs) {
       if (await probeRouterHealth(host, port, 1200)) {
         return true;
+      }
+      const elapsedMs = Date.now() - start;
+      if (elapsedMs - lastProgressLogAt >= 5000) {
+        lastProgressLogAt = elapsedMs;
+        console.log(
+          `[web] Waiting for router health on ${host}:${port} (${Math.floor(elapsedMs / 1000)}s elapsed)`
+        );
       }
       await sleep(300);
     }
@@ -1705,6 +1766,7 @@ async function runWebStack(opts: any) {
         repoRoot
       );
       routerStartedByWeb = true;
+      console.log(`[web] Spawned router process with ${pythonCmd} -m ${routerModule}`);
     }
   } else {
     spawnWithPrefix(
@@ -1714,14 +1776,17 @@ async function runWebStack(opts: any) {
       repoRoot
     );
     routerStartedByWeb = true;
+    console.log(`[web] Spawned router process with ${pythonCmd} -m ${routerModule}`);
   }
 
-  const routerHealthy = await waitForRouterHealthy(routerHost, routerPort, 15000);
+  console.log(`[web] Waiting for router startup on ${routerHost}:${routerPort}...`);
+  const routerHealthy = await waitForRouterHealthy(routerHost, routerPort, routerStartupTimeoutMs);
   if (!routerHealthy) {
     throw new Error(
-      `Router on ${routerHost}:${routerPort} did not become healthy within 15s.`
+      `Router on ${routerHost}:${routerPort} did not become healthy within ${Math.round(routerStartupTimeoutMs / 1000)}s.`
     );
   }
+  console.log(`[web] Router healthy on ${routerHost}:${routerPort}.`);
 
   // Backend
   const backendPort = 4000;
