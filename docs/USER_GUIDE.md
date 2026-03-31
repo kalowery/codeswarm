@@ -308,13 +308,16 @@ For AWS, router supports shorter graceful wait before force terminate via:
 - Backend persists UI-facing swarm metadata in `web/backend/state.json`.
 - Router persists orchestrated projects and pending project plans in `router_state.json`.
 - User-terminated swarms are removed from router active state immediately after `swarm_terminated`.
-- UI shows per-agent and per-swarm estimated spend from cumulative token usage.
-- Optional frontend pricing env vars (USD per 1M tokens):
+- Router now computes estimated spend per usage event and accumulates it onto task, worker, project, and swarm views.
+- Pricing is table-driven via top-level `model_pricing` entries in the router config.
+- Each usage event is attributed to a `pricing_model` when available.
+  - Claude uses `claude_model`, then the selected Claude env profile model, unless `pricing_model` is set explicitly.
+  - Codex defaults to `gpt-5.4` unless `pricing_model` is set explicitly.
+- The frontend still supports legacy fallback pricing env vars for older usage payloads:
   - `NEXT_PUBLIC_INPUT_TOKENS_USD_PER_1M`
   - `NEXT_PUBLIC_CACHED_INPUT_TOKENS_USD_PER_1M`
   - `NEXT_PUBLIC_OUTPUT_TOKENS_USD_PER_1M`
   - `NEXT_PUBLIC_REASONING_OUTPUT_TOKENS_USD_PER_1M`
-- Current defaults are set for `gpt-5.3-codex`: input `1.75`, cached input `0.175`, output `14`, reasoning output `0` (reasoning billed via output unless overridden).
 
 ## 15. Automated testing
 
@@ -322,10 +325,19 @@ Headless UI and project automation now exist in-repo:
 
 ```bash
 npm run test:web-ui
+npm run test:project-runtime-smoke
 python3 tools/orchestrated_project_resume_smoke.py
 ```
 
 The browser suite uses Puppeteer and covers critical web flows including project creation, worker interaction, and resume modal behavior.
+
+`tools/orchestrated_project_runtime_smoke.py` exercises direct-task and planner-task project execution against a local repo with a real remote origin. It supports independent planner and worker runtimes:
+
+```bash
+python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime codex --worker-runtime claude --mode both
+python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime codex --mode planned
+python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime claude --mode both
+```
 
 ## 16. Troubleshooting
 

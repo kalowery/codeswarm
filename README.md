@@ -304,9 +304,17 @@ Current repository-level automation includes:
 
 - CLI build: `npm --workspace=cli run build`
 - headless browser UI tests: `npm run test:web-ui`
+- local orchestrated project runtime smoke: `npm run test:project-runtime-smoke`
 - orchestrated project resume smoke: `python3 tools/orchestrated_project_resume_smoke.py`
 
 The browser suite uses Puppeteer and covers launch flows, project creation, worker interaction, and project resume behavior through the live frontend.
+
+The project runtime smoke harness is runtime-aware and can be pointed at `mock`, `codex`, or `claude` for planner and worker swarms independently. Example:
+
+```bash
+python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime codex --worker-runtime claude --mode both
+python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime claude --mode planned
+```
 
 ## Troubleshooting
 

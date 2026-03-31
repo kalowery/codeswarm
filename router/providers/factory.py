@@ -125,6 +125,14 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                 "placeholder": "/path/to/claude",
             },
             {
+                "key": "pricing_model",
+                "label": "Pricing Model",
+                "type": "text",
+                "default": "",
+                "required": False,
+                "placeholder": "gpt-5.4 or Claude-Sonnet-4.5",
+            },
+            {
                 "key": "mock_delay_ms",
                 "label": "Mock Delay (ms)",
                 "type": "number",

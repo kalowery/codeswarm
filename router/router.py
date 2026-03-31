@@ -17,6 +17,7 @@ import time
 import atexit
 import shutil
 from collections import defaultdict, deque
+from decimal import Decimal, InvalidOperation
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
@@ -41,6 +42,7 @@ APPROVALS_VERSION = 0
 ACTIVE_PROVIDER = None
 PROVIDERS = {}
 PROVIDER_SPECS = []
+MODEL_PRICING = {}
 NODE_OUTSTANDING = defaultdict(int)
 NODE_THREAD_ACTIVE = defaultdict(bool)
 FINAL_ANSWER_SEEN = set()
@@ -75,6 +77,15 @@ STARTUP_RECONCILE_TIMEOUT_SECONDS = 20.0
 LOCAL_STARTUP_RECONCILE_TIMEOUT_SECONDS = 5.0
 SLURM_STARTUP_RECONCILE_TIMEOUT_SECONDS = 60.0
 AWS_STARTUP_RECONCILE_TIMEOUT_SECONDS = 60.0
+
+DEFAULT_MODEL_PRICING = {
+    "gpt-5.4": {
+        "input_tokens_usd_per_m": 2.5,
+        "cached_input_tokens_usd_per_m": 0.25,
+        "output_tokens_usd_per_m": 15.0,
+        "reasoning_output_tokens_usd_per_m": 0.0,
+    }
+}
 
 
 def _pid_file_path():
@@ -1385,6 +1396,159 @@ def _to_int(value):
     return None
 
 
+def _to_decimal(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float, str)):
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError):
+            return None
+    return None
+
+
+def _round_cost_decimal(value):
+    number = _to_decimal(value)
+    if number is None:
+        return None
+    return float(number.quantize(Decimal("0.000000000001")))
+
+
+def _normalize_model_key(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _normalize_model_pricing(raw_catalog):
+    catalog = {}
+    if not isinstance(raw_catalog, dict):
+        return catalog
+    for raw_name, raw_entry in raw_catalog.items():
+        model_name = str(raw_name or "").strip()
+        if not model_name or not isinstance(raw_entry, dict):
+            continue
+        entry = {}
+        for source_key, dest_key in (
+            ("input_tokens_usd_per_m", "input_tokens_usd_per_m"),
+            ("cached_input_tokens_usd_per_m", "cached_input_tokens_usd_per_m"),
+            ("output_tokens_usd_per_m", "output_tokens_usd_per_m"),
+            ("reasoning_output_tokens_usd_per_m", "reasoning_output_tokens_usd_per_m"),
+        ):
+            value = _to_decimal(raw_entry.get(source_key))
+            if value is None:
+                continue
+            entry[dest_key] = float(value)
+        if not entry:
+            continue
+        catalog[_normalize_model_key(model_name)] = {
+            "model_name": model_name,
+            **entry,
+        }
+    return catalog
+
+
+def _load_model_pricing_catalog(config):
+    catalog = _normalize_model_pricing(DEFAULT_MODEL_PRICING)
+    configured = _normalize_model_pricing((config or {}).get("model_pricing"))
+    catalog.update(configured)
+    return catalog
+
+
+def _pricing_entry_for_model(model_name):
+    key = _normalize_model_key(model_name)
+    if not key:
+        return None
+    return MODEL_PRICING.get(key)
+
+
+def _resolve_claude_profile_model(config, profile_name):
+    text = str(profile_name or "").strip()
+    if not text:
+        return None
+    cluster_cfg = ((config or {}).get("cluster") or {})
+    local_cfg = {}
+    if isinstance(cluster_cfg, dict):
+        local_cfg = cluster_cfg.get("local") or {}
+        if not isinstance(local_cfg, dict) and str(cluster_cfg.get("backend") or "").strip() == "local":
+            local_cfg = cluster_cfg
+    if not isinstance(local_cfg, dict):
+        return None
+    profiles = local_cfg.get("claude_env_profiles")
+    if not isinstance(profiles, dict):
+        return None
+    profile = profiles.get(text)
+    if not isinstance(profile, dict):
+        return None
+    for key in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
+        value = str(profile.get(key) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _resolve_swarm_agent_model(config, agent_runtime, launch_params):
+    params = launch_params if isinstance(launch_params, dict) else {}
+    runtime = str(agent_runtime or params.get("agent_runtime") or params.get("worker_mode") or "").strip().lower()
+    for key in ("agent_model", "model"):
+        value = str(params.get(key) or "").strip()
+        if value:
+            return value
+    if runtime == "claude":
+        explicit = str(params.get("claude_model") or "").strip()
+        if explicit:
+            return explicit
+        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"))
+        if from_profile:
+            return from_profile
+    return None
+
+
+def _resolve_swarm_pricing_model(config, agent_runtime, launch_params, agent_model=None):
+    params = launch_params if isinstance(launch_params, dict) else {}
+    explicit = str(params.get("pricing_model") or "").strip()
+    if explicit:
+        return explicit
+    if isinstance(agent_model, str) and agent_model.strip():
+        return agent_model.strip()
+    runtime = str(agent_runtime or params.get("agent_runtime") or params.get("worker_mode") or "").strip().lower()
+    if runtime == "codex":
+        return "gpt-5.4"
+    if runtime == "claude":
+        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"))
+        if from_profile:
+            return from_profile
+    return None
+
+
+def _estimate_usage_cost_usd(token_usage, pricing_entry):
+    if not isinstance(token_usage, dict) or not isinstance(pricing_entry, dict):
+        return None
+    million = Decimal("1000000")
+    total = Decimal("0")
+    input_tokens = Decimal(max(0, _to_int(token_usage.get("input_tokens")) or 0))
+    cached_input_tokens = Decimal(max(0, _to_int(token_usage.get("cached_input_tokens")) or 0))
+    non_cached_input = max(Decimal("0"), input_tokens - cached_input_tokens)
+    output_tokens = Decimal(max(0, _to_int(token_usage.get("output_tokens")) or 0))
+    reasoning_output_tokens = Decimal(max(0, _to_int(token_usage.get("reasoning_output_tokens")) or 0))
+
+    components = (
+        (non_cached_input, pricing_entry.get("input_tokens_usd_per_m")),
+        (cached_input_tokens, pricing_entry.get("cached_input_tokens_usd_per_m")),
+        (output_tokens, pricing_entry.get("output_tokens_usd_per_m")),
+        (reasoning_output_tokens, pricing_entry.get("reasoning_output_tokens_usd_per_m")),
+    )
+    for tokens, raw_rate in components:
+        rate = _to_decimal(raw_rate)
+        if rate is None or tokens <= 0:
+            continue
+        total += (tokens / million) * rate
+    return _round_cost_decimal(total)
+
+
 def _normalize_usage_payload(base, total_usage, last_usage, model_context_window, source_method):
     total_tokens = _to_int((total_usage or {}).get("total_tokens"))
     input_tokens = _to_int((total_usage or {}).get("input_tokens"))
@@ -1401,6 +1565,29 @@ def _normalize_usage_payload(base, total_usage, last_usage, model_context_window
     if total_tokens is None:
         return None
 
+    swarm = SWARMS.get(str((base or {}).get("swarm_id") or ""))
+    model_name = str(((swarm or {}).get("agent_model")) or "").strip() or None
+    pricing_model = str(((swarm or {}).get("pricing_model")) or "").strip() or model_name or None
+    pricing_entry = _pricing_entry_for_model(pricing_model or model_name)
+    total_estimated_cost_usd = _estimate_usage_cost_usd(
+        {
+            "input_tokens": input_tokens,
+            "cached_input_tokens": cached_input_tokens,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": reasoning_output_tokens,
+        },
+        pricing_entry,
+    )
+    last_estimated_cost_usd = _estimate_usage_cost_usd(
+        {
+            "input_tokens": last_input_tokens,
+            "cached_input_tokens": last_cached_input_tokens,
+            "output_tokens": last_output_tokens,
+            "reasoning_output_tokens": last_reasoning_output_tokens,
+        },
+        pricing_entry,
+    )
+
     return {
         **base,
         # Backward-compatible top-level total used by existing UI.
@@ -1416,6 +1603,10 @@ def _normalize_usage_payload(base, total_usage, last_usage, model_context_window
         "last_reasoning_output_tokens": last_reasoning_output_tokens,
         "model_context_window": _to_int(model_context_window),
         "usage_source": source_method,
+        "model_name": model_name,
+        "pricing_model": pricing_model,
+        "estimated_cost_usd": total_estimated_cost_usd,
+        "last_estimated_cost_usd": last_estimated_cost_usd,
     }
 
 
@@ -1459,6 +1650,15 @@ def _normalize_usage_snapshot(payload):
     usage_source = str(payload.get("usage_source") or "").strip()
     if usage_source:
         snapshot["usage_source"] = usage_source
+    model_name = str(payload.get("model_name") or "").strip()
+    if model_name:
+        snapshot["model_name"] = model_name
+    pricing_model = str(payload.get("pricing_model") or "").strip()
+    if pricing_model:
+        snapshot["pricing_model"] = pricing_model
+    estimated_cost_usd = _to_decimal(payload.get("estimated_cost_usd"))
+    if estimated_cost_usd is not None:
+        snapshot["estimated_cost_usd"] = _round_cost_decimal(estimated_cost_usd)
     return snapshot
 
 
@@ -1478,11 +1678,32 @@ def _usage_delta(current_snapshot, previous_snapshot):
         if field_delta:
             changed = True
     if not changed:
-        return None
+        cost_current = _to_decimal(current_snapshot.get("estimated_cost_usd"))
+        cost_previous = _to_decimal(previous.get("estimated_cost_usd"))
+        if cost_current is None:
+            return None
+        cost_delta = cost_current - (cost_previous or Decimal("0"))
+        if cost_delta < 0:
+            cost_delta = cost_current
+        if cost_delta <= 0:
+            return None
+        delta["estimated_cost_usd"] = _round_cost_decimal(cost_delta)
+    else:
+        cost_current = _to_decimal(current_snapshot.get("estimated_cost_usd"))
+        cost_previous = _to_decimal(previous.get("estimated_cost_usd"))
+        if cost_current is not None:
+            cost_delta = cost_current - (cost_previous or Decimal("0"))
+            if cost_delta < 0:
+                cost_delta = cost_current
+            delta["estimated_cost_usd"] = _round_cost_decimal(cost_delta)
     if "model_context_window" in current_snapshot:
         delta["model_context_window"] = current_snapshot.get("model_context_window")
     if "usage_source" in current_snapshot:
         delta["usage_source"] = current_snapshot.get("usage_source")
+    if "model_name" in current_snapshot:
+        delta["model_name"] = current_snapshot.get("model_name")
+    if "pricing_model" in current_snapshot:
+        delta["pricing_model"] = current_snapshot.get("pricing_model")
     return delta
 
 
@@ -1504,11 +1725,22 @@ def _usage_delta_for_project_accounting(current_snapshot, previous_snapshot, pay
             changed = True
     if saw_last_value:
         if not changed:
-            return None
+            last_cost = _to_decimal(payload_dict.get("last_estimated_cost_usd"))
+            if last_cost is None or last_cost <= 0:
+                return None
+            delta["estimated_cost_usd"] = _round_cost_decimal(last_cost)
+        else:
+            last_cost = _to_decimal(payload_dict.get("last_estimated_cost_usd"))
+            if last_cost is not None:
+                delta["estimated_cost_usd"] = _round_cost_decimal(max(Decimal("0"), last_cost))
         if "model_context_window" in current_snapshot:
             delta["model_context_window"] = current_snapshot.get("model_context_window")
         if "usage_source" in current_snapshot:
             delta["usage_source"] = current_snapshot.get("usage_source")
+        if "model_name" in current_snapshot:
+            delta["model_name"] = current_snapshot.get("model_name")
+        if "pricing_model" in current_snapshot:
+            delta["pricing_model"] = current_snapshot.get("pricing_model")
         return delta
     return _usage_delta(current_snapshot, previous_snapshot)
 
@@ -1526,12 +1758,37 @@ def _apply_usage_delta(record, delta):
         if next_value != current_value:
             changed = True
         usage[field] = next_value
+    current_cost = _to_decimal(usage.get("estimated_cost_usd"))
+    delta_cost = _to_decimal(delta.get("estimated_cost_usd"))
+    if current_cost is not None or delta_cost is not None:
+        current_cost_value = current_cost or Decimal("0")
+        delta_cost_value = delta_cost or Decimal("0")
+        next_cost = current_cost_value + delta_cost_value
+        if next_cost != current_cost_value:
+            changed = True
+        usage["estimated_cost_usd"] = _round_cost_decimal(next_cost)
     model_context_window = _to_int(delta.get("model_context_window"))
     if model_context_window is not None:
         usage["model_context_window"] = model_context_window
     usage_source = str(delta.get("usage_source") or "").strip()
     if usage_source:
         usage["usage_source"] = usage_source
+    delta_model_name = str(delta.get("model_name") or "").strip()
+    existing_model_name = str(usage.get("model_name") or "").strip()
+    if delta_model_name:
+        if not existing_model_name:
+            usage["model_name"] = delta_model_name
+        elif existing_model_name != delta_model_name and existing_model_name != "mixed":
+            usage["model_name"] = "mixed"
+            changed = True
+    delta_pricing_model = str(delta.get("pricing_model") or "").strip()
+    existing_pricing_model = str(usage.get("pricing_model") or "").strip()
+    if delta_pricing_model:
+        if not existing_pricing_model:
+            usage["pricing_model"] = delta_pricing_model
+        elif existing_pricing_model != delta_pricing_model and existing_pricing_model != "mixed":
+            usage["pricing_model"] = "mixed"
+            changed = True
     record["usage"] = usage
     return changed
 
@@ -3145,14 +3402,15 @@ def _build_project_task_prompt(project, task):
     return (
         f"You are executing orchestrated project task {task.get('task_id')}.\n\n"
         f"Project: {project.get('title')}\n"
-        f"Repository workspace: ./{repo_subdir}\n"
+        "Repository workspace: your current working directory is already the prepared repository root.\n"
+        f"Prepared checkout label: ./{repo_subdir}\n"
         f"Base branch: {project.get('base_branch') or 'current checkout'}\n"
         f"Working branch to create/use: {branch_name}\n\n"
         f"Task title: {task.get('title')}\n"
         f"Task prompt:\n{prompt}\n\n"
         f"Dependencies:\n{dependency_lines}\n\n"
         f"Acceptance criteria:\n{acceptance_lines}\n\n"
-        "Operate only on this task's scope. If you need to run commands or edit files, work inside the repository workspace.\n"
+        "Operate only on this task's scope. If you need to run commands or edit files, work in the current working directory unless a command explicitly requires another path.\n"
         f"Use or create the branch `{branch_name}` in the repository workspace before making changes.\n"
         "Commit your changes on that branch. If git user identity is missing, configure repository-local user.name and user.email first.\n"
         "If the repository has an origin remote, push the branch with upstream tracking before you finish.\n"
@@ -6271,17 +6529,27 @@ def run_daemon(config, providers):
                         return
 
                     swarm_id = str(uuid.uuid4())
+                    agent_runtime = str(
+                        launch_effective_params.get("agent_runtime")
+                        or launch_effective_params.get("worker_mode")
+                        or "codex"
+                    ).strip().lower()
+                    agent_model = _resolve_swarm_agent_model(config, agent_runtime, launch_effective_params)
+                    pricing_model = _resolve_swarm_pricing_model(
+                        config,
+                        agent_runtime,
+                        launch_effective_params,
+                        agent_model=agent_model,
+                    )
 
                     SWARMS[swarm_id] = {
                         "job_id": job_id,
                         "node_count": launch_nodes,
                         "system_prompt": launch_system_prompt,
                         "status": "running",
-                        "agent_runtime": str(
-                            launch_effective_params.get("agent_runtime")
-                            or launch_effective_params.get("worker_mode")
-                            or "codex"
-                        ).strip().lower(),
+                        "agent_runtime": agent_runtime,
+                        "agent_model": agent_model,
+                        "pricing_model": pricing_model,
                         "provider": launch_provider_ref,
                         "provider_backend": launch_provider_backend,
                         "provider_id": launch_provider_id,
@@ -6306,6 +6574,8 @@ def run_daemon(config, providers):
                         "provider": launch_provider_backend,
                         "provider_id": launch_provider_id,
                         "agent_runtime": SWARMS[swarm_id].get("agent_runtime"),
+                        "agent_model": SWARMS[swarm_id].get("agent_model"),
+                        "pricing_model": SWARMS[swarm_id].get("pricing_model"),
                         "claude_env_profile": (
                             SWARMS[swarm_id].get("provider_params", {}) or {}
                         ).get("claude_env_profile"),
@@ -7397,9 +7667,10 @@ def main():
     config["_config_path"] = str(Path(args.config).resolve())
 
     # Build provider catalog/instances
-    global PROVIDER_SPECS, PROVIDERS
+    global PROVIDER_SPECS, PROVIDERS, MODEL_PRICING
     requested_provider_specs = get_provider_specs(config)
     PROVIDERS, PROVIDER_SPECS = build_providers(config, requested_provider_specs)
+    MODEL_PRICING = _load_model_pricing_catalog(config)
     disabled_specs = [spec for spec in PROVIDER_SPECS if bool(spec.get("disabled"))]
     if disabled_specs:
         for spec in disabled_specs:

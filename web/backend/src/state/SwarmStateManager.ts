@@ -8,6 +8,8 @@ export interface SwarmRecord {
   provider?: string;
   provider_id?: string;
   agent_runtime?: string;
+  agent_model?: string;
+  pricing_model?: string;
   claude_env_profile?: string;
   created_at: number;
 }
@@ -69,6 +71,8 @@ export class SwarmStateManager {
       status?: string;
       slurm_state?: string;
       agent_runtime?: string;
+      agent_model?: string;
+      pricing_model?: string;
       claude_env_profile?: string;
     }
   ) {
@@ -87,6 +91,8 @@ export class SwarmStateManager {
       provider: options?.provider,
       provider_id: options?.provider_id,
       agent_runtime: options?.agent_runtime,
+      agent_model: options?.agent_model,
+      pricing_model: options?.pricing_model,
       claude_env_profile: options?.claude_env_profile,
       created_at: Date.now()
     };
@@ -146,6 +152,8 @@ export class SwarmStateManager {
     provider?: string,
     provider_id?: string,
     agent_runtime?: string,
+    agent_model?: string,
+    pricing_model?: string,
     claude_env_profile?: string
   ) {
     const swarm = this.swarms.get(swarm_id);
@@ -158,6 +166,12 @@ export class SwarmStateManager {
     }
     if (typeof agent_runtime === 'string' && agent_runtime.length > 0) {
       swarm.agent_runtime = agent_runtime;
+    }
+    if (typeof agent_model === 'string' && agent_model.length > 0) {
+      swarm.agent_model = agent_model;
+    }
+    if (typeof pricing_model === 'string' && pricing_model.length > 0) {
+      swarm.pricing_model = pricing_model;
     }
     if (typeof claude_env_profile === 'string' && claude_env_profile.length > 0) {
       swarm.claude_env_profile = claude_env_profile;

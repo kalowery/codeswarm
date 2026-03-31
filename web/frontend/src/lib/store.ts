@@ -37,13 +37,17 @@ export interface TokenUsage {
   cached_input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
+  estimated_cost_usd?: number
   last_total_tokens?: number
   last_input_tokens?: number
   last_cached_input_tokens?: number
   last_output_tokens?: number
   last_reasoning_output_tokens?: number
+  last_estimated_cost_usd?: number
   model_context_window?: number
   usage_source?: string
+  model_name?: string
+  pricing_model?: string
 }
 
 export interface NodeTurn {
@@ -135,6 +139,8 @@ export interface SwarmRecord {
   provider?: string
   provider_id?: string
   agent_runtime?: string
+  agent_model?: string
+  pricing_model?: string
   claude_env_profile?: string
   known_exec_policies?: string[][]
   pending_approvals?: Record<number, PendingApproval[]>
@@ -1755,6 +1761,8 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
           output_tokens: typeof payload.output_tokens === 'number' ? payload.output_tokens : undefined,
           reasoning_output_tokens:
             typeof payload.reasoning_output_tokens === 'number' ? payload.reasoning_output_tokens : undefined,
+          estimated_cost_usd:
+            typeof payload.estimated_cost_usd === 'number' ? payload.estimated_cost_usd : undefined,
           last_total_tokens: typeof payload.last_total_tokens === 'number' ? payload.last_total_tokens : undefined,
           last_input_tokens: typeof payload.last_input_tokens === 'number' ? payload.last_input_tokens : undefined,
           last_cached_input_tokens:
@@ -1764,9 +1772,13 @@ export const useSwarmStore = create<SwarmStore>()(persist((set, get) => {
             typeof payload.last_reasoning_output_tokens === 'number'
               ? payload.last_reasoning_output_tokens
               : undefined,
+          last_estimated_cost_usd:
+            typeof payload.last_estimated_cost_usd === 'number' ? payload.last_estimated_cost_usd : undefined,
           model_context_window:
             typeof payload.model_context_window === 'number' ? payload.model_context_window : undefined,
-          usage_source: typeof payload.usage_source === 'string' ? payload.usage_source : undefined
+          usage_source: typeof payload.usage_source === 'string' ? payload.usage_source : undefined,
+          model_name: typeof payload.model_name === 'string' ? payload.model_name : undefined,
+          pricing_model: typeof payload.pricing_model === 'string' ? payload.pricing_model : undefined
         }
 
         const updatedTurns: NodeTurn[] = node.turns.map((t) =>

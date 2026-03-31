@@ -1513,6 +1513,8 @@ router.on('event', (msg: any) => {
       provider,
       provider_id,
       agent_runtime,
+      agent_model,
+      pricing_model,
       claude_env_profile
     } = data;
     if (typeof request_id === 'string' && request_id) {
@@ -1527,6 +1529,8 @@ router.on('event', (msg: any) => {
       provider,
       provider_id,
       agent_runtime: typeof agent_runtime === 'string' ? agent_runtime : undefined,
+      agent_model: typeof agent_model === 'string' ? agent_model : undefined,
+      pricing_model: typeof pricing_model === 'string' ? pricing_model : undefined,
       claude_env_profile: typeof claude_env_profile === 'string' ? claude_env_profile : undefined
     });
 
@@ -1737,6 +1741,8 @@ router.on('event', (msg: any) => {
             provider: swarm.provider,
             provider_id: swarm.provider_id,
             agent_runtime: typeof swarm.agent_runtime === 'string' ? swarm.agent_runtime : undefined,
+            agent_model: typeof swarm.agent_model === 'string' ? swarm.agent_model : undefined,
+            pricing_model: typeof swarm.pricing_model === 'string' ? swarm.pricing_model : undefined,
             claude_env_profile:
               typeof swarm.provider_params?.claude_env_profile === 'string'
                 ? swarm.provider_params.claude_env_profile
@@ -1753,6 +1759,8 @@ router.on('event', (msg: any) => {
           swarm.provider,
           swarm.provider_id,
           typeof swarm.agent_runtime === 'string' ? swarm.agent_runtime : undefined,
+          typeof swarm.agent_model === 'string' ? swarm.agent_model : undefined,
+          typeof swarm.pricing_model === 'string' ? swarm.pricing_model : undefined,
           typeof swarm.provider_params?.claude_env_profile === 'string'
             ? swarm.provider_params.claude_env_profile
             : typeof swarm.claude_env_profile === 'string'

@@ -13,7 +13,8 @@
     "bootstrap": "npm install && npm --workspace=frontend run build && npm --workspace=cli run build && npm --workspace=cli link",
     "dev:web": "codeswarm web --config configs/hpcfund.json",
     "build:all": "npm --workspace=cli run build",
-    "test:web-ui": "node --test tools/web_ui/browser.test.cjs"
+    "test:web-ui": "node --test tools/web_ui/browser.test.cjs",
+    "test:project-runtime-smoke": "python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime mock --worker-runtime mock --mode both"
   },
   "devDependencies": {
     "puppeteer": "^24.40.0"

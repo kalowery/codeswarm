@@ -48,6 +48,9 @@ function normalizeMarkdown(content: string, phase: string) {
 
 function estimateUsageUsd(usage: TokenUsage | undefined) {
   if (!usage) return 0
+  if (typeof usage.estimated_cost_usd === 'number' && Number.isFinite(usage.estimated_cost_usd)) {
+    return Math.max(0, usage.estimated_cost_usd)
+  }
 
   const inputTokens = Math.max(0, usage.input_tokens ?? 0)
   const cachedInputTokens = Math.max(0, usage.cached_input_tokens ?? 0)
@@ -1206,6 +1209,11 @@ export default function Home() {
                     {typeof turn.usage.input_tokens === 'number' && typeof turn.usage.output_tokens === 'number'
                       ? ` (in ${turn.usage.input_tokens}, out ${turn.usage.output_tokens})`
                       : ''}
+                    {turn.usage.pricing_model
+                      ? ` · Model: ${turn.usage.pricing_model}`
+                      : turn.usage.model_name
+                      ? ` · Model: ${turn.usage.model_name}`
+                      : ''}
                     {` · Est: ${formatUsd(estimateUsageUsd(turn.usage))}`}
                   </div>
                 )}
@@ -1780,6 +1788,8 @@ export default function Home() {
                 </div>
                 <div className="mt-1 text-xs text-slate-500">
                   Runtime: {active.agent_runtime ?? 'codex'}
+                  {active.agent_model ? ` · Model: ${active.agent_model}` : ''}
+                  {active.pricing_model ? ` · Pricing: ${active.pricing_model}` : ''}
                   {active.provider_id ? ` · Launch Profile: ${active.provider_id}` : ''}
                   {active.provider ? ` · Provider: ${active.provider}` : ''}
                   {active.claude_env_profile ? ` · Claude Env: ${active.claude_env_profile}` : ''}

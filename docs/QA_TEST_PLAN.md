@@ -19,6 +19,12 @@ Implemented repository-level automation now includes:
 - TypeScript compile/build coverage for CLI and web packages
 - headless browser UI tests via Puppeteer:
   - `node --test tools/web_ui/browser.test.cjs`
+- local orchestrated project runtime smoke:
+  - `python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime mock --worker-runtime mock --mode both`
+  - optional runtime combinations:
+    - `python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime codex --worker-runtime claude --mode both`
+    - `python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime codex --mode planned`
+    - `python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime claude --mode both`
 - orchestrated project resume smoke:
   - `python3 tools/orchestrated_project_resume_smoke.py`
 
