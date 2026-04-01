@@ -65,7 +65,7 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": true,
-        "fresh_thread_per_injection": true,
+        "fresh_thread_per_injection": false,
         "claude_env_profile": "amd-llm-gateway"
       }
     },
@@ -78,7 +78,7 @@
         "approval_policy": "never",
         "sandbox_mode": "danger-full-access",
         "native_auto_approve": true,
-        "fresh_thread_per_injection": true,
+        "fresh_thread_per_injection": false,
         "claude_env_profile": "amd-llm-gateway"
       }
     },
