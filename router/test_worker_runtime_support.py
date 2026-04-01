@@ -5,6 +5,7 @@ from unittest.mock import patch
 from agent import claude_worker as claude_worker_module
 from router import router as router_module
 from router.providers.factory import _default_launch_fields_for_backend, get_provider_specs
+from router.providers.aws import AwsProvider
 from router.providers.local import LocalProvider
 
 
@@ -19,6 +20,22 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         options = worker_mode_field.get("options") or []
         values = {option.get("value") for option in options if isinstance(option, dict)}
         self.assertIn("claude", values)
+
+    def test_aws_launch_fields_include_claude_runtime(self):
+        fields = _default_launch_fields_for_backend("aws", {})
+        worker_mode_field = next(
+            (field for field in fields if field.get("key") == "worker_mode"),
+            None,
+        )
+        self.assertIsNotNone(worker_mode_field)
+        options = worker_mode_field.get("options") or []
+        values = {option.get("value") for option in options if isinstance(option, dict)}
+        self.assertIn("claude", values)
+        field_keys = [field.get("key") for field in fields if isinstance(field, dict)]
+        self.assertIn("sandbox_mode", field_keys)
+        self.assertIn("fresh_thread_per_injection", field_keys)
+        self.assertIn("claude_cli_path", field_keys)
+        self.assertIn("claude_permission_mode", field_keys)
 
     def test_local_provider_allows_claude_with_interactive_approval_policy(self):
         captured = {}
@@ -62,6 +79,28 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
     def test_local_launch_fields_include_claude_env_profile_options(self):
         fields = _default_launch_fields_for_backend(
             "local",
+            {
+                "claude_env_profiles": {
+                    "amd-llm-gateway": {
+                        "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+                    }
+                }
+            },
+        )
+        profile_field = next(
+            (field for field in fields if field.get("key") == "claude_env_profile"),
+            None,
+        )
+        self.assertIsNotNone(profile_field)
+        options = profile_field.get("options") or []
+        self.assertIn(
+            "amd-llm-gateway",
+            {option.get("value") for option in options if isinstance(option, dict)},
+        )
+
+    def test_aws_launch_fields_include_claude_env_profile_options(self):
+        fields = _default_launch_fields_for_backend(
+            "aws",
             {
                 "claude_env_profiles": {
                     "amd-llm-gateway": {
@@ -197,6 +236,67 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                             },
                         )
 
+    def test_aws_provider_applies_claude_env_profile_with_expansion(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                        "claude_env_profiles": {
+                            "amd-llm-gateway": {
+                                "ANTHROPIC_API_KEY": "dummy",
+                                "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+                                "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}",
+                                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                            }
+                        },
+                    },
+                }
+            }
+        )
+        with patch.dict("os.environ", {"LLM_GATEWAY_KEY": "gateway-secret"}, clear=False):
+            env = provider._resolve_claude_launch_env(
+                {
+                    "worker_mode": "claude",
+                    "claude_env_profile": "amd-llm-gateway",
+                }
+            )
+        self.assertEqual(env.get("ANTHROPIC_API_KEY"), "dummy")
+        self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://llm-api.amd.com/Anthropic")
+        self.assertEqual(
+            env.get("ANTHROPIC_CUSTOM_HEADERS"),
+            "Ocp-Apim-Subscription-Key: gateway-secret",
+        )
+        self.assertEqual(env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), "1")
+
+    def test_aws_provider_rejects_claude_env_profile_when_placeholder_missing(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                        "claude_env_profiles": {
+                            "amd-llm-gateway": {
+                                "ANTHROPIC_CUSTOM_HEADERS": "Ocp-Apim-Subscription-Key: ${LLM_GATEWAY_KEY}",
+                            }
+                        },
+                    },
+                }
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "LLM_GATEWAY_KEY"):
+            with patch.dict("os.environ", {}, clear=True):
+                provider._resolve_claude_launch_env(
+                    {
+                        "worker_mode": "claude",
+                        "claude_env_profile": "amd-llm-gateway",
+                    }
+                )
+
     def test_translate_event_accepts_canonical_worker_event(self):
         original_job_to_swarm = router_module.JOB_TO_SWARM
         try:
@@ -309,6 +409,39 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                 None,
             )
         )
+
+    def test_router_resolves_aws_claude_profile_model_for_agent_and_pricing(self):
+        config = {
+            "cluster": {
+                "backend": "aws",
+                "aws": {
+                    "region": "us-east-1",
+                    "claude_env_profiles": {
+                        "amd-llm-gateway": {
+                            "ANTHROPIC_MODEL": "Claude-Sonnet-4.5",
+                        }
+                    },
+                },
+            }
+        }
+        params = {
+            "worker_mode": "claude",
+            "claude_env_profile": "amd-llm-gateway",
+        }
+        agent_model = router_module._resolve_swarm_agent_model(
+            config,
+            "claude",
+            params,
+            provider_backend="aws",
+        )
+        pricing_model = router_module._resolve_swarm_pricing_model(
+            config,
+            "claude",
+            params,
+            provider_backend="aws",
+        )
+        self.assertEqual(agent_model, "Claude-Sonnet-4.5")
+        self.assertEqual(pricing_model, "Claude-Sonnet-4.5")
 
 
 if __name__ == "__main__":

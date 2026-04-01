@@ -22,6 +22,7 @@ from decimal import Decimal, InvalidOperation
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from common.config import load_config
 from .providers.factory import build_providers, get_provider_specs
+from .providers.claude_env import resolve_claude_profile_model as _resolve_provider_claude_profile_model
 
 
 # ================================
@@ -1465,32 +1466,41 @@ def _pricing_entry_for_model(model_name):
     return MODEL_PRICING.get(key)
 
 
-def _resolve_claude_profile_model(config, profile_name):
+def _resolve_claude_profile_model(config, profile_name, provider_backend=None):
     text = str(profile_name or "").strip()
     if not text:
         return None
     cluster_cfg = ((config or {}).get("cluster") or {})
-    local_cfg = {}
-    if isinstance(cluster_cfg, dict):
-        local_cfg = cluster_cfg.get("local") or {}
-        if not isinstance(local_cfg, dict) and str(cluster_cfg.get("backend") or "").strip() == "local":
-            local_cfg = cluster_cfg
-    if not isinstance(local_cfg, dict):
+    if not isinstance(cluster_cfg, dict):
         return None
-    profiles = local_cfg.get("claude_env_profiles")
-    if not isinstance(profiles, dict):
-        return None
-    profile = profiles.get(text)
-    if not isinstance(profile, dict):
-        return None
-    for key in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL"):
-        value = str(profile.get(key) or "").strip()
-        if value:
-            return value
+    candidates: list[dict] = []
+    backend_text = str(provider_backend or "").strip().lower()
+    if backend_text:
+        backend_cfg = cluster_cfg.get(backend_text) or {}
+        if isinstance(backend_cfg, dict):
+            candidates.append(backend_cfg)
+        elif str(cluster_cfg.get("backend") or "").strip().lower() == backend_text:
+            candidates.append(cluster_cfg)
+    else:
+        active_backend = str(cluster_cfg.get("backend") or "").strip().lower()
+        if active_backend:
+            active_cfg = cluster_cfg.get(active_backend) or {}
+            if isinstance(active_cfg, dict):
+                candidates.append(active_cfg)
+            else:
+                candidates.append(cluster_cfg)
+        for backend_key in ("local", "aws"):
+            backend_cfg = cluster_cfg.get(backend_key) or {}
+            if isinstance(backend_cfg, dict):
+                candidates.append(backend_cfg)
+    for candidate in candidates:
+        resolved = _resolve_provider_claude_profile_model(candidate, text)
+        if resolved:
+            return resolved
     return None
 
 
-def _resolve_swarm_agent_model(config, agent_runtime, launch_params):
+def _resolve_swarm_agent_model(config, agent_runtime, launch_params, provider_backend=None):
     params = launch_params if isinstance(launch_params, dict) else {}
     runtime = str(agent_runtime or params.get("agent_runtime") or params.get("worker_mode") or "").strip().lower()
     for key in ("agent_model", "model"):
@@ -1501,13 +1511,13 @@ def _resolve_swarm_agent_model(config, agent_runtime, launch_params):
         explicit = str(params.get("claude_model") or "").strip()
         if explicit:
             return explicit
-        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"))
+        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"), provider_backend=provider_backend)
         if from_profile:
             return from_profile
     return None
 
 
-def _resolve_swarm_pricing_model(config, agent_runtime, launch_params, agent_model=None):
+def _resolve_swarm_pricing_model(config, agent_runtime, launch_params, agent_model=None, provider_backend=None):
     params = launch_params if isinstance(launch_params, dict) else {}
     explicit = str(params.get("pricing_model") or "").strip()
     if explicit:
@@ -1518,7 +1528,7 @@ def _resolve_swarm_pricing_model(config, agent_runtime, launch_params, agent_mod
     if runtime == "codex":
         return "gpt-5.4"
     if runtime == "claude":
-        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"))
+        from_profile = _resolve_claude_profile_model(config, params.get("claude_env_profile"), provider_backend=provider_backend)
         if from_profile:
             return from_profile
     return None
@@ -6534,12 +6544,18 @@ def run_daemon(config, providers):
                         or launch_effective_params.get("worker_mode")
                         or "codex"
                     ).strip().lower()
-                    agent_model = _resolve_swarm_agent_model(config, agent_runtime, launch_effective_params)
+                    agent_model = _resolve_swarm_agent_model(
+                        config,
+                        agent_runtime,
+                        launch_effective_params,
+                        provider_backend=launch_provider_backend,
+                    )
                     pricing_model = _resolve_swarm_pricing_model(
                         config,
                         agent_runtime,
                         launch_effective_params,
                         agent_model=agent_model,
+                        provider_backend=launch_provider_backend,
                     )
 
                     SWARMS[swarm_id] = {

@@ -78,13 +78,13 @@ Optional `cluster_profile` (alias `cluster_config`) selects `cluster.<backend>.p
 Optional `launch_soft_timeout_seconds` and `launch_hard_timeout_seconds` define per-provider
 launch timeout behavior.
 
-For local providers, launch parameters can also select the worker runtime:
+For local and AWS providers, launch parameters can also select the worker runtime:
 
 - `worker_mode=codex`
 - `worker_mode=claude`
-- `worker_mode=mock`
+- `worker_mode=mock` (local only)
 
-Local configs may define `claude_env_profiles` so Claude launches can inject named Anthropic environment bundles such as gateway routing settings.
+Local and AWS configs may define `claude_env_profiles` so Claude launches can inject named Anthropic environment bundles such as gateway routing settings.
 
 ### `swarm_launch`
 
@@ -325,7 +325,7 @@ Pricing lookup is driven by:
 
 Claude authentication/model selection is resolved at worker launch:
 
-- `claude_env_profile` selects a named env bundle from the active local backend config's `claude_env_profiles`
+- `claude_env_profile` selects a named env bundle from the active provider backend config's `claude_env_profiles`
 - profile values may reference `${ENV_VAR}` placeholders from the router host environment
 - if no profile is selected, the worker inherits `ANTHROPIC_*` variables from the router process environment
 - `claude_model` overrides the model passed to the Claude SDK

@@ -160,10 +160,10 @@ If Codex is left in read-only or on-request modes, commands may execute inconsis
 
 ## Claude Runtime
 
-Claude is supported as a local worker runtime through the Anthropic Claude Code SDK/CLI path.
+Claude is supported as a local and AWS worker runtime through the Anthropic Claude Code SDK/CLI path.
 
-- current support scope is local swarms and local orchestrated planner/worker runs
-- remote Claude launch for Slurm/AWS is intentionally deferred
+- current support scope is local swarms, AWS swarms, and local orchestrated planner/worker runs
+- remote Claude launch for Slurm is still deferred
 - select `worker_mode=claude` in the launch modal or provider defaults
 - `approval_policy=never` maps to Claude bypass mode
 - non-`never` approval policies route tool permissions through the normal Codeswarm approval UI
@@ -180,7 +180,7 @@ The sample local configs include an AMD gateway profile named `amd-llm-gateway`.
 Claude launch/runtime precedence is:
 
 1. `worker_mode=claude` selects the Claude worker implementation.
-2. `claude_env_profile` injects a named Anthropic environment bundle from the active local backend config's `claude_env_profiles`.
+2. `claude_env_profile` injects a named Anthropic environment bundle from the active provider backend config's `claude_env_profiles`.
 3. If no profile is selected, the worker uses inherited host env such as `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and `ANTHROPIC_MODEL`.
 4. `claude_model` overrides the model passed to the Claude SDK for that swarm.
 5. `pricing_model` can override billing lookup independently from the runtime-selected model.

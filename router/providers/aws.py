@@ -1,15 +1,18 @@
 import json
 import math
 import os
+import re
 import shlex
 import subprocess
 import time
 import uuid
+from functools import lru_cache
 from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Callable, Dict, Optional
 
 from .base import ClusterProvider
+from .claude_env import resolve_claude_env_overrides, resolve_claude_profile_env
 
 
 class AwsProvider(ClusterProvider):
@@ -143,6 +146,8 @@ class AwsProvider(ClusterProvider):
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
             f"{self.ssh_user}@{host}",
             remote_cmd,
         ]
@@ -199,14 +204,93 @@ class AwsProvider(ClusterProvider):
             )
         return key
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _cached_gh_auth_token() -> str:
+        completed = subprocess.run(
+            ["gh", "auth", "token"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return ""
+        return str(completed.stdout or "").strip()
+
+    def _local_github_token(self) -> str:
+        for key in ("GITHUB_TOKEN", "GH_TOKEN"):
+            value = str(os.environ.get(key) or "").strip()
+            if value:
+                return value
+        return self._cached_gh_auth_token()
+
+    def _ssh_with_env(self, host: str, env_vars: dict[str, str], remote_script: str) -> subprocess.CompletedProcess:
+        payload = {
+            str(key): str(value)
+            for key, value in (env_vars or {}).items()
+            if str(key or "").strip()
+        }
+        wrapped = (
+            'eval "$('
+            "python3 -c "
+            + self._quote(
+                "import json, shlex, sys; "
+                "data=json.load(sys.stdin); "
+                "print(chr(10).join("
+                "f'export {k}={shlex.quote(str(v))}' "
+                "for k, v in data.items() if str(k).strip()))"
+            )
+            + ')"; '
+            "/bin/bash -lc "
+            + self._quote(remote_script)
+        )
+        return self._ssh(host, wrapped, input_text=json.dumps(payload) + "\n")
+
     def _ssh_with_openai_api_key(self, host: str, remote_script: str) -> subprocess.CompletedProcess:
         key = self._local_openai_api_key()
-        wrapped = (
-            "read -r OPENAI_API_KEY; "
-            "export OPENAI_API_KEY; "
-            "/bin/bash -lc " + self._quote(remote_script)
-        )
-        return self._ssh(host, wrapped, input_text=key + "\n")
+        return self._ssh_with_env(host, {"OPENAI_API_KEY": key}, remote_script)
+
+    @staticmethod
+    def _runtime_mode(launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("agent_runtime") or params.get("worker_mode") or "codex").strip().lower() or "codex"
+
+    def _approval_policy(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("approval_policy") or self.aws_cfg.get("approval_policy") or "never").strip().lower() or "never"
+
+    def _sandbox_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("sandbox_mode") or self.aws_cfg.get("sandbox_mode") or "").strip()
+
+    def _claude_permission_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        explicit = str(params.get("claude_permission_mode") or self.aws_cfg.get("claude_permission_mode") or "").strip()
+        if explicit:
+            return explicit
+        return "bypassPermissions" if self._approval_policy(params) == "never" else "default"
+
+    def _claude_inherited_env(self) -> dict[str, str]:
+        allowed_prefixes = ("ANTHROPIC_", "CLAUDE_CODE_")
+        inherited: dict[str, str] = {}
+        for key, value in os.environ.items():
+            if not isinstance(key, str) or value is None:
+                continue
+            if any(key.startswith(prefix) for prefix in allowed_prefixes):
+                inherited[key] = str(value)
+        return inherited
+
+    def _resolve_claude_launch_env(self, launch_params: dict | None) -> dict[str, str]:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        inherited_runtime_env = self._claude_inherited_env()
+        expansion_env = {str(key): str(value) for key, value in os.environ.items() if value is not None}
+        profile_env = resolve_claude_profile_env(self.aws_cfg, params, expansion_env)
+        inherited_runtime_env.update(profile_env)
+        override_source = dict(expansion_env)
+        override_source.update(inherited_runtime_env)
+        inherited_runtime_env.update(resolve_claude_env_overrides(params, override_source))
+        return inherited_runtime_env
 
     def _wait_for_ssh(self, host: str, timeout_s: int = 300) -> None:
         deadline = time.time() + timeout_s
@@ -501,14 +585,14 @@ class AwsProvider(ClusterProvider):
             "if command -v apt-get >/dev/null 2>&1; then",
             "  export DEBIAN_FRONTEND=noninteractive",
             "  apt-get update -y",
-            "  apt-get install -y python3 rsync curl xz-utils jq nfs-common",
+            "  apt-get install -y python3 python3-venv python3-pip rsync curl xz-utils jq nfs-common",
             "  if [ \"" + role + "\" = \"coordinator\" ]; then",
             "    apt-get install -y nfs-kernel-server",
             "  fi",
             "elif command -v dnf >/dev/null 2>&1; then",
-            "  dnf install -y python3 rsync curl xz jq nfs-utils",
+            "  dnf install -y python3 python3-pip rsync curl xz jq nfs-utils",
             "elif command -v yum >/dev/null 2>&1; then",
-            "  yum install -y python3 rsync curl xz jq nfs-utils",
+            "  yum install -y python3 python3-pip rsync curl xz jq nfs-utils",
             "fi",
             f"mkdir -p {self._quote(self.workspace_root)}",
         ]
@@ -663,6 +747,158 @@ sudo mount -t nfs -o rw,nfsvers=4.1 {coordinator_private_ip}:{self.workspace_roo
             check=True,
         )
 
+    @staticmethod
+    def _parse_github_repo_ref(repo_path: str) -> str | None:
+        text = str(repo_path or "").strip()
+        if not text:
+            return None
+        shorthand = re.fullmatch(r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)", text)
+        if shorthand:
+            return f"{shorthand.group(1)}/{shorthand.group(2)}"
+        https_match = re.fullmatch(
+            r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?",
+            text,
+        )
+        if https_match:
+            return f"{https_match.group(1)}/{https_match.group(2)}"
+        ssh_match = re.fullmatch(
+            r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+            text,
+        )
+        if ssh_match:
+            return f"{ssh_match.group(1)}/{ssh_match.group(2)}"
+        return None
+
+    @staticmethod
+    def _origin_remote_url(repo_path: Path) -> str | None:
+        if not repo_path.exists() or not (repo_path / ".git").exists():
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(repo_path), "config", "--get", "remote.origin.url"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        value = str(result.stdout or "").strip()
+        return value or None
+
+    def _resolved_clone_source(self, source: str) -> tuple[str, str | None]:
+        github_repo = self._parse_github_repo_ref(source)
+        clone_source = str(source)
+        source_path = Path(str(source)).expanduser()
+        inherited_origin = self._origin_remote_url(source_path.resolve()) if source_path.exists() else None
+        if github_repo:
+            clone_source = f"git@github.com:{github_repo}.git"
+        return clone_source, inherited_origin
+
+    def _ssh_transport_args(self) -> list[str]:
+        return [
+            "ssh",
+            "-i",
+            self.ssh_private_key_path,
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+        ]
+
+    @staticmethod
+    def _strip_ssh_noise(text: str) -> str:
+        cleaned: list[str] = []
+        for raw_line in str(text or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("Warning: Permanently added ") and "known hosts" in line:
+                continue
+            cleaned.append(raw_line)
+        return "\n".join(cleaned).strip()
+
+    @staticmethod
+    def _github_https_url(repo_ref: str) -> str:
+        github_repo = AwsProvider._parse_github_repo_ref(repo_ref)
+        if not github_repo:
+            raise RuntimeError(f"Not a GitHub repository reference: {repo_ref}")
+        return f"https://github.com/{github_repo}.git"
+
+    @staticmethod
+    def _github_authenticated_url(repo_ref: str, token: str) -> str:
+        github_repo = AwsProvider._parse_github_repo_ref(repo_ref)
+        if not github_repo:
+            raise RuntimeError(f"Not a GitHub repository reference: {repo_ref}")
+        return f"https://x-access-token:{token}@github.com/{github_repo}.git"
+
+    def _rsync_to_host(self, local_source: Path, coordinator_host: str, remote_target: str) -> None:
+        remote_parent = str(PurePosixPath(remote_target).parent)
+        mkdir_res = self._ssh(coordinator_host, f"mkdir -p {self._quote(remote_parent)}")
+        if mkdir_res.returncode != 0:
+            raise RuntimeError(f"Failed to prepare remote repository parent:\n{mkdir_res.stderr}")
+        ssh_base = " ".join(shlex.quote(part) for part in self._ssh_transport_args())
+        remote_path = f"{self.ssh_user}@{coordinator_host}:{remote_target.rstrip('/')}/"
+        subprocess.run(
+            [
+                "rsync",
+                "-az",
+                "--delete",
+                "-e",
+                ssh_base,
+                str(local_source.resolve()) + "/",
+                remote_path,
+            ],
+            check=True,
+        )
+
+    @staticmethod
+    def _is_local_path_like(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if "://" in text or text.startswith("git@"):
+            return False
+        return Path(text).expanduser().exists() or text.startswith("/") or text.startswith("~")
+
+    def _checkout_prepared_branch_remote(self, coordinator_host: str, repo_path: str, branch_name: str, worker_id: int) -> None:
+        script = f"""
+set -euo pipefail
+REPO={self._quote(repo_path)}
+BRANCH={self._quote(branch_name)}
+if git -C "$REPO" checkout "$BRANCH"; then
+  exit 0
+fi
+if ! git -C "$REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
+  git -C "$REPO" checkout -B "$BRANCH"
+  exit 0
+fi
+if git -C "$REPO" rev-parse --verify "refs/remotes/origin/$BRANCH" >/dev/null 2>&1; then
+  git -C "$REPO" checkout -B "$BRANCH" "origin/$BRANCH"
+  exit 0
+fi
+        echo "Failed to checkout branch '$BRANCH' for worker {worker_id}" >&2
+exit 1
+"""
+        res = self._ssh(coordinator_host, "/bin/bash -lc " + self._quote(script))
+        combined = "\n".join(
+            part for part in (
+                self._strip_ssh_noise(res.stdout),
+                self._strip_ssh_noise(res.stderr),
+            ) if part
+        )
+        success_markers = [
+            f"Already on '{branch_name}'",
+            f"Switched to branch '{branch_name}'",
+            f"branch '{branch_name}' set up to track",
+            f"Your branch is up to date with 'origin/{branch_name}'",
+        ]
+        if any(marker in combined for marker in success_markers):
+            return
+        if res.returncode != 0:
+            raise RuntimeError(combined or f"Failed to checkout branch '{branch_name}'")
+
     def _ensure_codex_tools(self, coordinator_host: str) -> None:
         node_version = str(self.aws_cfg.get("node_version") or "24.13.0")
         codex_version = str(self.aws_cfg.get("codex_version") or "latest")
@@ -724,6 +960,46 @@ fi
         if res.returncode != 0:
             raise RuntimeError(f"Failed to bootstrap Codex tooling on coordinator:\n{res.stderr}")
 
+    def _ensure_claude_tools(self, coordinator_host: str, launch_params: dict | None = None) -> None:
+        claude_sdk_package = str(
+            (launch_params or {}).get("claude_sdk_package")
+            or self.aws_cfg.get("claude_sdk_package")
+            or "claude-agent-sdk"
+        ).strip()
+        script = f"""
+set -euo pipefail
+TOOLS_DIR={self._quote(self.base_path + '/tools')}
+CLAUDE_VENV="$TOOLS_DIR/claude-venv"
+
+mkdir -p "$TOOLS_DIR"
+
+if [ ! -x "$CLAUDE_VENV/bin/python" ]; then
+  if ! python3 -m venv "$CLAUDE_VENV"; then
+    if command -v apt-get >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      sudo apt-get update -y
+      sudo apt-get install -y python3-venv python3-pip
+    elif command -v dnf >/dev/null 2>&1; then
+      sudo dnf install -y python3-pip
+    elif command -v yum >/dev/null 2>&1; then
+      sudo yum install -y python3-pip
+    fi
+    python3 -m venv "$CLAUDE_VENV"
+  fi
+fi
+
+"$CLAUDE_VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+"$CLAUDE_VENV/bin/python" -m pip install {self._quote(claude_sdk_package)}
+"$CLAUDE_VENV/bin/python" -c "import claude_agent_sdk"
+"""
+        res = self._ssh(coordinator_host, "/bin/bash -lc " + self._quote(script))
+        if res.returncode != 0:
+            detail = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            if stdout:
+                detail = f"{detail}\nSTDOUT:\n{stdout}".strip()
+            raise RuntimeError(f"Failed to bootstrap Claude tooling on coordinator:\n{detail}")
+
     def _prepare_run_directories(
         self,
         coordinator_host: str,
@@ -766,7 +1042,12 @@ fi
                 if res.returncode != 0:
                     raise RuntimeError(f"Failed to write .agents/skills/{rel_path} for worker {i}:\n{res.stderr}")
 
-    def _start_workers(self, host_assignments: dict[str, list[int]], job_id: str) -> None:
+    def _start_codex_workers(self, host_assignments: dict[str, list[int]], job_id: str, launch_params: dict | None = None) -> None:
+        approval_policy = self._approval_policy(launch_params)
+        sandbox_mode = self._sandbox_mode(launch_params)
+        native_auto_approve = bool((launch_params or {}).get("native_auto_approve"))
+        fresh_thread_per_injection = bool((launch_params or {}).get("fresh_thread_per_injection"))
+        github_token = self._local_github_token()
         for host, worker_ids in host_assignments.items():
             if not worker_ids:
                 continue
@@ -775,6 +1056,20 @@ fi
             capture_export = ""
             if capture_all_session:
                 capture_export = f'    export CODESWARM_CAPTURE_ALL_SESSION={self._quote(capture_all_session)}\n'
+            sandbox_export = ""
+            if sandbox_mode:
+                sandbox_export = f'    export CODESWARM_SANDBOX_MODE={self._quote(sandbox_mode)}\n'
+            native_auto_approve_export = ""
+            if "native_auto_approve" in (launch_params or {}):
+                native_auto_approve_export = (
+                    f'    export CODESWARM_NATIVE_AUTO_APPROVE={self._quote("1" if native_auto_approve else "0")}\n'
+                )
+            fresh_thread_export = ""
+            if "fresh_thread_per_injection" in (launch_params or {}):
+                fresh_thread_export = (
+                    f'    export CODESWARM_FRESH_THREAD_PER_INJECTION='
+                    f'{self._quote("1" if fresh_thread_per_injection else "0")}\n'
+                )
             script = f"""
 set -euo pipefail
 BASE={self._quote(self.base_path)}
@@ -806,16 +1101,85 @@ for wid in {worker_list}; do
     export CODESWARM_NODE_ID="$wid"
     export CODESWARM_BASE_DIR="$BASE"
     export CODESWARM_CODEX_BIN="$BASE/tools/npm-global/bin/codex"
+    export CODESWARM_ASK_FOR_APPROVAL={self._quote(approval_policy)}
     export PATH="$BASE/tools/node/bin:$BASE/tools/npm-global/bin:$PATH"
-{capture_export}    # Optional full raw session capture for Codex protocol debugging
+{sandbox_export}{native_auto_approve_export}{fresh_thread_export}{capture_export}    # Optional full raw session capture for Codex protocol debugging
     nohup python3 "$BASE/agent/codex_worker.py" >> "$AGENT_WORKDIR/worker.log" 2>&1 &
     echo $! > "$AGENT_WORKDIR/worker.pid"
   )
 done
 """
-            res = self._ssh_with_openai_api_key(host, script)
+            env_payload = {"OPENAI_API_KEY": self._local_openai_api_key()}
+            if github_token:
+                env_payload["GITHUB_TOKEN"] = github_token
+                env_payload["GH_TOKEN"] = github_token
+            res = self._ssh_with_env(host, env_payload, script)
             if res.returncode != 0:
                 raise RuntimeError(f"Failed to launch workers on host {host}:\n{res.stderr}")
+
+    def _start_claude_workers(
+        self,
+        host_assignments: dict[str, list[int]],
+        job_id: str,
+        launch_params: dict | None = None,
+    ) -> None:
+        approval_policy = self._approval_policy(launch_params)
+        permission_mode = self._claude_permission_mode(launch_params)
+        fresh_thread_per_injection = bool((launch_params or {}).get("fresh_thread_per_injection"))
+        claude_model = str((launch_params or {}).get("claude_model") or "").strip()
+        claude_cli_path = str((launch_params or {}).get("claude_cli_path") or "").strip()
+        worker_env = self._resolve_claude_launch_env(launch_params)
+        github_token = self._local_github_token()
+        if github_token:
+            worker_env["GITHUB_TOKEN"] = github_token
+            worker_env.setdefault("GH_TOKEN", github_token)
+        for host, worker_ids in host_assignments.items():
+            if not worker_ids:
+                continue
+            worker_list = " ".join(str(i) for i in worker_ids)
+            env_payload = dict(worker_env)
+            script = f"""
+set -euo pipefail
+BASE={self._quote(self.base_path)}
+JOB={self._quote(job_id)}
+CLAUDE_VENV="$BASE/tools/claude-venv"
+export PATH="$CLAUDE_VENV/bin:$PATH"
+
+if [ ! -x "$CLAUDE_VENV/bin/python" ]; then
+  echo "Claude runtime virtualenv is missing at $CLAUDE_VENV" >&2
+  exit 1
+fi
+
+for wid in {worker_list}; do
+  AGENT_INDEX=$(printf "%02d" "$wid")
+  AGENT_WORKDIR="$BASE/runs/$JOB/agent_$AGENT_INDEX"
+  mkdir -p "$AGENT_WORKDIR"
+  (
+    cd "$AGENT_WORKDIR"
+    export CODESWARM_JOB_ID="$JOB"
+    export CODESWARM_NODE_ID="$wid"
+    export CODESWARM_BASE_DIR="$BASE"
+    export CODESWARM_ASK_FOR_APPROVAL={self._quote(approval_policy)}
+    export CODESWARM_CLAUDE_PERMISSION_MODE={self._quote(permission_mode)}
+"""
+            if claude_model:
+                script += f'    export CODESWARM_CLAUDE_MODEL={self._quote(claude_model)}\n'
+            if claude_cli_path:
+                script += f'    export CODESWARM_CLAUDE_CLI_PATH={self._quote(claude_cli_path)}\n'
+            if "fresh_thread_per_injection" in (launch_params or {}):
+                script += (
+                    '    export CODESWARM_FRESH_THREAD_PER_INJECTION='
+                    + self._quote("1" if fresh_thread_per_injection else "0")
+                    + "\n"
+                )
+            script += """    nohup "$CLAUDE_VENV/bin/python" "$BASE/agent/claude_worker.py" >> "$AGENT_WORKDIR/worker.log" 2>&1 &
+    echo $! > "$AGENT_WORKDIR/worker.pid"
+  )
+done
+"""
+            res = self._ssh_with_env(host, env_payload, script)
+            if res.returncode != 0:
+                raise RuntimeError(f"Failed to launch Claude workers on host {host}:\n{res.stderr}")
 
     def launch(
         self,
@@ -840,6 +1204,9 @@ done
         _progress("starting", f"Preparing AWS launch for {total_workers} worker(s)")
         _progress("auth", "Validating AWS CLI authentication on launch host")
         self._verify_aws_auth()
+        worker_mode = self._runtime_mode(launch_params)
+        if worker_mode not in {"codex", "claude"}:
+            raise RuntimeError(f"Unsupported AWS agent runtime: {worker_mode}")
 
         instance_type = str(launch_params.get("instance_type") or self.aws_cfg.get("instance_type") or "").strip()
         if not instance_type:
@@ -974,8 +1341,12 @@ done
             )
             _progress("bootstrap", "Syncing agent runtime files")
             self._sync_agent_dir(coordinator_host)
-            _progress("bootstrap", "Installing Codex runtime tools")
-            self._ensure_codex_tools(coordinator_host)
+            if worker_mode == "claude":
+                _progress("bootstrap", "Installing Claude runtime tools")
+                self._ensure_claude_tools(coordinator_host, launch_params)
+            else:
+                _progress("bootstrap", "Installing Codex runtime tools")
+                self._ensure_codex_tools(coordinator_host)
             _progress("bootstrap", "Preparing per-worker run directories")
             self._prepare_run_directories(
                 coordinator_host,
@@ -1001,7 +1372,10 @@ done
                 }
 
             _progress("bootstrap", "Launching worker processes")
-            self._start_workers(assignments, job_id)
+            if worker_mode == "claude":
+                self._start_claude_workers(assignments, job_id, launch_params)
+            else:
+                self._start_codex_workers(assignments, job_id, launch_params)
 
             self._set_job_meta(job_id, {
                 "job_id": job_id,
@@ -1020,6 +1394,8 @@ done
                 "total_workers": total_workers,
                 "compute_nodes": compute_nodes,
                 "workers_per_node": workers_per_node,
+                "agent_runtime": worker_mode,
+                "worker_mode": worker_mode,
                 "worker_mapping": worker_mapping,
                 "ssh_user": self.ssh_user,
                 "ssh_private_key_path": self.ssh_private_key_path,
@@ -1348,6 +1724,149 @@ rm -rf "$TMP"
         result = self._ssh(coordinator_host, remote_cmd)
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+
+    def prepare_repository(
+        self,
+        job_id: str,
+        repo_path: str,
+        branch: str | None = None,
+        subdir: str = "repo",
+    ) -> dict:
+        source_text = str(repo_path or "").strip()
+        if not source_text:
+            raise RuntimeError("Repository path is required")
+        coordinator_host = self._coordinator_host_for_job(str(job_id))
+        meta = self._get_job_meta(str(job_id)) or {}
+        worker_mapping = meta.get("worker_mapping")
+        if not isinstance(worker_mapping, dict) or not worker_mapping:
+            raise RuntimeError(f"No worker mapping found for AWS job {job_id}")
+
+        github_repo = self._parse_github_repo_ref(source_text)
+        source_path = Path(source_text).expanduser()
+        source_is_local = source_path.exists()
+        branch_name = str(branch).strip() if isinstance(branch, str) and str(branch).strip() else None
+        source_kind = "local_path" if source_is_local else ("github" if github_repo else "remote_url")
+        remote_source = f"{self.base_path}/project_sources/{job_id}/source"
+        github_token = self._local_github_token()
+        public_origin = ""
+        authenticated_origin = ""
+
+        if source_is_local:
+            source = source_path.resolve()
+            if not (source / ".git").exists():
+                raise RuntimeError(f"Repository path is not a git repository: {source}")
+            clone_source = str(source)
+            _clone_source, inherited_origin = self._resolved_clone_source(clone_source)
+            desired_origin = inherited_origin if inherited_origin and not self._is_local_path_like(inherited_origin) else remote_source
+            github_origin = self._parse_github_repo_ref(desired_origin)
+            if github_origin:
+                public_origin = self._github_https_url(github_origin)
+                authenticated_origin = self._github_authenticated_url(github_origin, github_token) if github_token else public_origin
+            else:
+                public_origin = desired_origin
+                authenticated_origin = desired_origin
+            self._rsync_to_host(source, coordinator_host, remote_source)
+        else:
+            clone_source, _inherited_origin = self._resolved_clone_source(github_repo or source_text)
+            github_origin = self._parse_github_repo_ref(clone_source)
+            if github_origin:
+                public_origin = self._github_https_url(github_origin)
+                authenticated_origin = self._github_authenticated_url(github_origin, github_token) if github_token else public_origin
+            else:
+                public_origin = clone_source
+                authenticated_origin = clone_source
+            desired_origin = public_origin
+            script = f"""
+set -euo pipefail
+SOURCE={self._quote(authenticated_origin)}
+TARGET={self._quote(remote_source)}
+PARENT=$(dirname "$TARGET")
+mkdir -p "$PARENT"
+if [ ! -d "$TARGET/.git" ]; then
+  rm -rf "$TARGET"
+  git clone "$SOURCE" "$TARGET"
+else
+  current_origin=$(git -C "$TARGET" config --get remote.origin.url || true)
+  if [ -n "$current_origin" ] && [ "$current_origin" != "$SOURCE" ]; then
+    rm -rf "$TARGET"
+    git clone "$SOURCE" "$TARGET"
+  else
+    git -C "$TARGET" remote set-url origin "$SOURCE" || true
+    git -C "$TARGET" fetch origin --prune
+  fi
+fi
+"""
+            res = self._ssh(coordinator_host, "/bin/bash -lc " + self._quote(script))
+            if res.returncode != 0:
+                raise RuntimeError(f"Failed to prepare AWS repository source:\n{res.stderr.strip() or res.stdout.strip()}")
+
+        prepared_paths: list[str] = []
+        node_ids = sorted(
+            int(node_id)
+            for node_id in worker_mapping.keys()
+            if str(node_id).isdigit()
+        )
+        for node_id in node_ids:
+            target = f"{self.base_path}/runs/{job_id}/agent_{node_id:02d}/{subdir}"
+            script = f"""
+set -euo pipefail
+SOURCE={self._quote(remote_source)}
+TARGET={self._quote(target)}
+ORIGIN={self._quote(public_origin or desired_origin)}
+if [ -e "$TARGET" ] && [ ! -d "$TARGET/.git" ]; then
+  rm -rf "$TARGET"
+fi
+if [ -d "$TARGET/.git" ]; then
+  current_origin=$(git -C "$TARGET" config --get remote.origin.url || true)
+  if [ -n "$current_origin" ] && [ "$current_origin" != "$ORIGIN" ]; then
+    rm -rf "$TARGET"
+  fi
+fi
+if [ ! -d "$TARGET/.git" ]; then
+  mkdir -p "$(dirname "$TARGET")"
+  git clone "$SOURCE" "$TARGET"
+fi
+git -C "$TARGET" remote set-url origin "$ORIGIN" || true
+if [ -n "${{GITHUB_TOKEN:-}}" ] && printf '%s' "$ORIGIN" | grep -Eq '^https://github\\.com/'; then
+  git -C "$TARGET" config credential.helper \
+    '!f() {{ if [ "$1" = get ]; then echo username=x-access-token; echo password=$GITHUB_TOKEN; fi; }}; f'
+  git -C "$TARGET" config credential.useHttpPath true
+else
+  git -C "$TARGET" config --unset-all credential.helper || true
+  git -C "$TARGET" config --unset-all credential.useHttpPath || true
+fi
+git -C "$TARGET" fetch origin --prune || true
+"""
+            if github_token:
+                res = self._ssh_with_env(
+                    coordinator_host,
+                    {"GITHUB_TOKEN": github_token, "GH_TOKEN": github_token},
+                    script,
+                )
+            else:
+                res = self._ssh(coordinator_host, "/bin/bash -lc " + self._quote(script))
+            if res.returncode != 0:
+                raise RuntimeError(
+                    f"Failed to prepare repository checkout for worker {node_id}:\n"
+                    f"{res.stderr.strip() or res.stdout.strip()}"
+                )
+            if branch_name:
+                self._checkout_prepared_branch_remote(coordinator_host, target, branch_name, node_id)
+            prepared_paths.append(target)
+
+        prepared = {
+            "mode": "per_agent_clone",
+            "source": clone_source if not source_is_local else str(source_path.resolve()),
+            "source_kind": source_kind,
+            "source_path_remote": remote_source,
+            "origin": public_origin or desired_origin,
+            "branch": branch_name,
+            "subdir": subdir,
+            "worker_paths": prepared_paths,
+        }
+        meta["prepared_repo"] = prepared
+        self._set_job_meta(str(job_id), meta)
+        return prepared
 
     def send_control(self, job_id: str, node_id: int, message: dict) -> None:
         coordinator_host = self._coordinator_host_for_job(str(job_id))

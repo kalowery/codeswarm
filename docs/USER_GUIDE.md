@@ -159,7 +159,7 @@ Router emits `swarm_launched`, then injects the system prompt to all nodes when 
 ### Claude-specific notes
 
 - `worker_mode=claude` uses the Anthropic Claude Code SDK/CLI path
-- current Claude support is for local launches; remote provider rollout is still pending
+- current Claude support is for local and AWS launches; Slurm rollout is still pending
 - if `claude_env_profile` is unset, Claude falls back to inherited environment variables such as `ANTHROPIC_API_KEY`
 - if `claude_env_profile` is set, Codeswarm expands `${ENV_VAR}` placeholders against the launch host environment and injects the resolved Anthropic env into the worker
 - `approval_policy=never` maps to Claude bypass mode
@@ -170,7 +170,7 @@ Router emits `swarm_launched`, then injects the system prompt to all nodes when 
 API key and model selection precedence:
 
 1. `claude_env_profile` selected:
-   the worker receives the resolved profile values from the active local backend config's `claude_env_profiles`
+   the worker receives the resolved profile values from the active provider backend config's `claude_env_profiles`
 2. no `claude_env_profile` selected:
    the worker inherits `ANTHROPIC_*` values from the router process environment
 3. `claude_model` set:
