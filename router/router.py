@@ -6320,26 +6320,25 @@ def run_daemon(config, providers):
                             int(data.get("node_id") if isinstance(data.get("node_id"), int) else -1),
                             str(data.get("injection_id") or ""),
                         )
-                        should_reconcile = False
+                        should_record = False
                         with SCHEDULER_LOCK:
                             if final_key not in FINAL_ANSWER_SEEN:
                                 FINAL_ANSWER_SEEN.add(final_key)
-                                should_reconcile = True
-                                node_id = data.get("node_id")
-                                if isinstance(node_id, int):
-                                    NODE_THREAD_ACTIVE[_node_key(data.get("swarm_id"), node_id)] = False
+                                should_record = True
                         plan_id = _find_pending_project_plan_by_injection(data.get("injection_id"))
-                        if plan_id:
+                        if should_record and plan_id:
                             _record_project_plan_result(plan_id, {
                                 "last_agent_message": data.get("content"),
                             })
                         project_id, task_id = _find_project_and_task_by_injection(data.get("injection_id"))
-                        if project_id and task_id:
+                        if should_record and project_id and task_id:
                             _record_project_task_result(project_id, task_id, {
                                 "last_agent_message": data.get("content"),
                             })
-                        if should_reconcile:
-                            _mark_outstanding(data.get("swarm_id"), data.get("node_id"), -1)
+                        # Record project/task results as soon as the final answer lands
+                        # so downstream dependency scheduling can proceed, but do not
+                        # force the originating node idle here. Some Codex traces emit
+                        # final answer text before the node is actually quiescent.
                         _dispatch_inter_swarm_queue(config)
                         _dispatch_pending_project_plans(config)
                         _dispatch_project_tasks(config)
