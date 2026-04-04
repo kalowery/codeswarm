@@ -65,6 +65,23 @@ ensure_path_in_shell_startup() {
   done
 }
 
+ensure_bash_profile_sources_bashrc() {
+  local profile="$HOME/.bash_profile"
+  local marker="# Added by Codeswarm installer: load ~/.bashrc for login shells"
+  [ -f "$profile" ] || touch "$profile"
+  if grep -F "$marker" "$profile" >/dev/null 2>&1; then
+    return 0
+  fi
+  cat >>"$profile" <<'EOF'
+
+# Added by Codeswarm installer: load ~/.bashrc for login shells
+if [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+EOF
+  log "Updated $profile to source ~/.bashrc"
+}
+
 cleanup() {
   if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
     rm -rf "$TMP_DIR"
@@ -169,6 +186,7 @@ install_from_release() {
 
   mkdir -p "$INSTALL_DIR/bin"
   write_launcher
+  ensure_bash_profile_sources_bashrc
   ensure_path_in_shell_startup "$INSTALL_DIR/bin"
 
   log "Install complete."
