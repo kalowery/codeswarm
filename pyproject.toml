@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codeswarm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Provider-agnostic multi-agent execution and orchestration for local, Slurm, and AWS runtimes."
 readme = "README.md"
 requires-python = ">=3.10"
