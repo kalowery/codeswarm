@@ -51,11 +51,66 @@ def _resolve_backend_profile(cluster_cfg: dict, backend: str, profile: str | Non
 
 
 def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
+    def _container_launch_fields(default_engine: str, supported_engines: list[str]):
+        options = []
+        seen = set()
+        for raw_name in supported_engines:
+            name = str(raw_name or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            options.append({"label": name.capitalize(), "value": name})
+        return [
+            {
+                "key": "execution_mode",
+                "label": "Execution Mode",
+                "type": "select",
+                "default": str(backend_cfg.get("default_execution_mode") or "native"),
+                "required": True,
+                "options": [
+                    {"label": "Native", "value": "native"},
+                    {"label": "Container", "value": "container"},
+                ],
+            },
+            {
+                "key": "container_engine",
+                "label": "Container Engine",
+                "type": "select",
+                "default": str(backend_cfg.get("default_container_engine") or default_engine),
+                "required": False,
+                "options": options,
+            },
+            {
+                "key": "container_image",
+                "label": "Container Image",
+                "type": "text",
+                "default": str(backend_cfg.get("default_container_image") or ""),
+                "required": False,
+                "placeholder": "ghcr.io/org/codeswarm-worker:latest or docker://image",
+            },
+            {
+                "key": "container_pull_policy",
+                "label": "Container Pull Policy",
+                "type": "select",
+                "default": str(backend_cfg.get("default_container_pull_policy") or "if_not_present"),
+                "required": False,
+                "options": [
+                    {"label": "If Not Present", "value": "if_not_present"},
+                    {"label": "Always", "value": "always"},
+                    {"label": "Never", "value": "never"},
+                ],
+            },
+        ]
+
     if backend == "local":
         local_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}
         default_sandbox = local_cfg.get("default_sandbox_mode")
         if not isinstance(default_sandbox, str) or not default_sandbox.strip():
             default_sandbox = "danger-full-access"
+        container_fields = _container_launch_fields(
+            "docker",
+            local_cfg.get("supported_container_engines") or ["docker", "podman"],
+        )
         fields = [
             {
                 "key": "worker_mode",
@@ -69,6 +124,7 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                     {"label": "Mock", "value": "mock"},
                 ],
             },
+            *container_fields,
             {
                 "key": "approval_policy",
                 "label": "Approval Policy",
@@ -171,6 +227,10 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
 
     if backend == "slurm":
         slurm_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}
+        container_fields = _container_launch_fields(
+            "apptainer",
+            slurm_cfg.get("supported_container_engines") or ["apptainer"],
+        )
         fields = [
             {
                 "key": "worker_mode",
@@ -183,6 +243,7 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                     {"label": "Claude", "value": "claude"},
                 ],
             },
+            *container_fields,
             {
                 "key": "approval_policy",
                 "label": "Approval Policy",
@@ -289,6 +350,10 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
 
     if backend == "aws":
         aws_cfg = backend_cfg if isinstance(backend_cfg, dict) else {}
+        container_fields = _container_launch_fields(
+            "docker",
+            aws_cfg.get("supported_container_engines") or ["docker", "podman"],
+        )
         fields = [
             {
                 "key": "worker_mode",
@@ -301,6 +366,7 @@ def _default_launch_fields_for_backend(backend: str, backend_cfg: dict):
                     {"label": "Claude", "value": "claude"},
                 ],
             },
+            *container_fields,
             {
                 "key": "approval_policy",
                 "label": "Approval Policy",

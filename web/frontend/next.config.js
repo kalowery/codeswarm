@@ -1,5 +1,9 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  output: 'standalone',
+  images: {
+    unoptimized: true,
+  },
   webpack: (config, { dev }) => {
     if (dev) {
       const rawIgnored = Array.isArray(config.watchOptions?.ignored)

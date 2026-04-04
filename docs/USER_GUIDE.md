@@ -2,19 +2,57 @@
 
 This guide describes day-to-day usage of the current router + backend + frontend stack.
 
-## 1. Start the system
+## 1. Install Codeswarm
+
+### Option A: Install a published release
+
+Latest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
+```
+
+Pinned release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/v0.1.2/install-codeswarm.sh | bash
+```
+
+This installs into `~/.codeswarm` by default, creates a private virtualenv, installs the bundled Python wheel, installs CLI/backend runtime dependencies, and writes a launcher to `~/.codeswarm/bin/codeswarm`.
+
+Useful installer overrides:
+
+- `CODESWARM_INSTALL_DIR`
+- `CODESWARM_RELEASE_URL`
+- `CODESWARM_RELEASE_ARCHIVE`
+
+### Option B: Bootstrap from a git clone
+
+```bash
+git clone https://github.com/kalowery/codeswarm.git
+cd codeswarm
+./bootstrap.sh
+```
+
+Use this path for development, branch testing, or local code changes. `bootstrap.sh` installs workspace dependencies, builds the JS artifacts, and installs the Python package in editable mode from the checkout.
+
+If dependencies change after switching branches:
+
+```bash
+npm install --workspaces
+npm run build:all
+```
+
+## 2. Start the system
 
 ### Option A: One command (recommended)
 
 ```bash
-codeswarm web --config configs/local.json
+codeswarm web --config ~/.codeswarm/configs/local.json
 ```
 
-or for Slurm:
-
-```bash
-codeswarm web --config configs/hpcfund.json
-```
+When running from a source checkout instead of a release install, use the repo-local config paths such as `configs/local.json`.
+Provider-specific operator configs such as Slurm or multi-provider setups are typically created locally from your own checked-out config files rather than shipped as part of the generic release bundle.
 
 ### Option B: Run services manually
 
@@ -53,7 +91,7 @@ CLI launch also supports the same launch-only payloads the web UI sends:
 - `--provider-params-json '{"key":"value"}'`
 - `--detach` to exit immediately after launch; otherwise the CLI follows INFO activity logs by default
 
-## 2. Modes
+## 3. Modes
 
 ### Local mode
 
@@ -106,7 +144,7 @@ These presets default to:
 - `approval_policy=never`
 - `sandbox_mode=danger-full-access`
 - `native_auto_approve=true`
-- `fresh_thread_per_injection=true`
+- `fresh_thread_per_injection=false`
 - `claude_env_profile=amd-llm-gateway` in the sample local configs
 
 Additional local config keys now used by Claude and spend accounting:
@@ -138,7 +176,7 @@ Example shape from [configs/local.json](/Users/keithlowery/codeswarm/configs/loc
 }
 ```
 
-## 3. Launch a swarm
+## 4. Launch a swarm
 
 In UI:
 
@@ -159,7 +197,7 @@ Router emits `swarm_launched`, then injects the system prompt to all nodes when 
 ### Claude-specific notes
 
 - `worker_mode=claude` uses the Anthropic Claude Code SDK/CLI path
-- current Claude support is for local and AWS launches; Slurm rollout is still pending
+- current Claude support is available for local, AWS, and Slurm launches
 - if `claude_env_profile` is unset, Claude falls back to inherited environment variables such as `ANTHROPIC_API_KEY`
 - if `claude_env_profile` is set, Codeswarm expands `${ENV_VAR}` placeholders against the launch host environment and injects the resolved Anthropic env into the worker
 - `approval_policy=never` maps to Claude bypass mode
@@ -196,7 +234,7 @@ When a persona directory is selected, each worker workspace receives:
 
 Files outside persona `AGENTS.md` and `skills/` are ignored.
 
-## 4. Orchestrated projects
+## 5. Orchestrated projects
 
 Codeswarm supports an opt-in project mode that keeps router-owned task state alongside the normal ad hoc swarm model.
 

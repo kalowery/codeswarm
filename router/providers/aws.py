@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from functools import lru_cache
@@ -16,6 +17,10 @@ from .claude_env import resolve_claude_env_overrides, resolve_claude_profile_env
 
 
 class AwsProvider(ClusterProvider):
+    DEFAULT_CONTAINER_IMAGE = (
+        os.environ.get("CODESWARM_DEFAULT_AWS_CONTAINER_IMAGE")
+        or "ghcr.io/kalowery/codeswarm-local-worker:latest"
+    )
 
     def __init__(self, config: dict):
         self.config = config
@@ -218,12 +223,33 @@ class AwsProvider(ClusterProvider):
             return ""
         return str(completed.stdout or "").strip()
 
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _cached_gh_auth_user() -> str:
+        completed = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            return ""
+        return str(completed.stdout or "").strip()
+
     def _local_github_token(self) -> str:
         for key in ("GITHUB_TOKEN", "GH_TOKEN"):
             value = str(os.environ.get(key) or "").strip()
             if value:
                 return value
         return self._cached_gh_auth_token()
+
+    def _local_github_username(self) -> str:
+        for key in ("GITHUB_USER", "GITHUB_USERNAME", "GH_USERNAME"):
+            value = str(os.environ.get(key) or "").strip()
+            if value:
+                return value
+        return self._cached_gh_auth_user()
 
     def _ssh_with_env(self, host: str, env_vars: dict[str, str], remote_script: str) -> subprocess.CompletedProcess:
         payload = {
@@ -255,6 +281,23 @@ class AwsProvider(ClusterProvider):
     def _runtime_mode(launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
         return str(params.get("agent_runtime") or params.get("worker_mode") or "codex").strip().lower() or "codex"
+
+    def _execution_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("execution_mode") or self.aws_cfg.get("default_execution_mode") or "native").strip().lower() or "native"
+
+    def _container_engine(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_engine") or self.aws_cfg.get("default_container_engine") or "docker").strip().lower() or "docker"
+
+    def _container_image(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        explicit = str(params.get("container_image") or self.aws_cfg.get("default_container_image") or "").strip()
+        return explicit or self.DEFAULT_CONTAINER_IMAGE
+
+    def _container_pull_policy(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_pull_policy") or self.aws_cfg.get("default_container_pull_policy") or "if_not_present").strip().lower() or "if_not_present"
 
     def _approval_policy(self, launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
@@ -306,6 +349,171 @@ class AwsProvider(ClusterProvider):
     @staticmethod
     def _quote(value: str) -> str:
         return shlex.quote(str(value))
+
+    @staticmethod
+    def _apt_wait_shell() -> str:
+        return r"""
+wait_for_apt() {
+  if command -v cloud-init >/dev/null 2>&1; then
+    sudo cloud-init status --wait >/dev/null 2>&1 || cloud-init status --wait >/dev/null 2>&1 || true
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  for _ in $(seq 1 120); do
+    if sudo fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
+      sleep 5
+      continue
+    fi
+    if pgrep -x apt >/dev/null 2>&1 \
+      || pgrep -x apt-get >/dev/null 2>&1 \
+      || pgrep -x dpkg >/dev/null 2>&1 \
+      || pgrep -x unattended-upgrade >/dev/null 2>&1 \
+      || pgrep -x unattended-upgrades >/dev/null 2>&1; then
+      sleep 5
+      continue
+    fi
+    return 0
+  done
+  echo "Timed out waiting for apt/dpkg locks" >&2
+  return 1
+}
+"""
+
+    @staticmethod
+    def _container_name(job_id: str, node_id: int) -> str:
+        safe_job = "".join(ch if ch.isalnum() or ch in ("-", "_") else "-" for ch in str(job_id))
+        return f"codeswarm-{safe_job}-{int(node_id):02d}"
+
+    def _container_engine_command(self, engine: str) -> str:
+        normalized = str(engine or "").strip().lower()
+        if normalized == "docker":
+            return "sudo docker"
+        raise RuntimeError(f"AWS container engine is not implemented yet: {engine}")
+
+    def _ensure_container_runtime(self, host: str, engine: str) -> None:
+        normalized = str(engine or "").strip().lower()
+        if normalized != "docker":
+            raise RuntimeError(f"AWS container engine is not implemented yet: {engine}")
+        script = self._apt_wait_shell() + r"""
+set -euo pipefail
+if command -v docker >/dev/null 2>&1; then
+  if command -v systemctl >/dev/null 2>&1; then
+    sudo systemctl enable --now docker || true
+  fi
+  exit 0
+fi
+if command -v apt-get >/dev/null 2>&1; then
+  wait_for_apt
+  sudo apt-get update -y
+  sudo apt-get install -y docker.io
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y docker
+elif command -v yum >/dev/null 2>&1; then
+  sudo yum install -y docker
+else
+  echo "Unsupported Linux distribution for Docker install" >&2
+  exit 1
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  sudo systemctl enable --now docker
+fi
+docker --version >/dev/null 2>&1 || sudo docker --version >/dev/null 2>&1
+"""
+        res = self._ssh(host, "/bin/bash -lc " + self._quote(script))
+        if res.returncode != 0:
+            raise RuntimeError(f"Failed to prepare container runtime on host {host}:\n{res.stderr.strip() or res.stdout.strip()}")
+
+    def _ensure_container_image(self, host: str, engine: str, image: str, pull_policy: str) -> None:
+        engine_cmd = self._container_engine_command(engine)
+        pull_policy = str(pull_policy or "if_not_present").strip().lower() or "if_not_present"
+        env_payload: dict[str, str] = {}
+        if str(image or "").startswith("ghcr.io/"):
+            github_token = self._local_github_token()
+            github_username = self._local_github_username()
+            if github_token and github_username:
+                env_payload["GITHUB_TOKEN"] = github_token
+                env_payload["GITHUB_USERNAME"] = github_username
+        default_dockerfile = f"{self.base_path}/docker/local-worker.Dockerfile"
+        script = f"""
+set -euo pipefail
+ENGINE={self._quote(engine_cmd)}
+IMAGE={self._quote(image)}
+PULL_POLICY={self._quote(pull_policy)}
+DEFAULT_IMAGE={self._quote(self.DEFAULT_CONTAINER_IMAGE)}
+DEFAULT_DOCKERFILE={self._quote(default_dockerfile)}
+DEFAULT_CONTEXT=$(dirname "$DEFAULT_DOCKERFILE")
+login_ghcr() {{
+  if [ -z "${{GITHUB_TOKEN:-}}" ] || [ -z "${{GITHUB_USERNAME:-}}" ]; then
+    return 0
+  fi
+  if printf '%s' "$IMAGE" | grep -Eq '^ghcr\\.io/'; then
+    printf '%s' "$GITHUB_TOKEN" | $ENGINE login ghcr.io -u "$GITHUB_USERNAME" --password-stdin >/dev/null
+  fi
+}}
+logout_ghcr() {{
+  if printf '%s' "$IMAGE" | grep -Eq '^ghcr\\.io/'; then
+    $ENGINE logout ghcr.io >/dev/null 2>&1 || true
+  fi
+}}
+have_image() {{
+  $ENGINE image inspect "$IMAGE" >/dev/null 2>&1
+}}
+build_default_image() {{
+  if [ "$IMAGE" != "$DEFAULT_IMAGE" ] || [ ! -f "$DEFAULT_DOCKERFILE" ]; then
+    return 1
+  fi
+  $ENGINE build -t "$IMAGE" -f "$DEFAULT_DOCKERFILE" "$DEFAULT_CONTEXT"
+}}
+
+case "$PULL_POLICY" in
+  never)
+    if ! have_image; then
+      if ! build_default_image; then
+        echo "Required container image is missing locally: $IMAGE" >&2
+        exit 1
+      fi
+    fi
+    ;;
+  always)
+    login_ghcr
+    if ! $ENGINE pull "$IMAGE"; then
+      logout_ghcr
+      if ! build_default_image; then
+        exit 1
+      fi
+    else
+      logout_ghcr
+    fi
+    ;;
+  if_not_present)
+    if ! have_image; then
+      login_ghcr
+      if ! $ENGINE pull "$IMAGE"; then
+        logout_ghcr
+        if ! build_default_image; then
+          exit 1
+        fi
+      else
+        logout_ghcr
+      fi
+    fi
+    ;;
+  *)
+    echo "Unsupported container pull policy: $PULL_POLICY" >&2
+    exit 1
+    ;;
+esac
+"""
+        if env_payload:
+            res = self._ssh_with_env(host, env_payload, script)
+        else:
+            res = self._ssh(host, "/bin/bash -lc " + self._quote(script))
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"Failed to prepare container image '{image}' on host {host}:\n{res.stderr.strip() or res.stdout.strip()}"
+            )
 
     def _describe_instances(self, filters: list[dict] | None = None) -> list[dict]:
         args = ["ec2", "describe-instances"]
@@ -603,23 +811,18 @@ class AwsProvider(ClusterProvider):
         base_q = self._quote(self.base_path)
         device_q = self._quote(device_name)
 
-        coordinator_script = f"""
+        coordinator_script = self._apt_wait_shell() + f"""
 set -euo pipefail
 sudo mkdir -p {workspace_q}
 
+if command -v apt-get >/dev/null 2>&1; then
+  wait_for_apt
+fi
+
 if ! command -v exportfs >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-
-    for _ in $(seq 1 60); do
-      if sudo fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/cache/apt/archives/lock >/dev/null 2>&1; then
-        sleep 5
-      else
-        break
-      fi
-    done
-
     for _ in $(seq 1 3); do
+      wait_for_apt
       if sudo apt-get update -y && sudo apt-get install -y nfs-kernel-server nfs-common; then
         break
       fi
@@ -746,6 +949,37 @@ sudo mount -t nfs -o rw,nfsvers=4.1 {coordinator_private_ip}:{self.workspace_roo
             ],
             check=True,
         )
+
+    def _sync_container_assets(self, hosts: list[str]) -> None:
+        docker_local_dir = Path(__file__).resolve().parents[2] / "docker"
+        if not docker_local_dir.exists():
+            raise RuntimeError(f"Local docker directory not found: {docker_local_dir}")
+        ssh_base = " ".join([
+            "ssh",
+            "-i",
+            shlex.quote(self.ssh_private_key_path),
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+        ])
+        unique_hosts = [host for host in dict.fromkeys(str(host).strip() for host in hosts) if host]
+        for host in unique_hosts:
+            mkdir_res = self._ssh(host, f"mkdir -p {self._quote(self.base_path + '/docker')}")
+            if mkdir_res.returncode != 0:
+                raise RuntimeError(f"Failed to prepare remote docker directory:\n{mkdir_res.stderr}")
+            remote_path = f"{self.ssh_user}@{host}:{self.base_path}/docker/"
+            subprocess.run(
+                [
+                    "rsync",
+                    "-az",
+                    "-e",
+                    ssh_base,
+                    str(docker_local_dir) + "/",
+                    remote_path,
+                ],
+                check=True,
+            )
 
     @staticmethod
     def _parse_github_repo_ref(repo_path: str) -> str | None:
@@ -967,6 +1201,7 @@ fi
             or "claude-agent-sdk"
         ).strip()
         script = f"""
+{self._apt_wait_shell()}
 set -euo pipefail
 TOOLS_DIR={self._quote(self.base_path + '/tools')}
 CLAUDE_VENV="$TOOLS_DIR/claude-venv"
@@ -976,7 +1211,7 @@ mkdir -p "$TOOLS_DIR"
 if [ ! -x "$CLAUDE_VENV/bin/python" ]; then
   if ! python3 -m venv "$CLAUDE_VENV"; then
     if command -v apt-get >/dev/null 2>&1; then
-      export DEBIAN_FRONTEND=noninteractive
+      wait_for_apt
       sudo apt-get update -y
       sudo apt-get install -y python3-venv python3-pip
     elif command -v dnf >/dev/null 2>&1; then
@@ -1041,6 +1276,299 @@ fi
                 )
                 if res.returncode != 0:
                     raise RuntimeError(f"Failed to write .agents/skills/{rel_path} for worker {i}:\n{res.stderr}")
+
+    def _start_codex_container_workers(
+        self,
+        host_assignments: dict[str, list[int]],
+        job_id: str,
+        launch_params: dict | None = None,
+    ) -> list[dict]:
+        approval_policy = self._approval_policy(launch_params)
+        sandbox_mode = self._sandbox_mode(launch_params)
+        native_auto_approve = bool((launch_params or {}).get("native_auto_approve"))
+        native_auto_approve_present = "native_auto_approve" in (launch_params or {})
+        fresh_thread_per_injection = bool((launch_params or {}).get("fresh_thread_per_injection"))
+        fresh_thread_present = "fresh_thread_per_injection" in (launch_params or {})
+        capture_all_session = str(os.environ.get("CODESWARM_CAPTURE_ALL_SESSION") or "").strip()
+        github_token = self._local_github_token()
+        engine = self._container_engine(launch_params)
+        engine_cmd = self._container_engine_command(engine)
+        image = self._container_image(launch_params)
+        workers: list[dict] = []
+
+        for host, worker_ids in host_assignments.items():
+            if not worker_ids:
+                continue
+            env_payload = {"OPENAI_API_KEY": self._local_openai_api_key()}
+            if github_token:
+                env_payload["GITHUB_TOKEN"] = github_token
+                env_payload["GH_TOKEN"] = github_token
+            if native_auto_approve_present:
+                env_payload["CODESWARM_NATIVE_AUTO_APPROVE_VALUE"] = "1" if native_auto_approve else "0"
+            if fresh_thread_present:
+                env_payload["CODESWARM_FRESH_THREAD_VALUE"] = "1" if fresh_thread_per_injection else "0"
+            if capture_all_session:
+                env_payload["CODESWARM_CAPTURE_ALL_SESSION_VALUE"] = capture_all_session
+            host_workers: list[dict] = []
+            for worker_id in worker_ids:
+                host_workers.append({
+                    "node_id": int(worker_id),
+                    "name": self._container_name(job_id, worker_id),
+                })
+            payload_json = json.dumps(host_workers)
+            script = f"""
+set -euo pipefail
+BASE={self._quote(self.base_path)}
+JOB={self._quote(job_id)}
+ENGINE={self._quote(engine_cmd)}
+IMAGE={self._quote(image)}
+WORKERS_JSON={self._quote(payload_json)}
+export BASE JOB ENGINE IMAGE WORKERS_JSON
+
+python3 - <<'PY'
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+base = os.environ["BASE"]
+job = os.environ["JOB"]
+engine = os.environ["ENGINE"]
+image = os.environ["IMAGE"]
+workers = json.loads(os.environ["WORKERS_JSON"])
+
+for worker in workers:
+    wid = int(worker["node_id"])
+    name = str(worker["name"])
+    agent_workdir = base + "/runs/" + job + ("/agent_%02d" % wid)
+    container_home = agent_workdir + "/.home"
+    uid = os.getuid()
+    gid = os.getgid()
+    preserve_env = ["OPENAI_API_KEY"]
+    if os.environ.get("GITHUB_TOKEN"):
+        preserve_env.append("GITHUB_TOKEN")
+    if os.environ.get("GH_TOKEN"):
+        preserve_env.append("GH_TOKEN")
+    docker_cmd = ["sudo"]
+    if preserve_env:
+        docker_cmd.append("--preserve-env=" + ",".join(preserve_env))
+    docker_cmd.append("docker")
+    startup = [
+        "set -euo pipefail",
+        "export HOME=" + shlex.quote(container_home),
+        'mkdir -p "$HOME/.codex"',
+        'if ! codex login status >/dev/null 2>&1; then',
+        '  if [ -z "${{OPENAI_API_KEY:-}}" ]; then',
+        '    echo "OPENAI_API_KEY is required to initialize Codex inside the worker container" >&2',
+        '    exit 1',
+        '  fi',
+        '  if ! printenv OPENAI_API_KEY | codex login --using-api-key; then',
+        '    printenv OPENAI_API_KEY | codex login --with-api-key',
+        '  fi',
+        'fi',
+        "exec python3 " + shlex.quote(base + "/agent/codex_worker.py"),
+    ]
+    run_cmd = [
+        *docker_cmd, "run", "-d",
+        "--name", name,
+        "--user", str(uid) + ":" + str(gid),
+        "--workdir", agent_workdir,
+        "-v", base + ":" + base,
+        "-e", "OPENAI_API_KEY",
+        "-e", "CODESWARM_JOB_ID=" + job,
+        "-e", "CODESWARM_NODE_ID=" + str(wid),
+        "-e", "CODESWARM_BASE_DIR=" + base,
+        "-e", "CODESWARM_CODEX_BIN=codex",
+        "-e", "CODESWARM_ASK_FOR_APPROVAL=" + {json.dumps(approval_policy)},
+        "-e", "HOME=" + container_home,
+        "-e", "PATH=/usr/local/bin:/usr/bin:/bin",
+    ]
+    sandbox_mode = {json.dumps(sandbox_mode)}
+    if sandbox_mode:
+        run_cmd.extend(["-e", "CODESWARM_SANDBOX_MODE=" + sandbox_mode])
+    native_auto_value = os.environ.get("CODESWARM_NATIVE_AUTO_APPROVE_VALUE")
+    if native_auto_value is not None:
+        run_cmd.extend(["-e", "CODESWARM_NATIVE_AUTO_APPROVE=" + native_auto_value])
+    fresh_thread_value = os.environ.get("CODESWARM_FRESH_THREAD_VALUE")
+    if fresh_thread_value is not None:
+        run_cmd.extend(["-e", "CODESWARM_FRESH_THREAD_PER_INJECTION=" + fresh_thread_value])
+    capture = os.environ.get("CODESWARM_CAPTURE_ALL_SESSION_VALUE", "")
+    if capture:
+        run_cmd.extend(["-e", "CODESWARM_CAPTURE_ALL_SESSION=" + capture])
+    if os.environ.get("GITHUB_TOKEN"):
+        run_cmd.extend(["-e", "GITHUB_TOKEN"])
+    if os.environ.get("GH_TOKEN"):
+        run_cmd.extend(["-e", "GH_TOKEN"])
+    subprocess.run(["sudo", "docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    run_cmd.extend([image, "/bin/bash", "-lc", "\\n".join(startup)])
+    result = subprocess.run(run_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise SystemExit("Failed to launch container worker %s: %s" % (wid, detail))
+PY
+"""
+            res = self._ssh_with_env(host, env_payload, script)
+            if res.returncode != 0:
+                raise RuntimeError(f"Failed to launch container workers on host {host}:\n{res.stderr.strip() or res.stdout.strip()}")
+            workers.extend(
+                {
+                    "node_id": int(item["node_id"]),
+                    "host": host,
+                    "container_name": str(item["name"]),
+                    "container_engine": engine,
+                    "container_image": image,
+                }
+                for item in host_workers
+            )
+        return workers
+
+    def _start_claude_container_workers(
+        self,
+        host_assignments: dict[str, list[int]],
+        job_id: str,
+        launch_params: dict | None = None,
+    ) -> list[dict]:
+        approval_policy = self._approval_policy(launch_params)
+        permission_mode = self._claude_permission_mode(launch_params)
+        fresh_thread_per_injection = bool((launch_params or {}).get("fresh_thread_per_injection"))
+        claude_model = str((launch_params or {}).get("claude_model") or "").strip()
+        claude_cli_path = str((launch_params or {}).get("claude_cli_path") or "").strip()
+        worker_env = self._resolve_claude_launch_env(launch_params)
+        github_token = self._local_github_token()
+        if github_token:
+            worker_env["GITHUB_TOKEN"] = github_token
+            worker_env.setdefault("GH_TOKEN", github_token)
+        engine = self._container_engine(launch_params)
+        image = self._container_image(launch_params)
+        workers: list[dict] = []
+
+        for host, worker_ids in host_assignments.items():
+            if not worker_ids:
+                continue
+            host_workers: list[dict] = []
+            for worker_id in worker_ids:
+                host_workers.append({
+                    "node_id": int(worker_id),
+                    "name": self._container_name(job_id, worker_id),
+                })
+            payload_json = json.dumps(host_workers)
+            env_payload = dict(worker_env)
+            env_payload["WORKERS_JSON"] = payload_json
+            env_payload["CODESWARM_APPROVAL_POLICY"] = approval_policy
+            env_payload["CODESWARM_CLAUDE_PERMISSION_MODE_VALUE"] = permission_mode
+            env_payload["CODESWARM_AWS_CONTAINER_IMAGE"] = image
+            env_payload["CODESWARM_AWS_BASE_PATH"] = self.base_path
+            env_payload["CODESWARM_AWS_JOB_ID"] = job_id
+            if claude_model:
+                env_payload["CODESWARM_CLAUDE_MODEL_VALUE"] = claude_model
+            if claude_cli_path:
+                env_payload["CODESWARM_CLAUDE_CLI_PATH_VALUE"] = claude_cli_path
+            if "fresh_thread_per_injection" in (launch_params or {}):
+                env_payload["CODESWARM_FRESH_THREAD_VALUE"] = "1" if fresh_thread_per_injection else "0"
+            script = r"""
+set -euo pipefail
+python3 - <<'PY'
+import json
+import os
+import subprocess
+
+base = os.environ["CODESWARM_AWS_BASE_PATH"]
+job = os.environ["CODESWARM_AWS_JOB_ID"]
+image = os.environ["CODESWARM_AWS_CONTAINER_IMAGE"]
+workers = json.loads(os.environ["WORKERS_JSON"])
+approval_policy = os.environ["CODESWARM_APPROVAL_POLICY"]
+permission_mode = os.environ["CODESWARM_CLAUDE_PERMISSION_MODE_VALUE"]
+claude_model = os.environ.get("CODESWARM_CLAUDE_MODEL_VALUE", "")
+claude_cli_path = os.environ.get("CODESWARM_CLAUDE_CLI_PATH_VALUE", "")
+fresh_thread = os.environ.get("CODESWARM_FRESH_THREAD_VALUE", "")
+
+anthropic_keys = [
+    key for key in os.environ
+    if key.startswith("ANTHROPIC_") or key.startswith("CLAUDE_CODE_")
+]
+for worker in workers:
+    wid = int(worker["node_id"])
+    name = str(worker["name"])
+    agent_workdir = f"{base}/runs/{job}/agent_{wid:02d}"
+    container_home = agent_workdir + "/.home"
+    uid = os.getuid()
+    gid = os.getgid()
+    preserve_env = list(anthropic_keys)
+    if os.environ.get("GITHUB_TOKEN"):
+        preserve_env.append("GITHUB_TOKEN")
+    if os.environ.get("GH_TOKEN"):
+        preserve_env.append("GH_TOKEN")
+    docker_cmd = ["sudo"]
+    if preserve_env:
+        docker_cmd.append("--preserve-env=" + ",".join(preserve_env))
+    docker_cmd.append("docker")
+    run_cmd = [
+        *docker_cmd, "run", "-d",
+        "--name", name,
+        "--user", str(uid) + ":" + str(gid),
+        "--workdir", agent_workdir,
+        "-v", f"{base}:{base}",
+        "-e", "CODESWARM_JOB_ID=" + job,
+        "-e", "CODESWARM_NODE_ID=" + str(wid),
+        "-e", "CODESWARM_BASE_DIR=" + base,
+        "-e", "HOME=" + container_home,
+        "-e", "CODESWARM_ASK_FOR_APPROVAL=" + approval_policy,
+        "-e", "CODESWARM_CLAUDE_PERMISSION_MODE=" + permission_mode,
+    ]
+    if claude_model:
+        run_cmd.extend(["-e", "CODESWARM_CLAUDE_MODEL=" + claude_model])
+    if claude_cli_path:
+        run_cmd.extend(["-e", "CODESWARM_CLAUDE_CLI_PATH=" + claude_cli_path])
+    if fresh_thread:
+        run_cmd.extend(["-e", "CODESWARM_FRESH_THREAD_PER_INJECTION=" + fresh_thread])
+    for key in anthropic_keys:
+        run_cmd.extend(["-e", key])
+    if os.environ.get("GITHUB_TOKEN"):
+        run_cmd.extend(["-e", "GITHUB_TOKEN"])
+    if os.environ.get("GH_TOKEN"):
+        run_cmd.extend(["-e", "GH_TOKEN"])
+    subprocess.run(["sudo", "docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    run_cmd.extend([image, "python3", f"{base}/agent/claude_worker.py"])
+    result = subprocess.run(run_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise SystemExit(f"Failed to launch Claude container worker {wid}: {detail}")
+PY
+"""
+            res = self._ssh_with_env(host, env_payload, script)
+            if res.returncode != 0:
+                raise RuntimeError(f"Failed to launch Claude container workers on host {host}:\n{res.stderr.strip() or res.stdout.strip()}")
+            workers.extend(
+                {
+                    "node_id": int(item["node_id"]),
+                    "host": host,
+                    "container_name": str(item["name"]),
+                    "container_engine": engine,
+                    "container_image": image,
+                }
+                for item in host_workers
+            )
+        return workers
+
+    def _stop_container_workers(self, workers: list[dict]) -> None:
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for worker in workers or []:
+            if not isinstance(worker, dict):
+                continue
+            host = str(worker.get("host") or "").strip()
+            name = str(worker.get("container_name") or "").strip()
+            engine = str(worker.get("container_engine") or "docker").strip().lower() or "docker"
+            if not host or not name:
+                continue
+            grouped.setdefault((host, engine), []).append(name)
+        for (host, engine), names in grouped.items():
+            if not names:
+                continue
+            engine_cmd = self._container_engine_command(engine)
+            joined = " ".join(self._quote(name) for name in names)
+            script = f"{engine_cmd} rm -f {joined} >/dev/null 2>&1 || true"
+            self._ssh(host, "/bin/bash -lc " + self._quote(script))
 
     def _start_codex_workers(self, host_assignments: dict[str, list[int]], job_id: str, launch_params: dict | None = None) -> None:
         approval_policy = self._approval_policy(launch_params)
@@ -1207,6 +1735,14 @@ done
         worker_mode = self._runtime_mode(launch_params)
         if worker_mode not in {"codex", "claude"}:
             raise RuntimeError(f"Unsupported AWS agent runtime: {worker_mode}")
+        execution_mode = self._execution_mode(launch_params)
+        if execution_mode not in {"native", "container"}:
+            raise RuntimeError(f"Unsupported AWS execution mode: {execution_mode}")
+        container_engine = self._container_engine(launch_params)
+        container_image = self._container_image(launch_params)
+        container_pull_policy = self._container_pull_policy(launch_params)
+        if execution_mode == "container":
+            self._container_engine_command(container_engine)
 
         instance_type = str(launch_params.get("instance_type") or self.aws_cfg.get("instance_type") or "").strip()
         if not instance_type:
@@ -1341,7 +1877,17 @@ done
             )
             _progress("bootstrap", "Syncing agent runtime files")
             self._sync_agent_dir(coordinator_host)
-            if worker_mode == "claude":
+            host_order = [coordinator_host] + worker_hosts
+            if execution_mode == "container":
+                _progress("bootstrap", "Syncing container build assets")
+                self._sync_container_assets(host_order)
+                _progress("bootstrap", f"Preparing {container_engine} runtime on AWS hosts")
+                for host in host_order:
+                    self._ensure_container_runtime(host, container_engine)
+                _progress("bootstrap", f"Ensuring worker image {container_image}")
+                for host in host_order:
+                    self._ensure_container_image(host, container_engine, container_image, container_pull_policy)
+            elif worker_mode == "claude":
                 _progress("bootstrap", "Installing Claude runtime tools")
                 self._ensure_claude_tools(coordinator_host, launch_params)
             else:
@@ -1356,7 +1902,6 @@ done
                 agents_bundle,
             )
 
-            host_order = [coordinator_host] + worker_hosts
             assignments: dict[str, list[int]] = {host: [] for host in host_order}
             worker_mapping = {}
             for worker_id in range(total_workers):
@@ -1372,10 +1917,27 @@ done
                 }
 
             _progress("bootstrap", "Launching worker processes")
+            worker_records: list[dict] = []
             if worker_mode == "claude":
-                self._start_claude_workers(assignments, job_id, launch_params)
+                if execution_mode == "container":
+                    worker_records = self._start_claude_container_workers(assignments, job_id, launch_params)
+                else:
+                    self._start_claude_workers(assignments, job_id, launch_params)
             else:
-                self._start_codex_workers(assignments, job_id, launch_params)
+                if execution_mode == "container":
+                    worker_records = self._start_codex_container_workers(assignments, job_id, launch_params)
+                else:
+                    self._start_codex_workers(assignments, job_id, launch_params)
+            if worker_records:
+                records_by_node = {int(item["node_id"]): item for item in worker_records if isinstance(item, dict) and "node_id" in item}
+                for node_id, mapping in worker_mapping.items():
+                    record = records_by_node.get(int(node_id))
+                    if record:
+                        mapping.update({
+                            "container_name": record.get("container_name"),
+                            "container_engine": record.get("container_engine"),
+                            "container_image": record.get("container_image"),
+                        })
 
             self._set_job_meta(job_id, {
                 "job_id": job_id,
@@ -1396,7 +1958,11 @@ done
                 "workers_per_node": workers_per_node,
                 "agent_runtime": worker_mode,
                 "worker_mode": worker_mode,
+                "execution_mode": execution_mode,
+                "container_engine": container_engine if execution_mode == "container" else None,
+                "container_image": container_image if execution_mode == "container" else None,
                 "worker_mapping": worker_mapping,
+                "workers": worker_records,
                 "ssh_user": self.ssh_user,
                 "ssh_private_key_path": self.ssh_private_key_path,
             })
@@ -1457,6 +2023,12 @@ done
             pass
 
         if instance_ids:
+            if str(meta.get("execution_mode") or "").strip().lower() == "container":
+                try:
+                    _progress("provider_terminate", "Stopping worker containers")
+                    self._stop_container_workers(meta.get("workers") if isinstance(meta.get("workers"), list) else [])
+                except Exception:
+                    pass
             _progress("provider_terminate", f"Requesting instance termination ({len(instance_ids)} instance(s))")
             self._aws(["ec2", "terminate-instances", "--instance-ids", *instance_ids])
             terminated, states = self._wait_instances_terminated(
@@ -1678,7 +2250,7 @@ rm -rf "$TMP"
         follower_path = Path(__file__).resolve().parent / "aws_follower.py"
         return subprocess.Popen(
             [
-                "python3",
+                sys.executable,
                 "-u",
                 str(follower_path),
                 "--state-file",

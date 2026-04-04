@@ -3,6 +3,8 @@
     "backend": "local",
     "workspace_root": "runs",
     "archive_root": "/tmp/archives",
+    "default_container_image": "ghcr.io/kalowery/codeswarm-local-worker:latest",
+    "default_container_pull_policy": "if_not_present",
     "claude_env_profiles": {
       "amd-llm-gateway": {
         "ANTHROPIC_API_KEY": "dummy",

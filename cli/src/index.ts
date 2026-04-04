@@ -598,6 +598,11 @@ function printProviders(providers: LaunchProvider[]) {
 }
 
 function getRepoRoot(): string {
+  const installRoot = process.env.CODESWARM_HOME;
+  if (installRoot) {
+    return path.resolve(installRoot);
+  }
+
   const cwd = process.cwd();
   const cwdLooksLikeRepo =
     existsSync(path.join(cwd, "router", "router.py")) &&
@@ -1547,9 +1552,7 @@ projectProgram
 // --- Web Stack Supervisor ---
 
 async function runWebStack(opts: any) {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  const repoRoot = path.resolve(__dirname, "../../");
+  const repoRoot = getRepoRoot();
 
   // routerPath no longer used (router launched as module)
   const routerModule = "router.router";
@@ -1710,9 +1713,28 @@ async function runWebStack(opts: any) {
     return false;
   }
 
-  function spawnWithPrefix(name: string, cmd: string, args: string[], cwd?: string) {
+  function findFrontendStandaloneEntry(root: string): string | null {
+    const directEntry = path.join(root, "server.js");
+    if (existsSync(directEntry)) {
+      return directEntry;
+    }
+    const nestedEntry = path.join(root, "web", "frontend", "server.js");
+    if (existsSync(nestedEntry)) {
+      return nestedEntry;
+    }
+    return null;
+  }
+
+  function spawnWithPrefix(
+    name: string,
+    cmd: string,
+    args: string[],
+    cwd?: string,
+    extraEnv?: NodeJS.ProcessEnv
+  ) {
     const child = spawn(cmd, args, {
       cwd,
+      env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -1801,8 +1823,13 @@ async function runWebStack(opts: any) {
       );
     }
   } else {
-    // Use non-watch mode in web stack to avoid restart flapping.
-    spawnWithPrefix("backend", "npm", ["run", "web"], backendPath);
+    const backendDistEntry = path.join(backendPath, "dist", "server.js");
+    if (existsSync(backendDistEntry)) {
+      spawnWithPrefix("backend", "node", [backendDistEntry], backendPath);
+    } else {
+      // Use non-watch mode in web stack to avoid restart flapping.
+      spawnWithPrefix("backend", "npm", ["run", "web"], backendPath);
+    }
   }
 
   // Frontend
@@ -1818,7 +1845,19 @@ async function runWebStack(opts: any) {
       );
     }
   } else {
-    spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
+    const frontendStandaloneRoot = path.join(frontendPath, ".next", "standalone");
+    const frontendStandaloneEntry = findFrontendStandaloneEntry(frontendStandaloneRoot);
+    if (frontendStandaloneEntry) {
+      spawnWithPrefix(
+        "frontend",
+        "node",
+        [frontendStandaloneEntry],
+        frontendPath,
+        { PORT: String(frontendPort), HOSTNAME: "127.0.0.1", NODE_ENV: "production" }
+      );
+    } else {
+      spawnWithPrefix("frontend", "npm", ["run", "dev"], frontendPath);
+    }
   }
 
   // Attempt to open browser (best-effort) once services are actually reachable.

@@ -3,6 +3,8 @@
     "module": "commonjs",
     "moduleResolution": "node",
     "target": "es2020",
+    "rootDir": "src",
+    "outDir": "dist",
     "lib": ["es2020"],
     "types": ["node"],
     "sourceMap": true,

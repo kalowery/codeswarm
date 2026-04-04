@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -14,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PROTOCOL = "codeswarm.router.v1"
+TMP_ROOT = ROOT / ".tmp"
 
 
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -102,12 +104,16 @@ class RouterClient:
         raise RuntimeError("Timed out waiting for router event")
 
 
-def make_repo_with_origin(prefix: str) -> tuple[Path, Path, Path]:
-    base_dir = Path(tempfile.mkdtemp(prefix=prefix))
+def make_repo_with_origin(prefix: str, root_dir: Path | None = None) -> tuple[Path, Path, Path]:
+    if root_dir is not None:
+        root_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root_dir)))
+    else:
+        base_dir = Path(tempfile.mkdtemp(prefix=prefix))
     origin_dir = base_dir / "origin.git"
     repo_dir = base_dir / "repo"
     run(["git", "init", "--bare", str(origin_dir)])
-    run(["git", "clone", str(origin_dir), str(repo_dir)])
+    run(["git", "clone", "--no-local", str(origin_dir), str(repo_dir)])
     run(["git", "-C", str(repo_dir), "config", "user.email", "smoke@example.test"])
     run(["git", "-C", str(repo_dir), "config", "user.name", "Codeswarm Runtime Smoke"])
     run(["git", "-C", str(repo_dir), "checkout", "-b", "main"])
@@ -155,7 +161,7 @@ def start_router(config_path: Path, state_file: Path, pid_file: Path, host: str,
         "CODESWARM_DISABLE_BEADS_SYNC": "1",
     }
     proc = subprocess.Popen(
-        ["python3", "-u", "-m", "router.router", "--config", str(config_path), "--daemon"],
+        [sys.executable, "-u", "-m", "router.router", "--config", str(config_path), "--daemon"],
         cwd=str(ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -178,7 +184,14 @@ def terminate_process(proc):
             pass
 
 
-def build_provider_params(runtime: str, role: str) -> tuple[str, dict]:
+def build_provider_params(
+    runtime: str,
+    role: str,
+    execution_mode: str = "native",
+    container_engine: str = "",
+    container_image: str = "",
+    container_pull_policy: str = "",
+) -> tuple[str, dict]:
     runtime_key = str(runtime).strip().lower()
     role_key = str(role).strip().lower()
     if role_key not in {"planner", "worker"}:
@@ -196,6 +209,15 @@ def build_provider_params(runtime: str, role: str) -> tuple[str, dict]:
         "approval_policy": "never",
         "fresh_thread_per_injection": True,
     }
+    execution_mode_key = str(execution_mode or "native").strip().lower() or "native"
+    params["execution_mode"] = execution_mode_key
+    if execution_mode_key == "container":
+        if container_engine:
+            params["container_engine"] = str(container_engine).strip().lower()
+        if container_image:
+            params["container_image"] = str(container_image).strip()
+        if container_pull_policy:
+            params["container_pull_policy"] = str(container_pull_policy).strip().lower()
     if runtime_key == "codex":
         params["native_auto_approve"] = True
     if runtime_key == "mock":
@@ -531,16 +553,26 @@ def main():
     parser = argparse.ArgumentParser(description="Run a local orchestrated project smoke across planner/worker runtimes.")
     parser.add_argument("--planner-runtime", default="codex", choices=["codex", "claude", "mock"])
     parser.add_argument("--worker-runtime", default="codex", choices=["codex", "claude", "mock"])
+    parser.add_argument("--planner-execution-mode", default="native", choices=["native", "container"])
+    parser.add_argument("--worker-execution-mode", default="native", choices=["native", "container"])
+    parser.add_argument("--planner-container-engine", default="")
+    parser.add_argument("--worker-container-engine", default="")
+    parser.add_argument("--planner-container-image", default="")
+    parser.add_argument("--worker-container-image", default="")
+    parser.add_argument("--planner-container-pull-policy", default="")
+    parser.add_argument("--worker-container-pull-policy", default="")
     parser.add_argument("--mode", default="both", choices=["direct", "planned", "both"])
     parser.add_argument("--config", default=str(ROOT / "configs" / "local.json"))
     parser.add_argument("--router-host", default=os.environ.get("CODESWARM_TEST_ROUTER_HOST", "127.0.0.1"))
     parser.add_argument("--router-port", type=int, default=int(os.environ.get("CODESWARM_TEST_ROUTER_PORT", "8941")))
     args = parser.parse_args()
 
-    temp_root = Path(tempfile.mkdtemp(prefix="codeswarm-runtime-smoke-"))
+    TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    temp_root = Path(tempfile.mkdtemp(prefix="codeswarm-runtime-smoke-", dir=str(TMP_ROOT)))
     config_path = write_temp_config(Path(args.config).resolve(), temp_root)
     state_file = temp_root / "router-state.json"
     pid_file = temp_root / "router.pid"
+    repo_root = temp_root / "runs" / "_smoke_repos"
     atexit.register(lambda: shutil.rmtree(temp_root, ignore_errors=True))
 
     router_proc = start_router(config_path, state_file, pid_file, args.router_host, args.router_port)
@@ -549,8 +581,22 @@ def main():
     client = RouterClient(args.router_host, args.router_port)
     atexit.register(client.close)
 
-    planner_provider_id, planner_provider_params = build_provider_params(args.planner_runtime, "planner")
-    worker_provider_id, worker_provider_params = build_provider_params(args.worker_runtime, "worker")
+    planner_provider_id, planner_provider_params = build_provider_params(
+        args.planner_runtime,
+        "planner",
+        execution_mode=args.planner_execution_mode,
+        container_engine=args.planner_container_engine,
+        container_image=args.planner_container_image,
+        container_pull_policy=args.planner_container_pull_policy,
+    )
+    worker_provider_id, worker_provider_params = build_provider_params(
+        args.worker_runtime,
+        "worker",
+        execution_mode=args.worker_execution_mode,
+        container_engine=args.worker_container_engine,
+        container_image=args.worker_container_image,
+        container_pull_policy=args.worker_container_pull_policy,
+    )
 
     planner_request = client.send("swarm_launch", {
         "provider_id": planner_provider_id,
@@ -585,11 +631,11 @@ def main():
 
     label = f"{args.planner_runtime}-{args.worker_runtime}"
     if args.mode in ("direct", "both"):
-        direct_base, _direct_origin, direct_repo = make_repo_with_origin("codeswarm-runtime-direct-")
+        direct_base, _direct_origin, direct_repo = make_repo_with_origin("codeswarm-runtime-direct-", root_dir=repo_root)
         direct_verify = Path(tempfile.mkdtemp(prefix="codeswarm-runtime-direct-verify-")) / "repo"
         atexit.register(lambda path=direct_base: shutil.rmtree(path, ignore_errors=True))
         atexit.register(lambda path=direct_verify.parent: shutil.rmtree(path, ignore_errors=True))
-        run(["git", "clone", str(direct_repo.parent / "origin.git"), str(direct_verify)])
+        run(["git", "clone", "--no-local", str(direct_repo.parent / "origin.git"), str(direct_verify)])
         results["modes"]["direct"] = run_direct_project(
             client,
             state_file,
@@ -600,11 +646,11 @@ def main():
         )
 
     if args.mode in ("planned", "both"):
-        planned_base, _planned_origin, planned_repo = make_repo_with_origin("codeswarm-runtime-planned-")
+        planned_base, _planned_origin, planned_repo = make_repo_with_origin("codeswarm-runtime-planned-", root_dir=repo_root)
         planned_verify = Path(tempfile.mkdtemp(prefix="codeswarm-runtime-planned-verify-")) / "repo"
         atexit.register(lambda path=planned_base: shutil.rmtree(path, ignore_errors=True))
         atexit.register(lambda path=planned_verify.parent: shutil.rmtree(path, ignore_errors=True))
-        run(["git", "clone", str(planned_repo.parent / "origin.git"), str(planned_verify)])
+        run(["git", "clone", "--no-local", str(planned_repo.parent / "origin.git"), str(planned_verify)])
         results["modes"]["planned"] = run_planned_project(
             client,
             state_file,

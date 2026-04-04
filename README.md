@@ -13,19 +13,51 @@ Current implementation includes two complementary operating modes:
 - ad hoc swarm operation with direct prompt routing
 - opt-in orchestrated projects with planner-generated task graphs, deterministic worker dispatch, live project/task UI, and project resume
 
-## Install via curl | bash
+## Install a Release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
 ```
 
+That installer downloads the latest published release bundle from GitHub Releases, installs the bundled Python wheel into a private virtualenv, installs CLI/backend runtime dependencies, and writes a `codeswarm` launcher into `~/.codeswarm/bin`.
+
+To pin installation to a specific published release, fetch the installer from that tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/v0.1.2/install-codeswarm.sh | bash
+```
+
 Optional installer overrides:
 
-- `CODESWARM_REPO_URL`
-- `CODESWARM_BRANCH`
 - `CODESWARM_INSTALL_DIR` (default: `~/.codeswarm`)
+- `CODESWARM_RELEASE_URL`
+- `CODESWARM_RELEASE_ARCHIVE`
+- `CODESWARM_INSTALL_MODE=release|source`
+- `CODESWARM_REPO_URL` and `CODESWARM_BRANCH` for source-mode installs only
 
 ## Quick Start (Local)
+
+1. Install a published release
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
+```
+
+2. Start the full web stack
+
+```bash
+codeswarm web --config ~/.codeswarm/configs/local.json
+```
+
+This starts:
+
+- Router on `127.0.0.1:8765`
+- Backend on `http://localhost:4000`
+- Frontend on `http://localhost:3000`
+
+## Bootstrap from a Git Clone
+
+Use this path for development, branch testing, or when you want the working tree directly on disk.
 
 1. Clone
 
@@ -40,12 +72,28 @@ cd codeswarm
 ./bootstrap.sh
 ```
 
-Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, links the `codeswarm` CLI, and checks for optional Beads CLI (`bd`) with optional install prompt.
+`bootstrap.sh` installs Node `24.13.0`, workspace dependencies, builds the frontend/backend/CLI artifacts, links the `codeswarm` CLI, and checks for optional Beads CLI (`bd`) with an optional install prompt.
+It also installs the Python package in editable mode so `router`, `agent`, `slurm`, and related modules resolve directly from the git checkout.
+
 If runtime packages are missing after branch switches or large git updates, run:
 
 ```bash
 npm install --workspaces
 ```
+
+Then rebuild the JS artifacts if needed:
+
+```bash
+npm run build:all
+```
+
+For a package-style Python install without the full bootstrap flow:
+
+```bash
+python3 -m pip install --user --break-system-packages -e .
+```
+
+If you are using a virtual environment, drop `--user --break-system-packages`.
 
 3. Use local config
 
@@ -69,13 +117,7 @@ Note: `configs/combined.json` is intentionally treated as a local operator file 
 codeswarm web --config configs/local.json
 ```
 
-This starts:
-
-- Router on `127.0.0.1:8765`
-- Backend on `http://localhost:4000`
-- Frontend on `http://localhost:3000`
-
-You can also run components manually:
+You can also run components manually from the checkout:
 
 ```bash
 python3 -u -m router.router --config configs/local.json --daemon
@@ -137,7 +179,7 @@ Recommended local launch presets for project work:
 - `local-orchestrated-planner`
 - `local-orchestrated-worker`
 
-These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and fresh-thread-per-injection behavior. The same launch path now also supports `worker_mode=claude`.
+These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and orchestrated-worker-safe thread behavior. The same launch path now also supports `worker_mode=claude`.
 
 ## Codex Sandbox and Approval
 
@@ -160,10 +202,9 @@ If Codex is left in read-only or on-request modes, commands may execute inconsis
 
 ## Claude Runtime
 
-Claude is supported as a local and AWS worker runtime through the Anthropic Claude Code SDK/CLI path.
+Claude is supported as a local, AWS, and Slurm worker runtime through the Anthropic Claude Code SDK/CLI path.
 
-- current support scope is local swarms, AWS swarms, and local orchestrated planner/worker runs
-- remote Claude launch for Slurm is still deferred
+- current support scope is local, AWS, and Slurm swarms, plus orchestrated project flows where the provider supports repository preparation
 - select `worker_mode=claude` in the launch modal or provider defaults
 - `approval_policy=never` maps to Claude bypass mode
 - non-`never` approval policies route tool permissions through the normal Codeswarm approval UI
@@ -192,6 +233,9 @@ Auth selection is therefore deterministic:
 - placeholder missing: swarm launch fails rather than silently running with incomplete auth
 
 This means Codeswarm will use plain `ANTHROPIC_API_KEY`-style environment configuration by default, and can also route Claude through the AMD LLM gateway when a profile injects gateway-specific values.
+
+For containerized local workers, the default image is now the published GHCR image `ghcr.io/kalowery/codeswarm-local-worker:latest`.
+If that image is not locally present, Codeswarm will try to pull it first and fall back to building from [local-worker.Dockerfile](/Users/klowery/codeswarm/docker/local-worker.Dockerfile) when a checkout is available.
 
 ## Model Pricing and Billing Tables
 
