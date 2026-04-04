@@ -1489,7 +1489,7 @@ def _resolve_claude_profile_model(config, profile_name, provider_backend=None):
                 candidates.append(active_cfg)
             else:
                 candidates.append(cluster_cfg)
-        for backend_key in ("local", "aws"):
+        for backend_key in ("local", "aws", "slurm"):
             backend_cfg = cluster_cfg.get(backend_key) or {}
             if isinstance(backend_cfg, dict):
                 candidates.append(backend_cfg)
