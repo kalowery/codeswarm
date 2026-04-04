@@ -210,7 +210,10 @@ def create_temp_repo(owner: str) -> tuple[str, dict]:
 
 
 def delete_repo(repo_name: str) -> None:
-    run(["gh", "repo", "delete", repo_name, "--yes"], check=False)
+    completed = run(["gh", "repo", "delete", repo_name, "--yes"], check=False)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"Failed to delete temporary repo {repo_name}: {detail}")
 
 
 def clone_repo(clone_source: str) -> Path:
@@ -382,6 +385,7 @@ def main():
     router_proc = None
     client = None
     swarm_id = ""
+    cleanup_errors: list[str] = []
     try:
         repo_name, repo_meta = create_temp_repo(args.github_owner)
         clone_source = str(repo_meta.get("sshUrl") or "").strip() or f"git@github.com:{repo_name}.git"
@@ -492,9 +496,14 @@ def main():
             client.close()
         terminate_process(router_proc)
         if repo_name and not args.keep_repo:
-            delete_repo(repo_name)
+            try:
+                delete_repo(repo_name)
+            except Exception as e:
+                cleanup_errors.append(str(e))
         if args.keep_artifacts:
             print(f"artifacts={tmp_root}", flush=True)
+        if cleanup_errors:
+            raise RuntimeError("; ".join(cleanup_errors))
 
 
 if __name__ == "__main__":
