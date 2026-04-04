@@ -156,7 +156,26 @@ ensure_path_in_shell_startup() {
   done
 }
 
+ensure_bash_profile_sources_bashrc() {
+  local profile="$HOME/.bash_profile"
+  local marker="# Added by Codeswarm bootstrap: load ~/.bashrc for login shells"
+  [ -f "$profile" ] || touch "$profile"
+  if grep -F "$marker" "$profile" >/dev/null 2>&1; then
+    return 0
+  fi
+  cat >>"$profile" <<'EOF'
+
+# Added by Codeswarm bootstrap: load ~/.bashrc for login shells
+if [ -f "$HOME/.bashrc" ]; then
+  . "$HOME/.bashrc"
+fi
+EOF
+  log "Updated $profile to source ~/.bashrc"
+}
+
 log "Starting environment checks"
+
+ensure_bash_profile_sources_bashrc
 
 # --- Ensure nvm ---
 if [ -z "${HOME:-}" ]; then
