@@ -21,6 +21,11 @@ from .claude_env import (
     resolve_claude_profile_env,
 )
 
+DEFAULT_LOCAL_CONTAINER_IMAGE = str(
+    os.environ.get("CODESWARM_DEFAULT_LOCAL_CONTAINER_IMAGE")
+    or "ghcr.io/kalowery/codeswarm-local-worker:latest"
+).strip()
+
 
 class LocalProvider(ClusterProvider):
     """
@@ -91,6 +96,232 @@ class LocalProvider(ClusterProvider):
     def _resolve_claude_env_overrides(self, launch_params: dict, base_env: dict[str, str]) -> dict[str, str]:
         return resolve_claude_env_overrides(launch_params, base_env)
 
+    def _execution_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("execution_mode") or self.config.get("default_execution_mode") or "native").strip().lower() or "native"
+
+    def _container_engine(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_engine") or self.config.get("default_container_engine") or "docker").strip().lower() or "docker"
+
+    def _container_image(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        explicit = str(params.get("container_image") or self.config.get("default_container_image") or "").strip()
+        return explicit or DEFAULT_LOCAL_CONTAINER_IMAGE
+
+    def _container_pull_policy(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_pull_policy") or self.config.get("default_container_pull_policy") or "if_not_present").strip().lower() or "if_not_present"
+
+    def _container_cli(self, engine: str) -> str:
+        binary = shutil.which(str(engine))
+        if not binary:
+            raise RuntimeError(f"Local container engine is unavailable on this host: {engine}")
+        return binary
+
+    def _container_image_exists(self, engine: str, image: str) -> bool:
+        result = subprocess.run(
+            [self._container_cli(engine), "image", "inspect", image],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+
+    def _ensure_local_container_image(self, engine: str, image: str, pull_policy: str) -> None:
+        engine_bin = self._container_cli(engine)
+        if image == DEFAULT_LOCAL_CONTAINER_IMAGE:
+            exists = self._container_image_exists(engine, image)
+            if pull_policy == "never" and not exists:
+                raise RuntimeError(f"Required local container image is missing: {image}")
+            if pull_policy == "always" or not exists:
+                pulled = False
+                pull_result = subprocess.run(
+                    [engine_bin, "pull", image],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if pull_result.returncode == 0:
+                    pulled = True
+                if pulled:
+                    return
+                repo_root = Path(__file__).resolve().parents[2]
+                dockerfile = repo_root / "docker" / "local-worker.Dockerfile"
+                if not dockerfile.exists():
+                    detail = pull_result.stderr.strip() or pull_result.stdout.strip()
+                    raise RuntimeError(
+                        f"Missing local worker Dockerfile: {dockerfile}. "
+                        f"Container pull also failed for '{image}': {detail}"
+                    )
+                result = subprocess.run(
+                    [engine_bin, "build", "-t", image, "-f", str(dockerfile), str(repo_root)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip()
+                    raise RuntimeError(f"Failed to build local worker container image '{image}': {detail}")
+            return
+
+        exists = self._container_image_exists(engine, image)
+        if pull_policy == "never":
+            if not exists:
+                raise RuntimeError(f"Required container image is missing locally: {image}")
+            return
+        if pull_policy == "always" or not exists:
+            result = subprocess.run(
+                [engine_bin, "pull", image],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(f"Failed to pull container image '{image}': {detail}")
+
+    def _container_name(self, job_id: str, node_id: int) -> str:
+        safe_job = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(job_id))
+        return f"codeswarm-{safe_job}-{int(node_id):02d}"
+
+    def _worker_script_name(self, worker_mode: str) -> str:
+        if worker_mode == "mock":
+            return "mock_worker.py"
+        if worker_mode == "claude":
+            return "claude_worker.py"
+        return "codex_worker.py"
+
+    def _is_container_worker(self, worker: dict) -> bool:
+        return isinstance(worker.get("container_id"), str) and bool(str(worker.get("container_id")).strip())
+
+    def _container_is_running(self, engine: str, container_id: str) -> bool:
+        result = subprocess.run(
+            [self._container_cli(engine), "inspect", "-f", "{{.State.Running}}", str(container_id)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        return str(result.stdout or "").strip().lower() == "true"
+
+    def _remove_container(self, engine: str, container_id: str) -> None:
+        subprocess.run(
+            [self._container_cli(engine), "rm", "-f", str(container_id)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+    def _container_mounts(self) -> list[tuple[Path, str, str]]:
+        repo_root = Path(__file__).resolve().parents[2].resolve()
+        workspace_root = self.workspace_root.resolve()
+        repo_mode = "ro"
+        try:
+            workspace_root.relative_to(repo_root)
+            repo_mode = "rw"
+        except Exception:
+            pass
+        mounts: list[tuple[Path, str, str]] = [
+            (repo_root, str(repo_root), repo_mode),
+        ]
+        if workspace_root != repo_root:
+            mounts.append((workspace_root, str(workspace_root), "rw"))
+        home = Path.home()
+        optional_mounts = [
+            (home / ".codex", "/root/.codex", "ro"),
+            (home / ".ssh", "/root/.ssh", "ro"),
+            (home / ".gitconfig", "/root/.gitconfig", "ro"),
+            (home / ".git-credentials", "/root/.git-credentials", "ro"),
+        ]
+        for host_path, container_path, mode in optional_mounts:
+            if host_path.exists():
+                mounts.append((host_path.resolve(), container_path, mode))
+        return mounts
+
+    def _container_host_path_mode(self, value: str) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            candidate = Path(text).expanduser().resolve()
+        except Exception:
+            return None
+        best_mode: str | None = None
+        best_depth = -1
+        for host_path, _container_path, mode in self._container_mounts():
+            try:
+                resolved_host = host_path.resolve()
+                candidate.relative_to(resolved_host)
+            except Exception:
+                continue
+            depth = len(resolved_host.parts)
+            if depth > best_depth:
+                best_depth = depth
+                best_mode = mode
+        return best_mode
+
+    def _start_container_worker(
+        self,
+        engine: str,
+        image: str,
+        job_id: str,
+        node_id: int,
+        agent_dir: Path,
+        worker_script: Path,
+        env: dict[str, str],
+    ) -> str:
+        engine_bin = self._container_cli(engine)
+        container_name = self._container_name(job_id, node_id)
+        subprocess.run(
+            [engine_bin, "rm", "-f", container_name],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        cmd = [
+            engine_bin,
+            "run",
+            "-d",
+            "--name",
+            container_name,
+            "--workdir",
+            str(agent_dir.resolve()),
+        ]
+        for key, value in sorted(env.items()):
+            cmd.extend(["-e", f"{key}={value}"])
+        for host_path, container_path, mode in self._container_mounts():
+            cmd.extend(["-v", f"{host_path}:{container_path}:{mode}"])
+        cmd.extend(
+            [
+                image,
+                "python3",
+                str(worker_script.resolve()),
+            ]
+        )
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(f"Failed to launch local container worker {node_id}: {detail}")
+        container_id = str(result.stdout or "").strip()
+        if not container_id:
+            raise RuntimeError(f"Container engine did not return a container id for worker {node_id}")
+        return container_id
+
     def _job_metadata_path(self, job_id: str) -> Path:
         return self._job_dir(job_id) / ".codeswarm-job.json"
 
@@ -137,12 +368,21 @@ class LocalProvider(ClusterProvider):
         for item in raw_workers:
             if not isinstance(item, dict):
                 continue
-            pid = item.get("pid")
             node_id = item.get("node_id")
+            if not isinstance(node_id, int) or node_id < 0:
+                continue
+            container_id = item.get("container_id")
+            if isinstance(container_id, str) and container_id.strip():
+                workers.append({
+                    "container_id": container_id.strip(),
+                    "container_engine": str(item.get("container_engine") or "docker").strip().lower() or "docker",
+                    "container_name": str(item.get("container_name") or "").strip() or None,
+                    "node_id": node_id,
+                })
+                continue
+            pid = item.get("pid")
             start_ticks = item.get("start_ticks")
             if not isinstance(pid, int) or pid <= 0:
-                continue
-            if not isinstance(node_id, int) or node_id < 0:
                 continue
             if start_ticks is not None and (not isinstance(start_ticks, int) or start_ticks <= 0):
                 continue
@@ -185,12 +425,18 @@ class LocalProvider(ClusterProvider):
             return ""
 
     def _is_worker_alive(self, worker: dict, job_id: str | None = None) -> bool:
-        pid = worker.get("pid")
-        start_ticks = worker.get("start_ticks")
         node_id = worker.get("node_id")
         if isinstance(job_id, str) and job_id and isinstance(node_id, int) and node_id >= 0:
             if self._has_fresh_worker_heartbeat(job_id, node_id):
                 return True
+        if self._is_container_worker(worker):
+            return self._container_is_running(
+                str(worker.get("container_engine") or "docker").strip().lower() or "docker",
+                str(worker.get("container_id") or "").strip(),
+            )
+
+        pid = worker.get("pid")
+        start_ticks = worker.get("start_ticks")
 
         # On non-Linux hosts, pid-only recovery is too weak because we cannot
         # reliably disambiguate pid reuse without /proc start ticks. Require a
@@ -343,6 +589,15 @@ class LocalProvider(ClusterProvider):
         value = str(result.stdout or "").strip()
         return value or None
 
+    @staticmethod
+    def _is_local_path_like(value: str) -> bool:
+        text = str(value or "").strip()
+        if not text:
+            return False
+        if "://" in text or text.startswith("git@"):
+            return False
+        return Path(text).expanduser().exists() or text.startswith("/") or text.startswith("~")
+
     def _resolved_clone_source(self, source: str) -> tuple[str, str | None]:
         github_repo = self._parse_github_repo_ref(source)
         clone_source = str(source)
@@ -367,8 +622,12 @@ class LocalProvider(ClusterProvider):
 
     def _clone_repository(self, source: str, target: Path) -> None:
         clone_source, inherited_origin = self._resolved_clone_source(source)
+        clone_cmd = ["git", "clone"]
+        if self._is_local_path_like(clone_source):
+            clone_cmd.append("--no-local")
+        clone_cmd.extend([clone_source, str(target)])
         result = subprocess.run(
-            ["git", "clone", clone_source, str(target)],
+            clone_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -483,17 +742,25 @@ class LocalProvider(ClusterProvider):
             or launch_params.get("worker_mode")
             or "codex"
         ).strip().lower()
+        execution_mode = self._execution_mode(launch_params)
+        if execution_mode not in {"native", "container"}:
+            raise RuntimeError(f"Unsupported local execution mode: {execution_mode}")
+        container_engine = self._container_engine(launch_params)
+        container_image = self._container_image(launch_params)
+        container_pull_policy = self._container_pull_policy(launch_params)
         approval_policy = str(launch_params.get("approval_policy") or "never").strip().lower() or "never"
         sandbox_mode = str(
             launch_params.get("sandbox_mode") or self._default_worker_sandbox_mode()
         ).strip() or self._default_worker_sandbox_mode()
         if worker_mode not in {"codex", "claude", "mock"}:
             raise RuntimeError(f"Unsupported local agent runtime: {worker_mode}")
-        if worker_mode == "claude":
+        if worker_mode == "claude" and execution_mode != "container":
             if importlib.util.find_spec("claude_agent_sdk") is None:
                 raise RuntimeError(
                     "Claude runtime requires the Python package 'claude-agent-sdk' to be installed on the launch host"
                 )
+        if execution_mode == "container":
+            self._ensure_local_container_image(container_engine, container_image, container_pull_policy)
 
         for i in range(nodes):
             agent_index = f"{i:02d}"
@@ -503,13 +770,7 @@ class LocalProvider(ClusterProvider):
             if worker_mode == "codex":
                 self._write_worker_codex_config(agent_dir, launch_params)
 
-            # Locate worker relative to repository root
-            if worker_mode == "mock":
-                worker_name = "mock_worker.py"
-            elif worker_mode == "claude":
-                worker_name = "claude_worker.py"
-            else:
-                worker_name = "codex_worker.py"
+            worker_name = self._worker_script_name(worker_mode)
             worker_path = Path(__file__).resolve().parents[2] / "agent" / worker_name
 
             env = os.environ.copy()
@@ -527,7 +788,7 @@ class LocalProvider(ClusterProvider):
             if "native_auto_approve" in launch_params:
                 env["CODESWARM_NATIVE_AUTO_APPROVE"] = "1" if bool(launch_params.get("native_auto_approve")) else "0"
             if worker_mode == "claude":
-                env.setdefault("CLAUDE_CONFIG_DIR", str(agent_dir / ".claude"))
+                env.setdefault("CLAUDE_CONFIG_DIR", str(agent_dir.resolve() / ".claude"))
                 env.update(self._resolve_claude_profile_env(launch_params, env))
                 env.update(self._resolve_claude_env_overrides(launch_params, env))
                 claude_model = str(launch_params.get("claude_model") or "").strip()
@@ -550,26 +811,42 @@ class LocalProvider(ClusterProvider):
                     except Exception:
                         parsed_mock_delay_ms = 0
                     env["CODESWARM_MOCK_DELAY_MS"] = str(parsed_mock_delay_ms)
-
-            p = subprocess.Popen(
-                ["python3", str(worker_path)],
-                cwd=str(agent_dir),
-                env=env,
-            )
-
-            start_ticks = self._read_proc_start_ticks(int(p.pid))
-            if sys.platform.startswith("linux"):
-                if not isinstance(start_ticks, int) or start_ticks <= 0:
-                    raise RuntimeError(f"Unable to capture worker start time for pid {p.pid}")
+            if execution_mode == "container":
+                container_id = self._start_container_worker(
+                    container_engine,
+                    container_image,
+                    job_id,
+                    i,
+                    agent_dir,
+                    worker_path,
+                    env,
+                )
+                workers.append({
+                    "container_id": container_id,
+                    "container_engine": container_engine,
+                    "container_name": self._container_name(job_id, i),
+                    "node_id": i,
+                })
             else:
-                # /proc is Linux-specific; persist pid only on non-Linux hosts.
-                start_ticks = None
+                p = subprocess.Popen(
+                    [sys.executable, str(worker_path)],
+                    cwd=str(agent_dir),
+                    env=env,
+                )
 
-            workers.append({
-                "pid": int(p.pid),
-                "node_id": i,
-                "start_ticks": start_ticks,
-            })
+                start_ticks = self._read_proc_start_ticks(int(p.pid))
+                if sys.platform.startswith("linux"):
+                    if not isinstance(start_ticks, int) or start_ticks <= 0:
+                        raise RuntimeError(f"Unable to capture worker start time for pid {p.pid}")
+                else:
+                    # /proc is Linux-specific; persist pid only on non-Linux hosts.
+                    start_ticks = None
+
+                workers.append({
+                    "pid": int(p.pid),
+                    "node_id": i,
+                    "start_ticks": start_ticks,
+                })
 
         self.jobs[job_id] = workers
         self._write_job_metadata(job_id, {
@@ -577,6 +854,9 @@ class LocalProvider(ClusterProvider):
             "provider": "local",
             "agent_runtime": worker_mode,
             "worker_mode": worker_mode,
+            "execution_mode": execution_mode,
+            "container_engine": container_engine if execution_mode == "container" else None,
+            "container_image": container_image if execution_mode == "container" else None,
             "workers": workers,
             "node_count": int(nodes),
             "launched_at": time.time(),
@@ -591,6 +871,12 @@ class LocalProvider(ClusterProvider):
             metadata = self._read_job_metadata(job_id) or {}
             workers = self._normalize_worker_records(metadata.get("workers"))
         for worker in workers or []:
+            if self._is_container_worker(worker):
+                self._remove_container(
+                    str(worker.get("container_engine") or "docker").strip().lower() or "docker",
+                    str(worker.get("container_id") or "").strip(),
+                )
+                continue
             pid = worker.get("pid")
             if not isinstance(pid, int) or pid <= 0:
                 continue
@@ -675,11 +961,22 @@ class LocalProvider(ClusterProvider):
         github_repo = self._parse_github_repo_ref(source_text)
         source_path = Path(source_text).expanduser()
         source_is_local = source_path.exists()
+        metadata = self._read_job_metadata(job_id) or {}
+        execution_mode = str(metadata.get("execution_mode") or "native").strip().lower() or "native"
+        staged_source: Path | None = None
         if source_is_local:
             source = source_path.resolve()
             if not (source / ".git").exists():
                 raise RuntimeError(f"Repository path is not a git repository: {source}")
-            clone_source = str(source)
+            if execution_mode == "container":
+                staged_source = (self.workspace_root / "project_sources" / job_id / "source").resolve()
+                if staged_source.exists():
+                    self._remove_path(staged_source)
+                staged_source.parent.mkdir(parents=True, exist_ok=True)
+                self._clone_repository(str(source), staged_source)
+                clone_source = str(staged_source)
+            else:
+                clone_source = str(source)
             source_kind = "local_path"
         else:
             if not source_text:
@@ -695,6 +992,9 @@ class LocalProvider(ClusterProvider):
         branch_name = str(branch).strip() if isinstance(branch, str) and str(branch).strip() else None
         resolved_clone_source, inherited_origin = self._resolved_clone_source(clone_source)
         desired_origin = inherited_origin or resolved_clone_source
+        if execution_mode == "container" and source_is_local and inherited_origin and self._is_local_path_like(inherited_origin):
+            if self._container_host_path_mode(inherited_origin) != "rw":
+                desired_origin = resolved_clone_source
 
         for worker in workers:
             node_id = worker.get("node_id")
@@ -742,8 +1042,10 @@ class LocalProvider(ClusterProvider):
 
         self._write_job_metadata(job_id, {
             "prepared_repo": {
-                "source": clone_source,
+                "source": str(source_path.resolve()) if source_is_local else clone_source,
                 "source_kind": source_kind,
+                "source_path_staged": str(staged_source) if staged_source else None,
+                "origin": desired_origin,
                 "branch": branch_name,
                 "subdir": subdir,
                 "worker_paths": prepared_paths,
@@ -751,8 +1053,10 @@ class LocalProvider(ClusterProvider):
         })
         return {
             "mode": "per_agent_clone",
-            "source": clone_source,
+            "source": str(source_path.resolve()) if source_is_local else clone_source,
             "source_kind": source_kind,
+            "source_path_staged": str(staged_source) if staged_source else None,
+            "origin": desired_origin,
             "branch": branch_name,
             "subdir": subdir,
             "worker_paths": prepared_paths,
@@ -832,7 +1136,7 @@ class LocalProvider(ClusterProvider):
         outbox_dir.mkdir(parents=True, exist_ok=True)
 
         return subprocess.Popen(
-            ["python3", str(follower_path), str(outbox_dir)],
+            [sys.executable, str(follower_path), str(outbox_dir)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )

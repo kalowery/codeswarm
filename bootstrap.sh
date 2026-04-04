@@ -43,6 +43,7 @@ NODE_MAJOR_REQUIRED=18
 FORCE_NVM="${CODESWARM_BOOTSTRAP_FORCE_NVM:-0}"
 INSTALL_BEADS_POLICY="${CODESWARM_BOOTSTRAP_INSTALL_BEADS:-ask}"
 BEADS_VERSION="${CODESWARM_BEADS_VERSION:-latest}"
+PYTHON_BIN=""
 
 log() {
   echo "[bootstrap] $*"
@@ -101,6 +102,24 @@ should_install_beads() {
 
 node_major() {
   node -p 'process.versions.node.split(".")[0]'
+}
+
+pick_python() {
+  local candidate
+  for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+    then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 find_beads_cli() {
@@ -236,13 +255,14 @@ echo "✅ Using Node $(node -v)"
 echo "✅ Using npm $(npm -v)"
 
 # --- Ensure Python 3.10+ ---
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "❌ python3 not found in PATH. Install Python 3.10+."
-  echo "   RHEL/Fedora example: sudo dnf install -y python3"
+PYTHON_BIN="$(pick_python || true)"
+if [ -z "$PYTHON_BIN" ]; then
+  echo "❌ No Python 3.10+ interpreter found in PATH."
+  echo "Install Python 3.10+ and rerun bootstrap."
   exit 1
 fi
 
-PY_VERSION=$(python3 - <<'PY'
+PY_VERSION=$("$PYTHON_BIN" - <<'PY'
 import sys
 print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
@@ -257,7 +277,26 @@ if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 10 ]; }
   exit 1
 fi
 
-echo "✅ Using Python $(python3 --version)"
+echo "✅ Using Python $("$PYTHON_BIN" --version)"
+
+if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+  echo "❌ Python pip is not available."
+  echo "Install pip for your Python 3.10+ interpreter, then rerun bootstrap."
+  exit 1
+fi
+
+echo "📦 Installing Codeswarm Python package..."
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+  "$PYTHON_BIN" -m pip install -e .
+else
+  "$PYTHON_BIN" -m pip install --user --break-system-packages -e .
+  PYTHON_USER_BIN="$("$PYTHON_BIN" -m site --user-base)/bin"
+  case ":$PATH:" in
+    *":$PYTHON_USER_BIN:"*) ;;
+    *) export PATH="$PYTHON_USER_BIN:$PATH" ;;
+  esac
+  ensure_path_in_shell_startup "$PYTHON_USER_BIN"
+fi
 
 
 # --- Install dependencies ---

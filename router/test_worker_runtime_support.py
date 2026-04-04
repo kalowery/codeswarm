@@ -1,11 +1,13 @@
 import tempfile
 import unittest
 import subprocess
+import sys
 from unittest.mock import patch
 from pathlib import Path
 
 from agent import claude_worker as claude_worker_module
 from router import router as router_module
+from router.providers import local as local_module
 from router.providers.factory import _default_launch_fields_for_backend, get_provider_specs
 from router.providers.aws import AwsProvider
 from router.providers.local import LocalProvider
@@ -24,6 +26,18 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         options = worker_mode_field.get("options") or []
         values = {option.get("value") for option in options if isinstance(option, dict)}
         self.assertIn("claude", values)
+        execution_mode_field = next((field for field in fields if field.get("key") == "execution_mode"), None)
+        self.assertIsNotNone(execution_mode_field)
+        self.assertIn(
+            "container",
+            {option.get("value") for option in (execution_mode_field.get("options") or []) if isinstance(option, dict)},
+        )
+        container_engine_field = next((field for field in fields if field.get("key") == "container_engine"), None)
+        self.assertIsNotNone(container_engine_field)
+        self.assertIn(
+            "docker",
+            {option.get("value") for option in (container_engine_field.get("options") or []) if isinstance(option, dict)},
+        )
 
     def test_aws_launch_fields_include_claude_runtime(self):
         fields = _default_launch_fields_for_backend("aws", {})
@@ -40,6 +54,9 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         self.assertIn("fresh_thread_per_injection", field_keys)
         self.assertIn("claude_cli_path", field_keys)
         self.assertIn("claude_permission_mode", field_keys)
+        self.assertIn("execution_mode", field_keys)
+        self.assertIn("container_engine", field_keys)
+        self.assertIn("container_image", field_keys)
 
     def test_slurm_launch_fields_include_claude_runtime(self):
         fields = _default_launch_fields_for_backend("slurm", {})
@@ -58,6 +75,33 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         self.assertIn("claude_cli_path", field_keys)
         self.assertIn("claude_permission_mode", field_keys)
         self.assertIn("pricing_model", field_keys)
+        self.assertIn("execution_mode", field_keys)
+        self.assertIn("container_engine", field_keys)
+        self.assertIn("container_image", field_keys)
+        container_engine_field = next((field for field in fields if field.get("key") == "container_engine"), None)
+        self.assertIsNotNone(container_engine_field)
+        self.assertIn(
+            "apptainer",
+            {option.get("value") for option in (container_engine_field.get("options") or []) if isinstance(option, dict)},
+        )
+
+    def test_launch_fields_use_configured_container_engine_defaults(self):
+        fields = _default_launch_fields_for_backend(
+            "slurm",
+            {
+                "default_execution_mode": "container",
+                "default_container_engine": "apptainer",
+                "supported_container_engines": ["apptainer", "docker"],
+            },
+        )
+        execution_mode_field = next((field for field in fields if field.get("key") == "execution_mode"), None)
+        container_engine_field = next((field for field in fields if field.get("key") == "container_engine"), None)
+        self.assertEqual(execution_mode_field.get("default"), "container")
+        self.assertEqual(container_engine_field.get("default"), "apptainer")
+        self.assertEqual(
+            {option.get("value") for option in (container_engine_field.get("options") or []) if isinstance(option, dict)},
+            {"apptainer", "docker"},
+        )
 
     def test_local_provider_allows_claude_with_interactive_approval_policy(self):
         captured = {}
@@ -97,6 +141,140 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                             "approval_policy": "never",
                         },
                     )
+
+    def test_local_provider_launches_mock_worker_in_container_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalProvider({"workspace_root": temp_dir})
+            with patch.object(provider, "_ensure_local_container_image") as ensure_image:
+                with patch.object(provider, "_start_container_worker", return_value="container-123"):
+                    job_id = provider.launch(
+                        1,
+                        launch_params={
+                            "worker_mode": "mock",
+                            "execution_mode": "container",
+                            "container_engine": "docker",
+                        },
+                    )
+            metadata = provider._read_job_metadata(job_id) or {}
+            self.assertEqual(metadata.get("execution_mode"), "container")
+            self.assertEqual(metadata.get("container_engine"), "docker")
+            self.assertEqual(metadata.get("container_image"), local_module.DEFAULT_LOCAL_CONTAINER_IMAGE)
+            workers = metadata.get("workers") or []
+            self.assertEqual(len(workers), 1)
+            self.assertEqual(workers[0].get("container_id"), "container-123")
+            ensure_image.assert_called_once()
+
+    def test_local_provider_launches_native_worker_with_current_interpreter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalProvider({"workspace_root": temp_dir})
+
+            class FakeProc:
+                pid = 4321
+
+            with patch("router.providers.local.subprocess.Popen", return_value=FakeProc()) as popen_mock:
+                with patch.object(provider, "_read_proc_start_ticks", return_value=123):
+                    job_id = provider.launch(
+                        1,
+                        launch_params={
+                            "worker_mode": "mock",
+                            "execution_mode": "native",
+                        },
+                    )
+
+            metadata = provider._read_job_metadata(job_id) or {}
+            self.assertEqual(metadata.get("execution_mode"), "native")
+            popen_args = popen_mock.call_args[0][0]
+            self.assertEqual(popen_args[0], sys.executable)
+
+    def test_local_container_mounts_make_repo_writable_when_workspace_is_nested(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        workspace_root = repo_root / ".tmp" / "nested-workspace-test"
+        provider = LocalProvider({"workspace_root": str(workspace_root)})
+        mounts = provider._container_mounts()
+        repo_mount = next((item for item in mounts if item[0] == repo_root.resolve()), None)
+        self.assertIsNotNone(repo_mount)
+        self.assertEqual(repo_mount[2], "rw")
+
+    def test_local_prepare_repository_stages_local_source_for_container_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with tempfile.TemporaryDirectory() as source_dir:
+                provider = LocalProvider({"workspace_root": temp_dir})
+                source_repo = Path(source_dir) / "source-repo"
+                subprocess.run(["git", "init", str(source_repo)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run(
+                    ["git", "-C", str(source_repo), "config", "user.name", "Codeswarm Test"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", str(source_repo), "config", "user.email", "codeswarm@example.com"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                (source_repo / "README.md").write_text("hello\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(source_repo), "add", "README.md"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                subprocess.run(["git", "-C", str(source_repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+                job_id = "local_test_container"
+                provider._write_job_metadata(
+                    job_id,
+                    {
+                        "job_id": job_id,
+                        "execution_mode": "container",
+                        "workers": [{"container_id": "cid-1", "container_engine": "docker", "node_id": 0}],
+                    },
+                )
+                with patch.object(provider, "_active_workers_for_job", return_value=[{"container_id": "cid-1", "container_engine": "docker", "node_id": 0}]):
+                    prepared = provider.prepare_repository(job_id, str(source_repo))
+                staged_source = prepared.get("source_path_staged")
+                self.assertEqual(prepared.get("source"), str(source_repo.resolve()))
+                self.assertTrue(isinstance(staged_source, str) and staged_source.endswith(f"{job_id}/source"))
+                self.assertEqual(prepared.get("origin"), staged_source)
+                self.assertTrue(Path(staged_source).exists())
+
+    def test_local_prepare_repository_preserves_rw_mounted_local_origin_for_container_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            provider = LocalProvider({"workspace_root": temp_dir})
+            origin_repo = Path(temp_dir) / "origin.git"
+            source_repo = Path(temp_dir) / "source-repo"
+            subprocess.run(["git", "init", "--bare", str(origin_repo)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "clone", str(origin_repo), str(source_repo)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(
+                ["git", "-C", str(source_repo), "config", "user.name", "Codeswarm Test"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(source_repo), "config", "user.email", "codeswarm@example.com"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            subprocess.run(["git", "-C", str(source_repo), "checkout", "-b", "main"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            (source_repo / "README.md").write_text("hello\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(source_repo), "add", "README.md"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "-C", str(source_repo), "commit", "-m", "init"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(["git", "-C", str(source_repo), "push", "-u", "origin", "main"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            job_id = "local_test_container_origin"
+            provider._write_job_metadata(
+                job_id,
+                {
+                    "job_id": job_id,
+                    "execution_mode": "container",
+                    "workers": [{"container_id": "cid-1", "container_engine": "docker", "node_id": 0}],
+                },
+            )
+            with patch.object(provider, "_active_workers_for_job", return_value=[{"container_id": "cid-1", "container_engine": "docker", "node_id": 0}]):
+                prepared = provider.prepare_repository(job_id, str(source_repo))
+            self.assertEqual(Path(str(prepared.get("origin") or "")).resolve(), origin_repo.resolve())
 
     def test_local_launch_fields_include_claude_env_profile_options(self):
         fields = _default_launch_fields_for_backend(
@@ -341,6 +519,34 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                     }
                 )
 
+    def test_aws_provider_rejects_container_execution_until_implemented(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                        "ami_id": "ami-123",
+                        "subnet_id": "subnet-123",
+                        "key_name": "key",
+                        "ssh_private_key_path": "~/.ssh/key.pem",
+                    },
+                }
+            }
+        )
+        with patch.object(provider, "_verify_aws_auth"):
+            with self.assertRaisesRegex(RuntimeError, "container execution is not implemented yet"):
+                provider.launch(
+                    1,
+                    launch_params={
+                        "worker_mode": "codex",
+                        "execution_mode": "container",
+                        "container_engine": "docker",
+                        "instance_type": "c7i.4xlarge",
+                    },
+                )
+
     def test_translate_event_accepts_canonical_worker_event(self):
         original_job_to_swarm = router_module.JOB_TO_SWARM
         try:
@@ -524,6 +730,30 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "token-123")
         self.assertEqual(provider._claude_permission_mode({"approval_policy": "never"}), "bypassPermissions")
         self.assertEqual(provider._claude_permission_mode({"approval_policy": "on-request"}), "default")
+        self.assertEqual(provider._execution_mode({"execution_mode": "container"}), "container")
+        self.assertEqual(provider._container_engine({}), "apptainer")
+
+    def test_slurm_provider_rejects_container_execution_until_implemented(self):
+        provider = SlurmProvider(
+            {
+                "cluster": {
+                    "slurm": {
+                        "login_host": "cluster-login",
+                        "partition": "cpu",
+                        "time_limit": "00:30:00",
+                    }
+                }
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "container execution is not implemented yet"):
+            provider.launch(
+                1,
+                launch_params={
+                    "worker_mode": "claude",
+                    "execution_mode": "container",
+                    "container_engine": "apptainer",
+                },
+            )
 
     def test_router_resolves_slurm_claude_profile_model_for_agent_and_pricing(self):
         config = {

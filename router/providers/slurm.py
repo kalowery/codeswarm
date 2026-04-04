@@ -6,6 +6,7 @@ import base64
 import tempfile
 import time
 import os
+import sys
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -57,6 +58,14 @@ class SlurmProvider(ClusterProvider):
     def _runtime_mode(launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
         return str(params.get("agent_runtime") or params.get("worker_mode") or "codex").strip().lower() or "codex"
+
+    def _execution_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("execution_mode") or self.slurm_cfg.get("default_execution_mode") or "native").strip().lower() or "native"
+
+    def _container_engine(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_engine") or self.slurm_cfg.get("default_container_engine") or "apptainer").strip().lower() or "apptainer"
 
     def _approval_policy(self, launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
@@ -378,6 +387,7 @@ exit 1
 
             launch_params = launch_params if isinstance(launch_params, dict) else {}
             worker_mode = self._runtime_mode(launch_params)
+            execution_mode = self._execution_mode(launch_params)
             partition = launch_params.get("partition") or self.slurm_cfg.get("partition")
             time_limit = launch_params.get("time_limit") or self.slurm_cfg.get("time_limit")
             account = launch_params.get("account") if "account" in launch_params else self.slurm_cfg.get("account")
@@ -388,6 +398,13 @@ exit 1
                 qos = None
             if worker_mode not in {"codex", "claude"}:
                 raise RuntimeError(f"Unsupported Slurm worker_mode: {worker_mode}")
+            if execution_mode not in {"native", "container"}:
+                raise RuntimeError(f"Unsupported Slurm execution mode: {execution_mode}")
+            if execution_mode == "container":
+                engine = self._container_engine(launch_params)
+                raise RuntimeError(
+                    f"Slurm container execution is not implemented yet (requested engine: {engine})"
+                )
 
             if not partition:
                 raise RuntimeError("Slurm partition not configured")
@@ -401,7 +418,7 @@ exit 1
             allocate_script = repo_root / "slurm" / "allocate_and_prepare.py"
 
             cmd = [
-                "python3",
+                sys.executable,
                 str(allocate_script),
                 "--config",
                 config_path,

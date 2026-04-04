@@ -4,6 +4,7 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 import uuid
 from functools import lru_cache
@@ -255,6 +256,14 @@ class AwsProvider(ClusterProvider):
     def _runtime_mode(launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
         return str(params.get("agent_runtime") or params.get("worker_mode") or "codex").strip().lower() or "codex"
+
+    def _execution_mode(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("execution_mode") or self.aws_cfg.get("default_execution_mode") or "native").strip().lower() or "native"
+
+    def _container_engine(self, launch_params: dict | None) -> str:
+        params = launch_params if isinstance(launch_params, dict) else {}
+        return str(params.get("container_engine") or self.aws_cfg.get("default_container_engine") or "docker").strip().lower() or "docker"
 
     def _approval_policy(self, launch_params: dict | None) -> str:
         params = launch_params if isinstance(launch_params, dict) else {}
@@ -1207,6 +1216,14 @@ done
         worker_mode = self._runtime_mode(launch_params)
         if worker_mode not in {"codex", "claude"}:
             raise RuntimeError(f"Unsupported AWS agent runtime: {worker_mode}")
+        execution_mode = self._execution_mode(launch_params)
+        if execution_mode not in {"native", "container"}:
+            raise RuntimeError(f"Unsupported AWS execution mode: {execution_mode}")
+        if execution_mode == "container":
+            engine = self._container_engine(launch_params)
+            raise RuntimeError(
+                f"AWS container execution is not implemented yet (requested engine: {engine})"
+            )
 
         instance_type = str(launch_params.get("instance_type") or self.aws_cfg.get("instance_type") or "").strip()
         if not instance_type:
@@ -1396,6 +1413,7 @@ done
                 "workers_per_node": workers_per_node,
                 "agent_runtime": worker_mode,
                 "worker_mode": worker_mode,
+                "execution_mode": execution_mode,
                 "worker_mapping": worker_mapping,
                 "ssh_user": self.ssh_user,
                 "ssh_private_key_path": self.ssh_private_key_path,
@@ -1678,7 +1696,7 @@ rm -rf "$TMP"
         follower_path = Path(__file__).resolve().parent / "aws_follower.py"
         return subprocess.Popen(
             [
-                "python3",
+                sys.executable,
                 "-u",
                 str(follower_path),
                 "--state-file",

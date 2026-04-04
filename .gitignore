@@ -24,6 +24,10 @@ log.txt
 **/__pycache__/
 *.pyc
 *.sqlite3
+build/
+dist/
+release/
+*.egg-info/
 
 # Local personal configs
 configs/hpcfund.json
