@@ -13,10 +13,18 @@ Current implementation includes two complementary operating modes:
 - ad hoc swarm operation with direct prompt routing
 - opt-in orchestrated projects with planner-generated task graphs, deterministic worker dispatch, live project/task UI, and project resume
 
-## Install via curl | bash
+## Install a Release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
+```
+
+That installer downloads the latest published release bundle from GitHub Releases, installs the bundled Python wheel into a private virtualenv, installs CLI/backend runtime dependencies, and writes a `codeswarm` launcher into `~/.codeswarm/bin`.
+
+To pin installation to a specific published release, fetch the installer from that tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/v0.1.2/install-codeswarm.sh | bash
 ```
 
 Optional installer overrides:
@@ -27,11 +35,9 @@ Optional installer overrides:
 - `CODESWARM_INSTALL_MODE=release|source`
 - `CODESWARM_REPO_URL` and `CODESWARM_BRANCH` for source-mode installs only
 
-The default installer path now downloads the latest prebuilt release bundle, installs the bundled Python wheel into a private virtualenv, installs CLI/backend runtime dependencies, and writes a `codeswarm` launcher into `~/.codeswarm/bin`.
-
 ## Quick Start (Local)
 
-1. Install Codeswarm
+1. Install a published release
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kalowery/codeswarm/main/install-codeswarm.sh | bash
@@ -49,7 +55,9 @@ This starts:
 - Backend on `http://localhost:4000`
 - Frontend on `http://localhost:3000`
 
-For source-based development instead of the release installer:
+## Bootstrap from a Git Clone
+
+Use this path for development, branch testing, or when you want the working tree directly on disk.
 
 1. Clone
 
@@ -64,13 +72,19 @@ cd codeswarm
 ./bootstrap.sh
 ```
 
-Bootstrap installs Node `24.13.0`, workspace dependencies, builds frontend/CLI, links the `codeswarm` CLI, and checks for optional Beads CLI (`bd`) with optional install prompt.
-It also installs the Python package in editable mode so `router`, `agent`, `slurm`, and related modules resolve from a standard package install.
+`bootstrap.sh` installs Node `24.13.0`, workspace dependencies, builds the frontend/backend/CLI artifacts, links the `codeswarm` CLI, and checks for optional Beads CLI (`bd`) with an optional install prompt.
+It also installs the Python package in editable mode so `router`, `agent`, `slurm`, and related modules resolve directly from the git checkout.
 
 If runtime packages are missing after branch switches or large git updates, run:
 
 ```bash
 npm install --workspaces
+```
+
+Then rebuild the JS artifacts if needed:
+
+```bash
+npm run build:all
 ```
 
 For a package-style Python install without the full bootstrap flow:
@@ -103,7 +117,7 @@ Note: `configs/combined.json` is intentionally treated as a local operator file 
 codeswarm web --config configs/local.json
 ```
 
-You can also run components manually:
+You can also run components manually from the checkout:
 
 ```bash
 python3 -u -m router.router --config configs/local.json --daemon
@@ -165,7 +179,7 @@ Recommended local launch presets for project work:
 - `local-orchestrated-planner`
 - `local-orchestrated-worker`
 
-These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and fresh-thread-per-injection behavior. The same launch path now also supports `worker_mode=claude`.
+These presets default to real Codex workers, `approval_policy=never`, `sandbox_mode=danger-full-access`, native auto-approval, and orchestrated-worker-safe thread behavior. The same launch path now also supports `worker_mode=claude`.
 
 ## Codex Sandbox and Approval
 
