@@ -149,6 +149,10 @@ def main():
     parser.add_argument("--provider", default="aws-claude-default")
     parser.add_argument("--nodes", type=int, default=1)
     parser.add_argument("--prompt", default="Reply with exactly READY and nothing else.")
+    parser.add_argument("--execution-mode", default="native", choices=["native", "container"])
+    parser.add_argument("--container-engine", default="")
+    parser.add_argument("--container-image", default="")
+    parser.add_argument("--claude-env-profile", default="direct-anthropic")
     parser.add_argument("--launch-timeout", type=float, default=1800.0)
     args = parser.parse_args()
 
@@ -170,20 +174,27 @@ def main():
     try:
         router_proc = start_router(config_path, state_file, pid_file, host, port)
         client = RouterClient(host, port)
+        provider_params = {
+            "worker_mode": "claude",
+            "approval_policy": "never",
+            "claude_env_profile": str(args.claude_env_profile or "").strip(),
+            "workers_per_node": 1,
+            "node_count": 1,
+            "ebs_volume_size_gb": 8,
+            "delete_ebs_on_shutdown": True,
+            "execution_mode": args.execution_mode,
+        }
+        if args.execution_mode == "container":
+            provider_params["container_engine"] = str(args.container_engine or "docker").strip().lower() or "docker"
+            if str(args.container_image or "").strip():
+                provider_params["container_image"] = str(args.container_image).strip()
         launch_request = client.send(
             "swarm_launch",
             {
                 "provider": args.provider,
                 "nodes": int(args.nodes),
                 "system_prompt": args.prompt,
-                "provider_params": {
-                    "worker_mode": "claude",
-                    "approval_policy": "never",
-                    "workers_per_node": 1,
-                    "node_count": 1,
-                    "ebs_volume_size_gb": 8,
-                    "delete_ebs_on_shutdown": True,
-                },
+                "provider_params": provider_params,
             },
         )
         print(f"launch_request_id={launch_request}", flush=True)

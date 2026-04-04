@@ -519,7 +519,7 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                     }
                 )
 
-    def test_aws_provider_rejects_container_execution_until_implemented(self):
+    def test_aws_provider_launches_codex_in_container_mode(self):
         provider = AwsProvider(
             {
                 "cluster": {
@@ -535,17 +535,247 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
                 }
             }
         )
+        instance = {
+            "InstanceId": "i-coord",
+            "PrivateIpAddress": "10.0.0.5",
+            "PublicIpAddress": "54.0.0.5",
+            "Placement": {"AvailabilityZone": "us-east-1a"},
+        }
+
+        def fake_aws(args, expect_json=False):
+            if list(args[:2]) == ["ec2", "create-volume"]:
+                return {"VolumeId": "vol-123"}
+            return {"ok": True} if expect_json else object()
+
         with patch.object(provider, "_verify_aws_auth"):
-            with self.assertRaisesRegex(RuntimeError, "container execution is not implemented yet"):
-                provider.launch(
-                    1,
-                    launch_params={
-                        "worker_mode": "codex",
-                        "execution_mode": "container",
-                        "container_engine": "docker",
-                        "instance_type": "c7i.4xlarge",
+            with patch.object(provider, "_run_instances", side_effect=[["i-coord"], []]):
+                with patch.object(provider, "_wait_instances_state"):
+                    with patch.object(provider, "_get_instances_for_job", return_value=[instance]):
+                        with patch.object(provider, "_aws", side_effect=fake_aws):
+                            with patch.object(provider, "_wait_for_ssh"):
+                                with patch.object(provider, "_setup_shared_ebs"):
+                                    with patch.object(provider, "_sync_agent_dir"):
+                                        with patch.object(provider, "_sync_container_assets") as sync_container_assets:
+                                            with patch.object(provider, "_ensure_container_runtime") as ensure_runtime:
+                                                with patch.object(provider, "_ensure_container_image") as ensure_image:
+                                                    with patch.object(provider, "_prepare_run_directories"):
+                                                        with patch.object(
+                                                            provider,
+                                                            "_start_codex_container_workers",
+                                                            return_value=[
+                                                                {
+                                                                    "node_id": 0,
+                                                                    "host": "54.0.0.5",
+                                                                    "container_name": "codeswarm-aws_test-00",
+                                                                    "container_engine": "docker",
+                                                                    "container_image": AwsProvider.DEFAULT_CONTAINER_IMAGE,
+                                                                }
+                                                            ],
+                                                        ):
+                                                            with patch.object(provider, "_ensure_codex_tools") as ensure_codex_tools:
+                                                                job_id = provider.launch(
+                                                                    1,
+                                                                    launch_params={
+                                                                        "worker_mode": "codex",
+                                                                        "execution_mode": "container",
+                                                                        "container_engine": "docker",
+                                                                        "instance_type": "c7i.4xlarge",
+                                                                    },
+                                                                )
+        metadata = provider._get_job_meta(job_id) or {}
+        self.assertEqual(metadata.get("execution_mode"), "container")
+        self.assertEqual(metadata.get("container_engine"), "docker")
+        self.assertEqual(metadata.get("container_image"), AwsProvider.DEFAULT_CONTAINER_IMAGE)
+        self.assertEqual(len(metadata.get("workers") or []), 1)
+        sync_container_assets.assert_called_once_with(["54.0.0.5"])
+        ensure_runtime.assert_called_once_with("54.0.0.5", "docker")
+        ensure_image.assert_called_once_with("54.0.0.5", "docker", AwsProvider.DEFAULT_CONTAINER_IMAGE, "if_not_present")
+        ensure_codex_tools.assert_not_called()
+
+    def test_aws_provider_builds_codex_container_launch_script(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
                     },
-                )
+                }
+            }
+        )
+        captured: dict[str, object] = {}
+
+        def fake_ssh_with_env(host, env_vars, remote_script):
+            captured["host"] = host
+            captured["env"] = dict(env_vars)
+            captured["script"] = remote_script
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch.object(provider, "_local_openai_api_key", return_value="openai-key"):
+            with patch.object(provider, "_local_github_token", return_value=""):
+                with patch.object(provider, "_ssh_with_env", side_effect=fake_ssh_with_env):
+                    workers = provider._start_codex_container_workers(
+                        {"host-1": [0]},
+                        "awsjob",
+                        {
+                            "execution_mode": "container",
+                            "container_engine": "docker",
+                            "container_image": "ghcr.io/kalowery/codeswarm-local-worker:latest",
+                            "approval_policy": "never",
+                            "sandbox_mode": "workspace-write",
+                            "fresh_thread_per_injection": False,
+                        },
+                    )
+        self.assertEqual(captured.get("host"), "host-1")
+        env = captured.get("env") or {}
+        script = str(captured.get("script") or "")
+        self.assertEqual(env.get("OPENAI_API_KEY"), "openai-key")
+        self.assertIn('*docker_cmd, "run", "-d"', script)
+        self.assertIn('"--preserve-env=" + ",".join(preserve_env)', script)
+        self.assertIn('"--user", str(uid) + ":" + str(gid)', script)
+        self.assertIn("codex login status", script)
+        self.assertIn("agent/codex_worker.py", script)
+        self.assertIn('"CODESWARM_ASK_FOR_APPROVAL=" + "never"', script)
+        self.assertIn('sandbox_mode = "workspace-write"', script)
+        self.assertIn("export BASE JOB ENGINE IMAGE WORKERS_JSON", script)
+        python_body = script.split("python3 - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        compile(python_body, "<aws-codex-container-script>", "exec")
+        self.assertEqual(
+            workers,
+            [
+                {
+                    "node_id": 0,
+                    "host": "host-1",
+                    "container_name": provider._container_name("awsjob", 0),
+                    "container_engine": "docker",
+                    "container_image": "ghcr.io/kalowery/codeswarm-local-worker:latest",
+                }
+            ],
+        )
+
+    def test_aws_provider_uses_github_auth_for_ghcr_image_pulls(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                    },
+                }
+            }
+        )
+        captured: dict[str, object] = {}
+
+        def fake_ssh_with_env(host, env_vars, remote_script):
+            captured["host"] = host
+            captured["env"] = dict(env_vars)
+            captured["script"] = remote_script
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch.object(provider, "_local_github_token", return_value="gh-token"):
+            with patch.object(provider, "_local_github_username", return_value="kalowery"):
+                with patch.object(provider, "_ssh_with_env", side_effect=fake_ssh_with_env):
+                    with patch.object(provider, "_ssh") as ssh_mock:
+                        provider._ensure_container_image(
+                            "host-1",
+                            "docker",
+                            "ghcr.io/kalowery/codeswarm-local-worker:latest",
+                            "if_not_present",
+                        )
+        self.assertEqual(captured.get("host"), "host-1")
+        self.assertEqual((captured.get("env") or {}).get("GITHUB_TOKEN"), "gh-token")
+        self.assertEqual((captured.get("env") or {}).get("GITHUB_USERNAME"), "kalowery")
+        script = str(captured.get("script") or "")
+        self.assertIn("$ENGINE login ghcr.io", script)
+        self.assertIn('printf \'%s\' "$GITHUB_TOKEN"', script)
+        ssh_mock.assert_not_called()
+
+    def test_aws_provider_builds_default_image_when_pull_unavailable(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                    },
+                }
+            }
+        )
+        captured: dict[str, object] = {}
+
+        def fake_ssh_with_env(host, env_vars, remote_script):
+            captured["host"] = host
+            captured["env"] = dict(env_vars)
+            captured["script"] = remote_script
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch.object(provider, "_local_github_token", return_value="gh-token"):
+            with patch.object(provider, "_local_github_username", return_value="kalowery"):
+                with patch.object(provider, "_ssh_with_env", side_effect=fake_ssh_with_env):
+                    provider._ensure_container_image(
+                        "host-1",
+                        "docker",
+                        AwsProvider.DEFAULT_CONTAINER_IMAGE,
+                        "if_not_present",
+                    )
+        script = str(captured.get("script") or "")
+        self.assertIn("build_default_image()", script)
+        self.assertIn("$ENGINE build -t \"$IMAGE\" -f \"$DEFAULT_DOCKERFILE\" \"$DEFAULT_CONTEXT\"", script)
+        self.assertIn(f"DEFAULT_DOCKERFILE={provider._quote(provider.base_path + '/docker/local-worker.Dockerfile')}", script)
+
+    def test_aws_provider_builds_claude_container_launch_script_with_non_root_user(self):
+        provider = AwsProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "aws": {
+                        "region": "us-east-1",
+                    },
+                }
+            }
+        )
+        captured: dict[str, object] = {}
+
+        def fake_ssh_with_env(host, env_vars, remote_script):
+            captured["host"] = host
+            captured["env"] = dict(env_vars)
+            captured["script"] = remote_script
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        with patch.object(provider, "_resolve_claude_launch_env", return_value={"ANTHROPIC_API_KEY": "anthropic-key"}):
+            with patch.object(provider, "_local_github_token", return_value="gh-token"):
+                with patch.object(provider, "_ssh_with_env", side_effect=fake_ssh_with_env):
+                    workers = provider._start_claude_container_workers(
+                        {"host-1": [0]},
+                        "awsjob",
+                        {
+                            "execution_mode": "container",
+                            "container_engine": "docker",
+                            "container_image": "ghcr.io/kalowery/codeswarm-local-worker:latest",
+                            "approval_policy": "never",
+                        },
+                    )
+        script = str(captured.get("script") or "")
+        self.assertIn('"--preserve-env=" + ",".join(preserve_env)', script)
+        self.assertIn('"--user", str(uid) + ":" + str(gid)', script)
+        self.assertIn('"HOME=" + container_home', script)
+        self.assertEqual((captured.get("env") or {}).get("ANTHROPIC_API_KEY"), "anthropic-key")
+        self.assertEqual(
+            workers,
+            [
+                {
+                    "node_id": 0,
+                    "host": "host-1",
+                    "container_name": provider._container_name("awsjob", 0),
+                    "container_engine": "docker",
+                    "container_image": "ghcr.io/kalowery/codeswarm-local-worker:latest",
+                }
+            ],
+        )
 
     def test_translate_event_accepts_canonical_worker_event(self):
         original_job_to_swarm = router_module.JOB_TO_SWARM
