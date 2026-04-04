@@ -341,17 +341,29 @@ def project_debug_summary(project: dict) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run an AWS-only Claude orchestrated project smoke against a temporary GitHub repo.")
+    parser = argparse.ArgumentParser(description="Run an AWS-only orchestrated project smoke against a temporary GitHub repo.")
     parser.add_argument("--config", default=str(ROOT / "configs" / "combined.json"))
     parser.add_argument("--provider", default="aws-claude-default")
+    parser.add_argument("--worker-mode", choices=["claude", "codex"], default="claude")
+    parser.add_argument("--execution-mode", choices=["native", "container"], default="native")
+    parser.add_argument("--container-engine", default="docker")
+    parser.add_argument("--container-image", default="")
+    parser.add_argument("--native-auto-approve", dest="native_auto_approve", action="store_true")
+    parser.add_argument("--no-native-auto-approve", dest="native_auto_approve", action="store_false")
     parser.add_argument("--nodes", type=int, default=1)
     parser.add_argument("--github-owner", default=os.environ.get("CODESWARM_GITHUB_OWNER", "kalowery"))
     parser.add_argument("--keep-repo", action="store_true")
     parser.add_argument("--keep-artifacts", action="store_true")
+    parser.set_defaults(native_auto_approve=None)
     args = parser.parse_args()
 
-    if not str(os.environ.get("ANTHROPIC_API_KEY") or "").strip():
-        raise RuntimeError("ANTHROPIC_API_KEY must be set for AWS Claude project smoke")
+    worker_mode = str(args.worker_mode or "claude").strip().lower() or "claude"
+    if worker_mode == "claude":
+        if not str(os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            raise RuntimeError("ANTHROPIC_API_KEY must be set for AWS Claude project smoke")
+    else:
+        if not str(os.environ.get("OPENAI_API_KEY") or "").strip():
+            raise RuntimeError("OPENAI_API_KEY must be set for AWS Codex project smoke")
 
     config_path = write_temp_aws_only_config(Path(args.config), args.provider)
     tmp_root = config_path.parent
@@ -378,22 +390,34 @@ def main():
         router_proc = start_router(config_path, state_file, pid_file, host, port)
         client = RouterClient(host, port)
 
+        provider_params = {
+            "worker_mode": worker_mode,
+            "approval_policy": "never",
+            "workers_per_node": 1,
+            "node_count": 1,
+            "ebs_volume_size_gb": 8,
+            "delete_ebs_on_shutdown": True,
+            "execution_mode": str(args.execution_mode or "native").strip().lower() or "native",
+        }
+        if provider_params["execution_mode"] == "container":
+            provider_params["container_engine"] = str(args.container_engine or "docker").strip().lower() or "docker"
+            if str(args.container_image or "").strip():
+                provider_params["container_image"] = str(args.container_image).strip()
+        native_auto_approve = args.native_auto_approve
+        if native_auto_approve is None and worker_mode == "codex":
+            native_auto_approve = True
+        if native_auto_approve is not None:
+            provider_params["native_auto_approve"] = bool(native_auto_approve)
+
         launch_request = client.send(
             "swarm_launch",
             {
                 "provider": args.provider,
                 "nodes": int(args.nodes),
                 "system_prompt": "You are a task worker. For orchestrated project tasks, return only the TASK_RESULT block.",
-                "provider_params": {
-                    "worker_mode": "claude",
-                    "approval_policy": "never",
-                    "workers_per_node": 1,
-                    "node_count": 1,
-                    "ebs_volume_size_gb": 8,
-                    "delete_ebs_on_shutdown": True,
-                },
+                "provider_params": provider_params,
                 "agents_md_content": (
-                    "# AWS Claude Project Smoke Worker\n"
+                    f"# AWS {worker_mode.capitalize()} Project Smoke Worker\n"
                     "For orchestrated project tasks, return only the TASK_RESULT block in the final answer.\n"
                     "Create or switch to the assigned branch, commit your changes, and push to origin when available.\n"
                 ),
@@ -408,7 +432,7 @@ def main():
         swarm_id = str(launch_data.get("swarm_id") or "")
         print(f"swarm_id={swarm_id}", flush=True)
 
-        project_title = f"AWS Claude GitHub Project Smoke {int(time.time())}"
+        project_title = f"AWS {worker_mode.capitalize()} GitHub Project Smoke {int(time.time())}"
         tasks = [
             {
                 "task_id": "T-001",
