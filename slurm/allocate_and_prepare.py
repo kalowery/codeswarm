@@ -88,6 +88,23 @@ def safe_skill_rel_path(path: str) -> str | None:
     return str(PurePosixPath(*parts))
 
 
+def _truthy_flag(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def launch_worker_requested(args) -> bool:
+    return bool(getattr(args, "launch_worker_run", False) or getattr(args, "launch_codex_run", False))
+
+
+def resolved_worker_mode(args) -> str:
+    mode = str(getattr(args, "worker_mode", "") or "").strip().lower()
+    if mode:
+        return mode
+    if getattr(args, "launch_codex_run", False):
+        return "codex"
+    return "codex"
+
+
 def build_sbatch_script(args, config):
     workspace_root, cluster_subdir = resolve_slurm_paths(config)
     hpc_base = f"{workspace_root}/{cluster_subdir}"
@@ -126,30 +143,84 @@ def build_sbatch_script(args, config):
         f"cd {hpc_base}",
     ])
 
-    if args.launch_codex_run:
+    if launch_worker_requested(args):
+        worker_mode = resolved_worker_mode(args)
         capture_all_session = str(os.environ.get("CODESWARM_CAPTURE_ALL_SESSION") or "").strip()
         capture_line = (
             f"export CODESWARM_CAPTURE_ALL_SESSION={shlex.quote(capture_all_session)}\n"
             if capture_all_session
             else ""
         )
-        lines.extend([
-            "",
-            "# Per-agent working directory isolation (runs/<job_id>/agent_XX layout)",
-            f"srun bash -c '\n"
-            f"export CODESWARM_JOB_ID=$SLURM_JOB_ID\n"
-            f"export CODESWARM_NODE_ID=$SLURM_PROCID\n"
-            f"export CODESWARM_BASE_DIR={hpc_base}\n"
-            f"export CODESWARM_CODEX_BIN={hpc_base}/tools/npm-global/bin/codex\n"
-            f"export PATH={hpc_base}/tools/npm-global/bin:$PATH\n"
-            f"{capture_line}"
-            f"AGENT_INDEX=$(printf \"%02d\" $SLURM_PROCID)\n"
-            f"AGENT_WORKDIR=\"{hpc_base}/runs/$SLURM_JOB_ID/agent_${{AGENT_INDEX}}\"\n"
-            f"mkdir -p \"$AGENT_WORKDIR\"\n"
-            f"cd \"$AGENT_WORKDIR\"\n"
-            f"python3 {hpc_base}/agent/codex_worker.py\n"
-            f"'",
-        ])
+        worker_lines = [
+            "export CODESWARM_JOB_ID=$SLURM_JOB_ID",
+            "export CODESWARM_NODE_ID=$SLURM_PROCID",
+            f"export CODESWARM_BASE_DIR={hpc_base}",
+            f"export CODESWARM_ASK_FOR_APPROVAL={shlex.quote(str(args.approval_policy or 'never'))}",
+        ]
+        if getattr(args, "fresh_thread_per_injection", None) is not None:
+            worker_lines.append(
+                "export CODESWARM_FRESH_THREAD_PER_INJECTION="
+                + shlex.quote("1" if _truthy_flag(args.fresh_thread_per_injection) else "0")
+            )
+        if worker_mode == "codex":
+            worker_lines.extend(
+                [
+                    f"export CODESWARM_CODEX_BIN={hpc_base}/tools/npm-global/bin/codex",
+                    f"export PATH={hpc_base}/tools/npm-global/bin:$PATH",
+                ]
+            )
+            if capture_line:
+                worker_lines.append(capture_line.rstrip("\n"))
+            worker_entrypoint = f"python3 {hpc_base}/agent/codex_worker.py"
+        elif worker_mode == "claude":
+            worker_lines.append(
+                "export CODESWARM_CLAUDE_PERMISSION_MODE="
+                + shlex.quote(str(args.claude_permission_mode or "bypassPermissions"))
+            )
+            worker_lines.extend(
+                [
+                    f'CLAUDE_VENV="{hpc_base}/tools/claude-venv"',
+                    'if [ ! -x "$CLAUDE_VENV/bin/python" ]; then',
+                    '  echo "Claude runtime virtualenv is missing at $CLAUDE_VENV" >&2',
+                    "  exit 1",
+                    "fi",
+                    'export PATH="$CLAUDE_VENV/bin:$PATH"',
+                ]
+            )
+            if args.claude_env_file:
+                quoted_env_file = shlex.quote(str(args.claude_env_file))
+                worker_lines.extend(
+                    [
+                        f"if [ ! -f {quoted_env_file} ]; then",
+                        f'  echo "Claude env file is missing at {args.claude_env_file}" >&2',
+                        "  exit 1",
+                        "fi",
+                        f". {quoted_env_file}",
+                    ]
+                )
+            if args.claude_model:
+                worker_lines.append("export CODESWARM_CLAUDE_MODEL=" + shlex.quote(str(args.claude_model)))
+            if args.claude_cli_path:
+                worker_lines.append("export CODESWARM_CLAUDE_CLI_PATH=" + shlex.quote(str(args.claude_cli_path)))
+            worker_entrypoint = '"$CLAUDE_VENV/bin/python" ' + f'"{hpc_base}/agent/claude_worker.py"'
+        else:
+            raise RuntimeError(f"Unsupported worker_mode: {worker_mode}")
+        worker_lines.extend(
+            [
+                'AGENT_INDEX=$(printf "%02d" $SLURM_PROCID)',
+                f'AGENT_WORKDIR="{hpc_base}/runs/$SLURM_JOB_ID/agent_${{AGENT_INDEX}}"',
+                'mkdir -p "$AGENT_WORKDIR"',
+                'cd "$AGENT_WORKDIR"',
+                worker_entrypoint,
+            ]
+        )
+        lines.extend(
+            [
+                "",
+                "# Per-agent working directory isolation (runs/<job_id>/agent_XX layout)",
+                "srun bash -c '\n" + "\n".join(worker_lines) + "\n'",
+            ]
+        )
 
     elif args.launch_codex_test:
         lines.extend([
@@ -290,6 +361,40 @@ def ensure_codex_ready(config):
     print("Codex authenticated successfully.")
 
 
+def ensure_claude_ready(config):
+    login_host = resolve_login_host(config)
+    workspace_root, cluster_subdir = resolve_slurm_paths(config)
+    slurm_cfg = config.get("cluster", {}).get("slurm", {})
+
+    tools_dir = f"{workspace_root}/{cluster_subdir}/tools"
+    claude_venv = f"{tools_dir}/claude-venv"
+    claude_sdk_package = str(slurm_cfg.get("claude_sdk_package") or "claude-agent-sdk").strip() or "claude-agent-sdk"
+
+    bootstrap_script = f"""
+set -euo pipefail
+TOOLS_DIR={shlex.quote(tools_dir)}
+CLAUDE_VENV={shlex.quote(claude_venv)}
+
+mkdir -p "$TOOLS_DIR"
+
+if [ ! -x "$CLAUDE_VENV/bin/python" ]; then
+  python3 -m venv "$CLAUDE_VENV"
+fi
+
+"$CLAUDE_VENV/bin/python" -m pip install --upgrade pip setuptools wheel
+"$CLAUDE_VENV/bin/python" -m pip install {shlex.quote(claude_sdk_package)}
+"$CLAUDE_VENV/bin/python" -c "import claude_agent_sdk"
+"""
+    result = ssh_login(login_host, bootstrap_script)
+    if result.returncode != 0:
+        print("Claude runtime bootstrap failed:")
+        if result.stderr:
+            print(result.stderr)
+        if result.stdout:
+            print(result.stdout)
+        sys.exit(1)
+
+
 def ensure_partition_capacity(args, config):
     login_host = resolve_login_host(config)
 
@@ -390,6 +495,14 @@ if __name__ == "__main__":
     parser.add_argument("--qos")
     parser.add_argument("--agents-md-b64")
     parser.add_argument("--agents-bundle-b64")
+    parser.add_argument("--launch-worker-run", action="store_true")
+    parser.add_argument("--worker-mode")
+    parser.add_argument("--approval-policy")
+    parser.add_argument("--fresh-thread-per-injection")
+    parser.add_argument("--claude-model")
+    parser.add_argument("--claude-cli-path")
+    parser.add_argument("--claude-permission-mode")
+    parser.add_argument("--claude-env-file")
     parser.add_argument("--launch-codex-test", action="store_true")
     parser.add_argument("--launch-codex-run", action="store_true")
 
@@ -405,7 +518,7 @@ if __name__ == "__main__":
     login_host = resolve_login_host(config)
 
     # ✅ DEPLOY AGENT DIRECTORY (worker + follower) BEFORE SUBMISSION
-    if args.launch_codex_run:
+    if launch_worker_requested(args):
         agent_local_dir = Path(__file__).parent.parent / "agent"
         agent_remote_dir = f"{hpc_base}/agent"
 
@@ -424,8 +537,12 @@ if __name__ == "__main__":
         )
 
     # Ensure Codex installed and authenticated before submission
-    if args.launch_codex_run:
-        ensure_codex_ready(config)
+    if launch_worker_requested(args):
+        worker_mode = resolved_worker_mode(args)
+        if worker_mode == "codex":
+            ensure_codex_ready(config)
+        elif worker_mode == "claude":
+            ensure_claude_ready(config)
 
     # Ensure partition has sufficient idle nodes
     ensure_partition_capacity(args, config)
@@ -435,7 +552,7 @@ if __name__ == "__main__":
     print(f"Submitted job {job_id}")
 
     # ✅ CREATE RUN DIRECTORIES AFTER JOB ID EXISTS
-    if args.launch_codex_run:
+    if launch_worker_requested(args):
         run_base = f"{hpc_base}/runs/{job_id}"
         ssh_login(login_host, f"mkdir -p {run_base}")
         agents_md_content = None

@@ -1,12 +1,16 @@
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import patch
+from pathlib import Path
 
 from agent import claude_worker as claude_worker_module
 from router import router as router_module
 from router.providers.factory import _default_launch_fields_for_backend, get_provider_specs
 from router.providers.aws import AwsProvider
 from router.providers.local import LocalProvider
+from router.providers.slurm import SlurmProvider
+from slurm import allocate_and_prepare as slurm_allocate_module
 
 
 class WorkerRuntimeSupportTests(unittest.TestCase):
@@ -36,6 +40,24 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         self.assertIn("fresh_thread_per_injection", field_keys)
         self.assertIn("claude_cli_path", field_keys)
         self.assertIn("claude_permission_mode", field_keys)
+
+    def test_slurm_launch_fields_include_claude_runtime(self):
+        fields = _default_launch_fields_for_backend("slurm", {})
+        worker_mode_field = next(
+            (field for field in fields if field.get("key") == "worker_mode"),
+            None,
+        )
+        self.assertIsNotNone(worker_mode_field)
+        options = worker_mode_field.get("options") or []
+        values = {option.get("value") for option in options if isinstance(option, dict)}
+        self.assertIn("claude", values)
+        field_keys = [field.get("key") for field in fields if isinstance(field, dict)]
+        self.assertIn("approval_policy", field_keys)
+        self.assertIn("fresh_thread_per_injection", field_keys)
+        self.assertIn("claude_model", field_keys)
+        self.assertIn("claude_cli_path", field_keys)
+        self.assertIn("claude_permission_mode", field_keys)
+        self.assertIn("pricing_model", field_keys)
 
     def test_local_provider_allows_claude_with_interactive_approval_policy(self):
         captured = {}
@@ -101,6 +123,28 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
     def test_aws_launch_fields_include_claude_env_profile_options(self):
         fields = _default_launch_fields_for_backend(
             "aws",
+            {
+                "claude_env_profiles": {
+                    "amd-llm-gateway": {
+                        "ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+                    }
+                }
+            },
+        )
+        profile_field = next(
+            (field for field in fields if field.get("key") == "claude_env_profile"),
+            None,
+        )
+        self.assertIsNotNone(profile_field)
+        options = profile_field.get("options") or []
+        self.assertIn(
+            "amd-llm-gateway",
+            {option.get("value") for option in options if isinstance(option, dict)},
+        )
+
+    def test_slurm_launch_fields_include_claude_env_profile_options(self):
+        fields = _default_launch_fields_for_backend(
+            "slurm",
             {
                 "claude_env_profiles": {
                     "amd-llm-gateway": {
@@ -442,6 +486,272 @@ class WorkerRuntimeSupportTests(unittest.TestCase):
         )
         self.assertEqual(agent_model, "Claude-Sonnet-4.5")
         self.assertEqual(pricing_model, "Claude-Sonnet-4.5")
+
+    def test_slurm_provider_resolves_claude_profile_env_and_defaults_permission_mode(self):
+        provider = SlurmProvider(
+            {
+                "cluster": {
+                    "slurm": {
+                        "login_host": "cluster-login",
+                        "claude_env_profiles": {
+                            "amd-llm-gateway": {
+                                "ANTHROPIC_BASE_URL": "${TEST_ANTHROPIC_BASE_URL}",
+                                "ANTHROPIC_MODEL": "Claude-Sonnet-4.5",
+                            }
+                        },
+                    }
+                }
+            }
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "TEST_ANTHROPIC_BASE_URL": "https://llm-api.amd.com/Anthropic",
+                "TEST_ANTHROPIC_AUTH_TOKEN": "token-123",
+            },
+            clear=False,
+        ):
+            env = provider._resolve_claude_launch_env(
+                {
+                    "claude_env_profile": "amd-llm-gateway",
+                    "claude_env": {
+                        "ANTHROPIC_AUTH_TOKEN": "${TEST_ANTHROPIC_AUTH_TOKEN}",
+                    },
+                }
+            )
+        self.assertEqual(env.get("ANTHROPIC_BASE_URL"), "https://llm-api.amd.com/Anthropic")
+        self.assertEqual(env.get("ANTHROPIC_MODEL"), "Claude-Sonnet-4.5")
+        self.assertEqual(env.get("ANTHROPIC_AUTH_TOKEN"), "token-123")
+        self.assertEqual(provider._claude_permission_mode({"approval_policy": "never"}), "bypassPermissions")
+        self.assertEqual(provider._claude_permission_mode({"approval_policy": "on-request"}), "default")
+
+    def test_router_resolves_slurm_claude_profile_model_for_agent_and_pricing(self):
+        config = {
+            "cluster": {
+                "backend": "slurm",
+                "slurm": {
+                    "login_host": "cluster-login",
+                    "claude_env_profiles": {
+                        "amd-llm-gateway": {
+                            "ANTHROPIC_MODEL": "Claude-Sonnet-4.5",
+                        }
+                    },
+                },
+            }
+        }
+        params = {
+            "worker_mode": "claude",
+            "claude_env_profile": "amd-llm-gateway",
+        }
+        agent_model = router_module._resolve_swarm_agent_model(
+            config,
+            "claude",
+            params,
+            provider_backend="slurm",
+        )
+        pricing_model = router_module._resolve_swarm_pricing_model(
+            config,
+            "claude",
+            params,
+            provider_backend="slurm",
+        )
+        self.assertEqual(agent_model, "Claude-Sonnet-4.5")
+        self.assertEqual(pricing_model, "Claude-Sonnet-4.5")
+
+    def test_slurm_prepare_repository_for_github_origin_uses_shared_clone_contract(self):
+        provider = SlurmProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "slurm": {
+                        "login_host": "cluster-login",
+                    },
+                }
+            }
+        )
+        scripts: list[str] = []
+
+        class _Result:
+            def __init__(self, returncode=0, stdout="", stderr=""):
+                self.returncode = returncode
+                self.stdout = stdout
+                self.stderr = stderr
+
+        def fake_ssh_run(args, timeout=None, input_text=None):
+            remote_cmd = args[-1]
+            scripts.append(remote_cmd)
+            if "for d in \"$BASE/runs/$JOB\"/agent_*" in remote_cmd:
+                return _Result(stdout="00\n01\n")
+            return _Result()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = Path(temp_dir) / "repo"
+            subprocess.run(["git", "init", str(repo_dir)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            subprocess.run(
+                ["git", "-C", str(repo_dir), "remote", "add", "origin", "https://github.com/example/project.git"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            with patch.object(provider, "_ssh_run", side_effect=fake_ssh_run):
+                with patch.object(provider, "_rsync_to_login_host") as rsync_mock:
+                    with patch.object(provider, "_local_github_token", return_value="ghs_test_token"):
+                        with patch.object(provider, "_stage_github_token_file", return_value="/srv/codeswarm/runtime/github-token.txt"):
+                            with patch.object(provider, "_checkout_prepared_branch_remote") as checkout_mock:
+                                prepared = provider.prepare_repository(
+                                    "12345",
+                                    str(repo_dir),
+                                    branch="main",
+                                    subdir="repo",
+                                )
+
+        self.assertEqual(prepared["mode"], "per_agent_clone")
+        self.assertEqual(prepared["source_kind"], "local_path")
+        self.assertEqual(prepared["origin"], "https://github.com/example/project.git")
+        self.assertEqual(
+            prepared["worker_paths"],
+            [
+                "/srv/codeswarm/runs/12345/agent_00/repo",
+                "/srv/codeswarm/runs/12345/agent_01/repo",
+            ],
+        )
+        rsync_mock.assert_called_once_with(repo_dir.resolve(), "/srv/codeswarm/project_sources/12345/source")
+        self.assertEqual(checkout_mock.call_count, 2)
+        joined = "\n".join(scripts)
+        self.assertIn("/srv/codeswarm/runtime/github-token.txt", joined)
+        self.assertIn("credential.helper", joined)
+        self.assertIn("https://github.com/example/project.git", joined)
+
+    def test_slurm_provider_launch_threads_claude_runtime_args(self):
+        provider = SlurmProvider(
+            {
+                "cluster": {
+                    "slurm": {
+                        "login_host": "cluster-login",
+                        "partition": "cpu",
+                        "time_limit": "00:30:00",
+                    }
+                }
+            }
+        )
+
+        captured = {}
+
+        class _DummyProc:
+            def __init__(self):
+                self.stdout = iter(["JOB_ID=12345\n"])
+
+            def wait(self):
+                return 0
+
+        def fake_popen(cmd, stdout=None, stderr=None, text=None, bufsize=None):
+            captured["cmd"] = list(cmd)
+            return _DummyProc()
+
+        with patch("router.providers.slurm.subprocess.Popen", side_effect=fake_popen):
+            with patch.object(provider, "_stage_claude_env_file", return_value="/srv/codeswarm/runtime/claude-launch.sh"):
+                job_id = provider.launch(
+                    2,
+                    launch_params={
+                        "worker_mode": "claude",
+                        "approval_policy": "on-request",
+                        "fresh_thread_per_injection": True,
+                        "claude_model": "Claude-Sonnet-4.5",
+                        "claude_cli_path": "/opt/claude/bin/claude",
+                    },
+                )
+
+        self.assertEqual(job_id, "12345")
+        cmd = captured["cmd"]
+        self.assertIn("--launch-worker-run", cmd)
+        self.assertIn("--worker-mode", cmd)
+        self.assertIn("claude", cmd)
+        self.assertIn("--approval-policy", cmd)
+        self.assertIn("on-request", cmd)
+        self.assertIn("--fresh-thread-per-injection", cmd)
+        self.assertIn("--claude-model", cmd)
+        self.assertIn("Claude-Sonnet-4.5", cmd)
+        self.assertIn("--claude-cli-path", cmd)
+        self.assertIn("/opt/claude/bin/claude", cmd)
+        self.assertIn("--claude-permission-mode", cmd)
+        self.assertIn("--claude-env-file", cmd)
+        self.assertIn("/srv/codeswarm/runtime/claude-launch.sh", cmd)
+        self.assertNotIn("--launch-codex-run", cmd)
+
+    def test_slurm_allocate_builds_claude_worker_script_from_runtime_args(self):
+        args = slurm_allocate_module.argparse.Namespace(
+            nodes=2,
+            time="00:30:00",
+            partition="cpu",
+            account=None,
+            qos=None,
+            approval_policy="on-request",
+            fresh_thread_per_injection="1",
+            claude_model="Claude-Sonnet-4.5",
+            claude_cli_path="/opt/claude/bin/claude",
+            claude_permission_mode="default",
+            claude_env_file="/srv/codeswarm/runtime/claude-launch.sh",
+            launch_worker_run=True,
+            launch_codex_run=False,
+            launch_codex_test=False,
+            worker_mode="claude",
+        )
+        script = slurm_allocate_module.build_sbatch_script(
+            args,
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "slurm": {},
+                }
+            },
+        )
+        self.assertIn('CLAUDE_VENV="/srv/codeswarm/tools/claude-venv"', script)
+        self.assertIn('export PATH="$CLAUDE_VENV/bin:$PATH"', script)
+        self.assertIn('"$CLAUDE_VENV/bin/python" "/srv/codeswarm/agent/claude_worker.py"', script)
+        self.assertIn(". /srv/codeswarm/runtime/claude-launch.sh", script)
+        self.assertIn("export CODESWARM_ASK_FOR_APPROVAL=on-request", script)
+        self.assertIn("export CODESWARM_CLAUDE_PERMISSION_MODE=default", script)
+        self.assertIn("export CODESWARM_CLAUDE_MODEL=Claude-Sonnet-4.5", script)
+        self.assertIn("export CODESWARM_CLAUDE_CLI_PATH=/opt/claude/bin/claude", script)
+        self.assertIn("export CODESWARM_FRESH_THREAD_PER_INJECTION=1", script)
+        self.assertNotIn("codex_worker.py", script)
+
+    def test_slurm_provider_stages_claude_env_file_without_putting_values_in_path(self):
+        provider = SlurmProvider(
+            {
+                "cluster": {
+                    "workspace_root": "/srv",
+                    "cluster_subdir": "codeswarm",
+                    "slurm": {
+                        "login_host": "cluster-login",
+                    },
+                }
+            }
+        )
+        captured = {}
+
+        def fake_ssh_run(args, timeout=None, input_text=None):
+            captured["args"] = list(args)
+            captured["input_text"] = input_text
+
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _Result()
+
+        with patch.object(provider, "_resolve_claude_launch_env", return_value={"ANTHROPIC_API_KEY": "secret-token"}):
+            with patch.object(provider, "_ssh_run", side_effect=fake_ssh_run):
+                remote_path = provider._stage_claude_env_file({"worker_mode": "claude"})
+
+        self.assertIsNotNone(remote_path)
+        self.assertIn("/srv/codeswarm/runtime/claude-env-", str(remote_path))
+        self.assertNotIn("secret-token", " ".join(captured["args"]))
+        self.assertEqual(captured["input_text"], "export ANTHROPIC_API_KEY=secret-token\n")
 
 
 if __name__ == "__main__":
