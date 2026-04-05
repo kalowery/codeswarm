@@ -430,6 +430,10 @@ Headless UI and project automation now exist in-repo:
 npm run test:web-ui
 npm run test:project-runtime-smoke
 python3 tools/orchestrated_project_resume_smoke.py
+python3 tools/aws_claude_runtime_smoke.py --provider aws-claude-default
+python3 tools/aws_claude_project_smoke.py --provider aws-claude-default --worker-mode claude --execution-mode container --container-engine docker
+python3 tools/slurm_claude_runtime_smoke.py --provider slurm-claude-default
+python3 tools/slurm_claude_project_smoke.py --provider slurm-claude-default
 ```
 
 The browser suite uses Puppeteer and covers critical web flows including project creation, worker interaction, and resume modal behavior.
@@ -441,6 +445,15 @@ python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime codex --wo
 python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime codex --mode planned
 python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime claude --mode both
 ```
+
+Remote smoke guidance:
+
+- use the AWS and Slurm runtime smokes to validate launch, prompt delivery, and teardown
+- use the AWS and Slurm project smokes to validate repo prep, task execution, branch pushes, and integration
+- AWS and Slurm project smokes may create temporary GitHub repos
+- GitHub cleanup requires `gh` auth with `delete_repo` scope
+
+Detailed smoke-test documentation, prerequisites, cleanup semantics, and example commands are in [SMOKE_TESTS.md](/Users/klowery/codeswarm/docs/SMOKE_TESTS.md).
 
 ## 16. Troubleshooting
 
