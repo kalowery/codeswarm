@@ -388,6 +388,10 @@ Current repository-level automation includes:
 - headless browser UI tests: `npm run test:web-ui`
 - local orchestrated project runtime smoke: `npm run test:project-runtime-smoke`
 - orchestrated project resume smoke: `python3 tools/orchestrated_project_resume_smoke.py`
+- AWS runtime smoke: `python3 tools/aws_claude_runtime_smoke.py --provider aws-claude-default`
+- AWS project smoke: `python3 tools/aws_claude_project_smoke.py --provider aws-claude-default --worker-mode claude --execution-mode container --container-engine docker`
+- Slurm runtime smoke: `python3 tools/slurm_claude_runtime_smoke.py --provider slurm-claude-default`
+- Slurm project smoke: `python3 tools/slurm_claude_project_smoke.py --provider slurm-claude-default`
 
 The browser suite uses Puppeteer and covers launch flows, project creation, worker interaction, and project resume behavior through the live frontend.
 
@@ -397,6 +401,14 @@ The project runtime smoke harness is runtime-aware and can be pointed at `mock`,
 python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime codex --worker-runtime claude --mode both
 python3 tools/orchestrated_project_runtime_smoke.py --planner-runtime claude --worker-runtime claude --mode planned
 ```
+
+Remote smoke notes:
+
+- AWS and Slurm smokes provision real remote workers
+- GitHub-backed project smokes create temporary repos unless `--keep-repo` is set
+- GitHub repo cleanup requires `gh` auth with `delete_repo` scope
+
+Full smoke-test documentation is in `docs/SMOKE_TESTS.md`.
 
 ## Troubleshooting
 
@@ -432,5 +444,6 @@ npm --workspace=web/frontend run build
 - `docs/PROTOCOL.md`
 - `docs/PROTOCOL_SPEC.md`
 - `docs/PROVIDER_INTERFACE.md`
+- `docs/SMOKE_TESTS.md`
 - `docs/USER_GUIDE.md`
 - `docs/QA_TEST_PLAN.md`
